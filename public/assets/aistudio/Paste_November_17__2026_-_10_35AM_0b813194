@@ -1,0 +1,1260 @@
+Tôi đã kiểm tra cấu trúc mã nguồn, các phân hệ quan trọng, mô hình dữ liệu, lưu trữ, kiểm tra kỹ thuật, xuất hồ sơ, API AI, cấu hình triển khai và các báo cáo kiểm thử có sẵn.
+
+Tôi sẽ đánh giá theo tiêu chuẩn một sản phẩm phần mềm thương mại dành cho kỹ sư thiết kế hạ tầng mạng, không đánh giá theo tiêu chuẩn một ứng dụng demo.
+
+Nhận định tổng thể: Đây là một sản phẩm có khối lượng tính năng lớn, kiến trúc nghiệp vụ khá phong phú và đã có đầu tư nghiêm túc. Tuy nhiên, có những vấn đề quan trọng nằm ở tầng dữ liệu, tính chính xác kỹ thuật, độ tin cậy của lưu trữ và kiểm soát API. Những vấn đề này cần được giải quyết trước khi giao cho khách hàng.
+
+Điều tôi quan tâm nhất không phải là ứng dụng có 100 tính năng hay 200 tính năng, mà là:
+1. Khách hàng thiết kế một dự án trong nhiều ngày có bị mất dữ liệu không?
+2. Các phép tính kỹ thuật có phản ánh đúng thực tế thi công không?
+3. Bản vẽ và BOM xuất ra có chính xác và nhất quán không?
+4. Import dự án có làm hỏng dữ liệu cũ không?
+5. Khách hàng sử dụng máy yếu, màn hình nhỏ, mạng chập chờn có gặp sự cố không?
+6. Có thể sử dụng sản phẩm lâu dài mà không phải liên tục sửa lỗi không?
+
+I. ĐÁNH GIÁ TỔNG QUAN KIẾN TRÚC
+1. Những gì sản phẩm đã có
+Kiến trúc tính năng hiện tại
+8 chế độ thiết kế
+
+Topology, Floorplan, Rack, CCTV, Wi-Fi, Fiber, Electrical, Multisite
+
+
+Không gian 2D/3D
+
+Canvas, Three.js, tủ Rack, mô hình thiết bị
+
+
+Kỹ thuật và BOM
+
+IP, VLAN, PoE, UPS, vật tư, chiều dài cáp
+
+
+Hồ sơ bàn giao
+
+PDF, Excel, SVG, DXF, HTML, CSV
+
+
+Lưu trữ dự án
+
+IndexedDB, lịch sử, revisions, backup package
+
+
+Trợ lý AI
+
+Gemini API, tư vấn kiến trúc, Rack, BOM
+
+
+
+
+Đánh giá kiến trúc mã nguồn
+Thành phần	Dung lượng mã
+App.tsx	~117 KB
+DesignCanvas.tsx	~136 KB
+useProjectStore.ts	~90 KB
+Network3DScene.tsx	~100 KB
+ExportModal.tsx	~79 KB
+ExcelTreeImportModal.tsx	~59 KB
+BomStatisticsModal.tsx	~87 KB
+
+
+Nhận xét
+Sản phẩm có nền tảng tốt, nhưng một số thành phần đang quá lớn.
+
+Đặc biệt:
+- App.tsx đang đảm nhiệm quá nhiều trách nhiệm điều phối.
+- DesignCanvas.tsx có thể trở thành điểm nghẽn khi bổ sung tính năng.
+- useProjectStore.ts đang quản lý quá nhiều nghiệp vụ và trạng thái.
+- Các phân hệ export, BOM và engineering validation cần được tách thành những dịch vụ độc lập có giao diện dữ liệu thống nhất.
+Đề xuất: Không viết lại toàn bộ ứng dụng. Giữ kiến trúc và chức năng hiện có, cải tiến theo hướng module hóa có kiểm soát.
+
+II. CÁC LỖI NGHIÊM TRỌNG CẦN ƯU TIÊN SỬA
+Tôi phân loại theo mức độ ảnh hưởng đến khách hàng.
+P0 – Phải sửa trước khi bàn giao
+1. Rủi ro mất dữ liệu khi tự động lưu IndexedDB
+Rất nghiêm trọng
+File:
+
+src/store/useProjectStore.ts
+
+Đoạn hiện tại:
+const res = await saveProjectToDB(stamped);
+
+setIsSaving(false);
+
+if (res.ok) {
+  setStorageError(null);
+  setLastSavedAt(stamped.lastSavedAt || new Date().toISOString());
+  setHasUnsavedChanges(false);
+}
+
+
+Tôi nhận thấy có một lỗi thiết kế quan trọng.
+
+Giả sử:
+1. Khách hàng sửa bản vẽ A.
+2. Autosave bắt đầu ghi A.
+3. Khách hàng tiếp tục chỉnh sửa thành B.
+4. Autosave của B cũng bắt đầu.
+5. Hai thao tác ghi hoàn thành không đúng thứ tự.
+Khi đó bản cũ A có khả năng ghi đè bản mới B.
+
+Một vấn đề khác: nếu thao tác autosave gặp lỗi, trạng thái lỗi có được ghi nhận nhưng chưa có cơ chế hàng đợi lưu tuần tự và xác nhận phiên bản dữ liệu để chống ghi đè.
+
+Giải pháp bắt buộc:
+
+Thiết kế cơ chế Save Coordinator:
+- Mỗi thay đổi có revisionId hoặc changeVersion.
+- Chỉ cho phép một thao tác ghi dự án thực hiện tại một thời điểm.
+- Nếu đang lưu mà có thay đổi mới, đánh dấu dirty.
+- Sau khi lưu xong, nếu dirty thì lập tức lưu snapshot mới nhất.
+- Chỉ chuyển sang trạng thái đã lưu khi snapshot được ghi thành công và đúng phiên bản mới nhất.
+- Không để thao tác ghi cũ hoàn thành làm mất trạng thái chưa lưu của thao tác mới.
+- Có cơ chế flush trước khi chuyển dự án, đóng ứng dụng hoặc reload.
+Luồng nên là:
+Người dùng thay đổi bản vẽ
+
+
+Tăng revision và đánh dấu Dirty
+
+
+Save Coordinator
+
+
+Ghi IndexedDB tuần tự
+
+
+Thành công
+Xác nhận revision, kiểm tra Dirty và cập nhật trạng thái lưu.
+
+
+Thất bại
+Giữ Dirty, thông báo lỗi và cho phép thử lưu lại.
+
+
+
+
+Tôi đánh giá đây là cải tiến ưu tiên hàng đầu.
+2. Backup khẩn cấp chưa thực hiện đúng chức năng
+Rất nghiêm trọng
+File:
+
+src/components/modals/ErrorBoundary.tsx
+
+Hiện tại giao diện thông báo:
+Dữ liệu dự án của bạn vẫn được bảo toàn tự động trong bộ nhớ phục hồi.
+
+Nhưng nút tải backup đọc:
+const raw = localStorage.getItem(
+  RECOVERY_STORAGE_KEY
+) || '{}';
+
+
+Tôi tìm thấy nơi đọc RECOVERY_STORAGE_KEY trong store, nhưng không tìm thấy nơi ghi snapshot dự án vào key này.
+
+Như vậy, thông báo bảo toàn dữ liệu không được mã nguồn chứng minh.
+
+Cần sửa thành:
+- Mỗi lần autosave thành công, cập nhật bản recovery.
+- Lưu bản snapshot gần nhất độc lập với project đang thao tác.
+- Backup bao gồm đầy đủ assets, nodes, cables, racks, floors, settings, VLAN, subnet và các dữ liệu liên quan.
+- Có phiên bản schema.
+- Có checksum để phát hiện dữ liệu hỏng.
+- Khi khôi phục, phải kiểm tra và xem trước trước khi ghi đè dự án.
+- Không dùng dữ liệu {} làm backup mặc định.
+- Nếu recovery không tồn tại, thông báo rõ ràng và không cho tải một file giả.
+Nên bổ sung 3 cấp bảo vệ:
+Cấp	Mục đích
+Autosave	Lưu thay đổi thường xuyên
+Recovery snapshot	Khôi phục khi ứng dụng crash
+Full backup	Sao lưu toàn bộ dự án ra file
+
+Tôi còn đề nghị giữ ít nhất 3 snapshot gần nhất thay vì chỉ có một bản.
+3. Công thức kiểm tra UPS đang có giả định kỹ thuật quá rộng
+Rất nghiêm trọng
+File:
+
+src/utils/engineeringValidator.ts
+
+Đây là điểm tôi đặc biệt yêu cầu phải sửa trước khi giao khách hàng sử dụng để thiết kế điện.
+
+Đoạn hiện tại cộng toàn bộ công suất UPS:
+if (a.category === 'ups') {
+  if (w > 0) {
+    upsCapacityWatts += w;
+  }
+}
+
+
+Sau đó so sánh với tổng công suất thiết bị toàn dự án:
+if (upsCapacityWatts > 0 &&
+    totalPowerWatts > upsCapacityWatts * 0.85) {
+  // warning / error
+}
+
+
+Và tính thời gian lưu điện:
+estimatedUpsRuntimeMinutes =
+  totalUsableUpsWh > 0 && totalPowerWatts > 0
+    ? Math.max(
+        1,
+        Math.round(
+          (totalUsableUpsWh / totalPowerWatts) * 60
+        )
+      )
+    : 0;
+
+
+Vấn đề:
+
+Giả sử dự án có:
+- UPS A: 3.000W tại tầng 1.
+- UPS B: 3.000W tại tầng 4.
+- Tải tầng 1: 4.000W.
+- Tải tầng 4: 0W.
+Phần mềm có thể hiểu tổng khả năng UPS là 6.000W và tải là 4.000W.
+
+Nhưng UPS B không mặc nhiên có khả năng cấp điện cho tải tầng 1.
+
+Đặc biệt, việc cộng tổng năng lượng pin của nhiều UPS rồi chia cho tổng tải có thể tạo ra thời gian lưu điện cao hơn thực tế.
+
+Đề xuất thiết kế lại mô hình điện:
+
+Mỗi UPS cần có:
+- Công suất định mức VA.
+- Công suất đầu ra W.
+- Power Factor.
+- Hiệu suất inverter.
+- Battery Ah.
+- Battery Voltage.
+- Số lượng bình.
+- Battery configuration.
+- Dải điện áp.
+- Tỷ lệ DOD.
+- Kiểu kết nối: độc lập, song song, dự phòng.
+- Power domain / nguồn cấp.
+Mỗi tải cần liên kết với:
+- UPS cấp nguồn.
+- PDU.
+- Rack.
+- Mạch điện.
+- Nhánh nguồn A/B nếu có.
+Từ đó tính riêng từng power domain.
+Mô hình tính toán đề xuất
+Power Domain A
+
+UPS A → PDU A → Rack A → Thiết bị A
+
+Power Domain B
+
+UPS B → PDU B → Rack B → Thiết bị B
+
+Tính tải, dự phòng và thời gian lưu điện độc lập theo từng nhánh. Chỉ tổng hợp toàn dự án sau khi xác định rõ quan hệ cấp nguồn.
+
+Không được mặc định VA = W.
+
+Cần phân biệt:
+\[
+P(W)=S(VA)\times PF
+\]
+
+Thời gian lưu điện cũng không nên chỉ sử dụng công thức Wh/tải để công bố là thời gian thực tế. Phải có hệ số hiệu chỉnh theo đặc tuyến xả pin, hiệu suất và mức tải.
+4. Thuật toán phát hiện vòng lặp L2 chưa đủ độ tin cậy
+Rất nghiêm trọng
+File:
+
+src/utils/engineeringValidator.ts
+
+Đoạn:
+if (switchIds.size < 3) return [];
+
+
+Điều này có nghĩa là dự án có ít hơn 3 switch sẽ không được kiểm tra vòng lặp theo thuật toán hiện tại.
+
+Đây là hạn chế đáng kể vì hai switch kết nối hai đường uplink song song cũng có thể tạo ra vòng lặp nếu không có cấu hình bảo vệ phù hợp.
+
+Vấn đề thứ hai:
+const markerText = `
+  ${c.cableCode || ''}
+  ${c.label || ''}
+  ${c.notes || ''}
+`.toUpperCase();
+
+if (/\b(STP|RSTP|MSTP|LACP|LAG|ISL|MLAG|STACK)\b/.test(markerText)) {
+  continue;
+}
+
+
+Phần mềm bỏ qua tuyến nếu tìm thấy chữ STP, RSTP hoặc LACP trong tên hoặc ghi chú.
+
+Nhưng ghi chữ RSTP trên bản vẽ không chứng minh switch đã cấu hình RSTP.
+
+Đề xuất sửa:
+- Không dùng nội dung văn bản làm bằng chứng giao thức.
+- Thêm thông tin cấu hình STP/RSTP/MSTP thực tế theo thiết bị hoặc miền mạng.
+- Thêm cấu hình LACP/LAG với thành viên và trạng thái.
+- Kiểm tra chu trình trong đồ thị mạng, kể cả chu trình có hai switch và nhiều đường kết nối.
+- Phân biệt vòng lặp vật lý, vòng lặp logic và đường dự phòng có cơ chế bảo vệ.
+- Nếu thiếu thông tin cấu hình, đưa ra cảnh báo cần xác minh.
+Quan trọng: Kết quả phải là Suspected loop, Protected redundancy hoặc Unverified, không được khẳng định mạng an toàn chỉ dựa trên ghi chú.
+5. Hai API AI có logic bảo mật không đồng nhất
+Nghiêm trọng
+Hai file:
+- server.ts
+- api/gemini/chat.ts
+Tôi phát hiện hai nơi đang triển khai logic xử lý AI tương tự nhưng có sự khác biệt.
+Kiểm tra	Express server	Vercel API
+Kiểm tra HTTP method	Có	Có
+Kiểm tra Origin	Có	Chưa có
+CHAT_API_SECRET	Có	Có
+Rate limit	Có	Có
+Upstash	Có	Có
+Giới hạn message	Có	Có
+Xử lý lỗi	Có phân loại	Đơn giản hơn
+IP client	Express proxy	X-Forwarded-For
+
+Đặc biệt, trong Vercel:
+const fwd = req.headers['x-forwarded-for'];
+
+const ip = typeof fwd === 'string'
+  ? fwd.split(',')[0].trim()
+  : 'serverless-client';
+
+
+Không nên mặc định tin địa chỉ đầu tiên trong header nếu chưa xác minh nó đến từ proxy đáng tin cậy.
+
+Cũng cần lưu ý:
+- Rate limit trong bộ nhớ không đảm bảo hoạt động nhất quán giữa các serverless instance.
+- Nếu Upstash lỗi, cơ chế fallback có thể khiến giới hạn chi phí không còn mang tính toàn cục.
+- API Vercel chưa có cùng kiểm tra Origin như Express.
+- Chưa thấy giới hạn kích thước request body riêng ở handler Vercel.
+Giải pháp:
+
+Tách các phần sau thành module dùng chung:
+src/server/
+  chatValidation.ts
+  chatRateLimit.ts
+  chatSecurity.ts
+  chatService.ts
+  chatTypes.ts
+
+
+Cả Express và Vercel gọi cùng một logic.
+
+Đồng thời:
+1. Kiểm tra Origin theo allowlist.
+2. Không dùng Origin như cơ chế xác thực duy nhất.
+3. Xác định IP bằng thông tin proxy đáng tin cậy của nền tảng.
+4. Có giới hạn request body.
+5. Có timeout cho Gemini.
+6. Có giới hạn token và giới hạn chi phí theo ngày.
+7. Có xử lý Upstash fail-closed hoặc một cơ chế giới hạn chi phí toàn cục khác khi Redis lỗi.
+8. Không trả nguyên thông báo lỗi nội bộ hoặc thông tin nhạy cảm cho client.
+Lưu ý: CHAT_API_SECRET hiện là tùy chọn, nhưng tôi không thấy frontend gửi secret trong NetworkAssistantChat.tsx. Không được bật biến này mà chưa thiết kế lại cơ chế xác thực, nếu không tính năng AI sẽ nhận lỗi 401.
+
+III. DỮ LIỆU VÀ CẤU TRÚC DỰ ÁN
+6. Import JSON chưa kiểm tra toàn diện cấu trúc quan hệ
+File:
+
+src/utils/projectStorage.ts
+
+Đây là file đặc biệt quan trọng vì mọi dự án được nhập hoặc phục hồi đều đi qua quá trình migration và validation.
+
+Hiện tại đã có những kiểm tra tốt:
+- Giới hạn số lượng thiết bị.
+- Giới hạn số lượng node.
+- Giới hạn số lượng cable.
+- Lọc URL hình ảnh không an toàn.
+- Kiểm tra đầu và cuối cable có tồn tại.
+- Chuẩn hóa một số trường dữ liệu.
+- Hỗ trợ dữ liệu phiên bản cũ.
+Tuy nhiên, có những trường vẫn đang được tin tưởng khá nhiều.
+
+Ví dụ:
+const buildings = Array.isArray(raw.buildings)
+  ? raw.buildings as ProjectState['buildings']
+  : [];
+
+
+Đây là ép kiểu, không phải kiểm tra tính hợp lệ của từng building.
+
+Tương tự, node có thể chứa assetId không tồn tại trong assets.
+
+Cable có thể có sourcePortId hoặc targetPortId không tồn tại trên thiết bị.
+
+Rack có thể chứa slot vượt giới hạn U hoặc nhiều thiết bị xung đột vị trí.
+
+Cần xây dựng bộ Project Schema Validator thực sự.
+Nhóm	Kiểm tra bắt buộc
+Project	ID, version, tên, schema
+Building	Kích thước, số tầng, hình dạng
+Floor	buildingId tồn tại
+Room	floorId tồn tại, tọa độ hợp lệ
+Asset	ID duy nhất, category hợp lệ
+DevicePort	ID duy nhất, loại cổng hợp lệ
+Node	assetId tồn tại, kích thước và tọa độ hợp lệ
+Cable	hai đầu tồn tại, loại cáp hợp lệ
+Cable Port	Port thực sự thuộc thiết bị
+Rack	U hợp lệ, không trùng slot
+VLAN	VLAN ID từ 1 đến 4094
+Subnet	CIDR, gateway, DHCP range hợp lệ
+PatchLink	Patch panel và port tham chiếu hợp lệ
+
+Tôi đề nghị dùng schema validation có kiểm soát, ví dụ Zod hoặc một bộ validator thuần TypeScript đã được kiểm thử.
+
+Nguyên tắc: Dữ liệu không hợp lệ phải được báo cáo rõ ràng, không tự động xóa hoặc sửa âm thầm những thông tin có thể ảnh hưởng đến thiết kế.
+7. Cần bổ sung cơ chế chống mất liên kết dữ liệu
+Hiện tại ứng dụng có nhiều loại đối tượng:
+- DeviceAsset.
+- DiagramNode.
+- DevicePort.
+- CableEdge.
+- ServerRack.
+- Building.
+- Floor.
+- Room.
+- PatchLink.
+Đây là mô hình tương đối tốt, nhưng cần quy định rõ quan hệ giữa các đối tượng.
+
+Ví dụ:
+
+Một thiết bị có thể có asset nhưng không có node hiển thị.
+
+Một node có thể tham chiếu asset đã bị xóa.
+
+Một cable có thể còn tồn tại nhưng port đầu cuối không còn.
+
+Một rack có thể có slot trỏ đến thiết bị đã bị xóa.
+
+Đề xuất:
+
+Tạo một hàm kiểm tra toàn bộ quan hệ dự án:
+validateProjectIntegrity(project)
+
+
+Trả về:
+{
+  valid: false,
+  errors: [],
+  warnings: [],
+  repairableIssues: []
+}
+
+
+Hàm này phải được dùng tại các điểm:
+- Import.
+- Mở dự án.
+- Nhân bản dự án.
+- Xóa thiết bị.
+- Xóa tủ Rack.
+- Xóa tầng.
+- Xuất hồ sơ.
+- Trước khi bàn giao dự án.
+8. Lịch sử Undo/Redo cần kiểm tra hiệu năng
+File:
+
+src/store/useProjectStore.ts
+
+Hiện có history stack, structural sharing và giới hạn lịch sử.
+
+Đây là hướng làm đúng.
+
+Tuy nhiên, với dự án lớn, cần kiểm tra:
+- Undo khi có 5.000 node.
+- Undo khi có 10.000 cable.
+- Kéo nhiều node liên tục.
+- Resize rack.
+- Thay đổi nhiều thiết bị.
+- Undo sau khi đổi tầng.
+- Undo sau khi import Excel.
+- Undo sau khi đồng bộ Legend.
+Đặc biệt, cần đảm bảo thao tác drag chỉ tạo một history checkpoint hợp lý, không tạo hàng trăm snapshot.
+
+Đề xuất:
+- Có transaction/batch update.
+- Không ghi history cho trạng thái tạm thời của mỗi pixel khi kéo.
+- Giới hạn dung lượng history theo bộ nhớ, không chỉ theo số bước.
+- Có cơ chế giải phóng snapshot cũ.
+- Kiểm thử tính đúng đắn của redo sau khi undo và phát sinh thao tác mới.
+
+IV. KIỂM TRA NGHIỆP VỤ KỸ THUẬT MẠNG
+Đây là phần quyết định phần mềm có thể được kỹ sư sử dụng để làm việc thật hay không.
+9. Kiểm tra hệ thống IP/Subnet/VLAN
+File:
+
+src/utils/engineeringValidator.ts
+
+Đã có:
+- Phát hiện IP trùng.
+- Kiểm tra CIDR.
+- Kiểm tra subnet overlap.
+- Kiểm tra IP ngoài subnet.
+- Kiểm tra VLAN chưa khai báo.
+- Kiểm tra VLAN mismatch.
+Tuy nhiên, cần nâng cấp theo những tình huống thực tế hơn:
+Hạng mục	Cải tiến
+IP	Kiểm tra địa chỉ network và broadcast
+Gateway	Gateway phải thuộc subnet
+DHCP	Kiểm tra DHCP range không trùng IP tĩnh
+VLAN	Phân biệt Access, Trunk, Native VLAN
+Trunk	Kiểm tra allowed VLAN
+Management	Phân biệt management IP và IP dịch vụ
+Subnet	Kiểm tra overlap giữa các VLAN
+IP Assignment	Không tự gán vào gateway, broadcast, reserved
+Duplicate IP	Chỉ cảnh báo trong phạm vi địa chỉ thực sự xung đột
+
+Đặc biệt, một thiết bị switch có thể mang nhiều VLAN, nhưng thuật toán không nên mặc định mọi kết nối hai thiết bị có VLAN khác nhau đều là lỗi.
+
+Cần có mô hình cấu hình port:
+- Access.
+- Trunk.
+- Hybrid.
+- Routed Port.
+- Native VLAN.
+- Allowed VLANs.
+- Port-channel.
+Nếu không bổ sung các thuộc tính này, việc kiểm tra VLAN chỉ là kiểm tra đơn giản chứ chưa đủ để thẩm định thiết kế mạng doanh nghiệp.
+10. Kiểm tra PoE
+File:
+
+src/utils/poeCalculator.ts
+
+Đã có các thành phần:
+- PD consumption.
+- PSE budget.
+- Công suất tiêu thụ.
+- Port-level breakdown.
+- Kiểm tra quá tải.
+Cần bổ sung:
+1. Phân biệt IEEE 802.3af, 802.3at, 802.3bt.
+2. Phân biệt công suất PSE và công suất thực nhận tại PD.
+3. Tính tổn hao trên đường cáp.
+4. Phân biệt tổng ngân sách PoE và ngân sách từng port.
+5. Kiểm tra giới hạn công suất trên từng cổng.
+6. Kiểm tra thiết bị được cấp nguồn từ switch nào.
+7. Kiểm tra khi có nhiều switch PoE.
+8. Kiểm tra thiết bị tiêu thụ cao như camera PTZ, Wi-Fi AP nhiều radio.
+Kết quả phải có ít nhất ba mức:
+- Đạt.
+- Gần ngưỡng.
+- Quá tải.
+Không chỉ có một phép cộng tổng công suất.
+11. Kiểm tra cáp mạng và cáp quang
+Các file:
+- cableRouting.ts
+- bomAggregator.ts
+- excelService.ts
+- engineeringValidator.ts
+Cần thẩm định các yếu tố sau:
+Loại	Cần kiểm tra
+Cat5e/Cat6/Cat6A	Chiều dài channel và permanent link
+Fiber OS2	Khoảng cách, suy hao, bước sóng
+Fiber OM3/OM4	Khoảng cách theo tốc độ
+DAC	Khoảng cách và tốc độ hỗ trợ
+SFP/SFP+	Tương thích module
+Patch Cord	Chiều dài, số lượng
+Cable Tray	Dung lượng, hệ số lấp đầy
+PoE Cable	Sụt áp và suy hao
+Uplink	Băng thông và khả năng nghẽn
+
+Một cải tiến rất quan trọng:
+
+Phải phân biệt chiều dài tuyến vẽ với chiều dài cáp thi công.
+
+Chiều dài cáp thi công cần tính thêm:
+- Đường đi thực tế.
+- Độ cao trần.
+- Đường đứng giữa các tầng.
+- Chiều dài đi trong máng.
+- Độ chùng kỹ thuật.
+- Service loop.
+- Hao hụt thi công.
+Nếu chỉ dùng khoảng cách hai điểm trên canvas thì BOM sẽ không thể được xem là số liệu thi công đáng tin cậy.
+12. Kiểm tra tủ Rack
+Các file:
+- rackGeometry.ts
+- RackInspector.tsx
+- engineeringValidator.ts
+- bomAggregator.ts
+Cần có bộ kiểm tra độc lập:
+- Trùng U.
+- Vượt tổng U.
+- Front/Rear mounting.
+- Thiết bị có chiều cao U hợp lệ.
+- Trọng lượng.
+- Tải trọng tủ.
+- Phân bố trọng lượng.
+- Nguồn điện A/B.
+- PDU outlet.
+- Dự phòng U.
+- Luồng gió.
+- Khoảng trống bảo trì.
+- Tương thích chiều sâu thiết bị với tủ.
+Một điểm cần nâng cấp: kiểm tra tính khả thi khi lắp thiết bị vật lý, không chỉ kiểm tra số U.
+
+Ví dụ, thiết bị 4U có thể vừa về chiều cao nhưng lại không phù hợp với chiều sâu hoặc giới hạn tải của tủ.
+
+V. KIỂM TRA BOM VÀ HỒ SƠ XUẤT
+13. BOM phải là nguồn dữ liệu thống nhất
+Các file:
+- bomAggregator.ts
+- bomPricingCatalog.ts
+- bomCsvExporter.ts
+- excelService.ts
+- ExcelTreeImportModal.tsx
+- BomStatisticsModal.tsx
+Đây là một trong những phân hệ quan trọng nhất của sản phẩm.
+
+Tôi đề xuất xây dựng một BOM Engine thống nhất.
+
+Hiện tại có nhiều dạng dữ liệu:
+- Thiết bị.
+- Cáp.
+- Phụ kiện.
+- Rack.
+- Cable tray.
+- Vật tư điện.
+- Đầu nối.
+- Patch panel.
+- Module quang.
+Cần đảm bảo tất cả báo cáo lấy dữ liệu từ cùng một kết quả tổng hợp chuẩn.
+
+Không được để BOM Excel tính một cách, BOM PDF tính một cách, BOM CSV lại tính một cách khác.
+
+Mô hình nên là:
+ProjectState
+
+
+BOM Aggregation Engine
+
+Chuẩn hóa số lượng, SKU, vật tư, chiều dài và hao hụt
+
+
+BOM Excel
+
+
+BOM PDF
+
+
+BOM CSV
+
+
+BOM Statistics
+
+
+
+
+Các kiểm tra cần bổ sung
+- Số lượng thiết bị trong sơ đồ bằng BOM.
+- Số lượng cable bằng bảng tuyến cáp.
+- Tổng chiều dài cáp bằng tổng chiều dài từng tuyến.
+- Tổng vật tư bằng tổng phụ kiện.
+- Số lượng module quang tương ứng với hai đầu kết nối.
+- Patch panel có đủ port.
+- Switch có đủ port.
+- Rack có đủ phụ kiện.
+- Giá thành tính đúng đơn vị.
+- Thuế và chi phí dự phòng có quy tắc riêng.
+- SKU không được tự động gộp nếu model khác nhau.
+Đề nghị có chức năng:
+
+BOM Reconciliation – Đối soát chéo.
+
+Ví dụ:
+Hạng mục	Sơ đồ	BOM	Kết quả
+Switch	12	12	Đạt
+Camera	24	23	Lỗi
+Cat6A	1.250m	1.250m	Đạt
+Module SFP	16	14	Lỗi
+
+Khi phát hiện sai lệch, phải cho biết đối tượng nào gây ra sai lệch.
+14. Xuất PDF phải đạt chuẩn hồ sơ kỹ thuật
+File:
+
+src/utils/pdfExporter.ts
+
+Đã có nhiều tính năng đáng ghi nhận:
+- Khổ giấy A4–A1.
+- Landscape/Portrait.
+- Khung tên.
+- Thước tỷ lệ.
+- Legend.
+- Phụ lục.
+- Rack elevation.
+- 3D captures.
+Nhưng tôi đề nghị bổ sung một lớp kiểm tra chất lượng đầu ra.
+
+Các yêu cầu:
+1. Không cắt mất node.
+2. Không mất nhãn thiết bị.
+3. Không mất mã cáp.
+4. Không bị chồng chữ.
+5. Không bị mất hình ảnh.
+6. Không bị biến dạng tỷ lệ.
+7. Không xuất ra trang trắng.
+8. Không xuất nhầm tầng.
+9. Không xuất nhầm chế độ thiết kế.
+10. Không đưa đối tượng ẩn vào bản vẽ nếu đã chọn loại trừ.
+11. Không tạo phụ lục thiếu dữ liệu.
+12. Kiểm tra font tiếng Việt.
+Đặc biệt, phải kiểm tra PDF bằng trình đọc PDF thực tế, không chỉ kiểm tra rằng file có header %PDF-.
+
+Nên có:
+- PDF preflight.
+- Kiểm tra kích thước trang.
+- Kiểm tra số trang.
+- Kiểm tra font.
+- Kiểm tra hình ảnh.
+- Kiểm tra vùng nội dung.
+- Xem trước từng trang trước khi tải.
+15. Xuất DXF cần kiểm tra khả năng mở trên AutoCAD
+File:
+
+src/utils/dxfExporter.ts
+
+Không chỉ cần tạo file DXF hợp lệ về mặt cấu trúc.
+
+Phải thử trên phần mềm CAD thực tế:
+- AutoCAD.
+- ZWCAD.
+- DraftSight hoặc phần mềm tương thích.
+Kiểm tra:
+- Layer.
+- Line type.
+- Text.
+- Font.
+- Block.
+- Dimension.
+- Scale.
+- Units.
+- Encoding tiếng Việt.
+- Tọa độ.
+Đặc biệt, cần bảo đảm khi khách hàng mở DXF, bản vẽ không bị lệch tỷ lệ hoặc mất chữ.
+
+VI. GIAO DIỆN VÀ TRẢI NGHIỆM KHÁCH HÀNG
+16. Cần cải thiện quản lý trạng thái hệ thống
+Hiện có:
+- Đã lưu.
+- Đang lưu.
+- Kiểm tra.
+- Toast.
+- Các nút xuất.
+Nhưng tôi đề nghị chuẩn hóa toàn bộ trạng thái ứng dụng.
+Trạng thái	Giao diện cần thể hiện
+Loading	Đang tải dự án
+Hydrating	Đang khôi phục dữ liệu
+Ready	Sẵn sàng
+Dirty	Có thay đổi chưa lưu
+Saving	Đang lưu
+Saved	Đã lưu
+Save failed	Lưu thất bại
+Exporting	Đang xuất
+Importing	Đang nhập
+Offline	Mất kết nối
+Recovering	Đang khôi phục
+Conflict	Có xung đột dữ liệu
+
+Tôi muốn khách hàng luôn biết trạng thái thật của ứng dụng.
+
+Không được hiển thị “Đã lưu” trong khi dữ liệu vẫn đang chờ ghi.
+17. Responsive cần được kiểm thử lại
+Ứng dụng đã có ba bố cục:
+- Desktop.
+- Tablet.
+- Mobile.
+Đây là ưu điểm.
+
+Tuy nhiên, với phần mềm vẽ sơ đồ, cần kiểm tra thực tế:
+- Canvas có bị che không?
+- Bảng thuộc tính có che đối tượng không?
+- Kéo thả thiết bị có chính xác không?
+- Pinch zoom có hoạt động?
+- Context menu có hoạt động?
+- Kéo thanh điều khiển có bị mất sự kiện?
+- Bottom sheet có che nút lưu?
+- Khi đổi hướng màn hình có mất vị trí không?
+Đề nghị kiểm tra các kích thước:
+Thiết bị	Độ phân giải
+Desktop Full HD	1920×1080
+Laptop	1366×768
+Laptop nhỏ	1280×720
+Tablet ngang	1024×768
+Tablet dọc	768×1024
+Mobile	390×844
+Mobile nhỏ	360×740
+
+18. Tối ưu hiệu năng canvas
+Đây là việc cần làm nếu khách hàng sử dụng sơ đồ lớn.
+
+Các hướng cải tiến:
+- React.memo cho các thành phần phù hợp.
+- useMemo cho dữ liệu tính toán nặng.
+- useCallback cho callback truyền xuống cây component.
+- Tách state tạm thời khi drag khỏi state dự án.
+- Hạn chế render lại toàn bộ canvas.
+- Tính toán đường cáp theo vùng bị ảnh hưởng.
+- Virtualization khi có nhiều đối tượng.
+- Giảm số lượng SVG filters.
+- Giảm các phép tính hình học lặp lại.
+- Giải phóng texture Three.js.
+- Dispose geometry/material khi xóa thiết bị.
+- Giảm render 3D khi tab không hoạt động.
+Tôi đề nghị thiết lập các mốc hiệu năng:
+Tình huống	Mục tiêu đề xuất
+Mở dự án 500 node	Dưới 3 giây
+Kéo một thiết bị	60 FPS mục tiêu
+Zoom/pan	Không giật đáng kể
+Mở BOM	Dưới 2 giây với dự án vừa
+Autosave	Không khóa thao tác
+Xuất PDF	Có tiến trình và không treo UI
+
+Đây là mục tiêu nghiệm thu đề xuất, không phải số đo hiện tại.
+
+VII. BẢO MẬT VÀ QUYỀN RIÊNG TƯ
+19. Cần nâng cấp xử lý SVG và dữ liệu nhập
+File:
+
+src/utils/security.ts
+
+Hiện sử dụng các biểu thức Regex để kiểm tra SVG.
+
+Đây là một lớp phòng vệ tốt, nhưng không nên coi là bộ lọc SVG hoàn chỉnh.
+
+Đề xuất:
+- Parse SVG bằng XML parser.
+- Whitelist thẻ và thuộc tính được phép.
+- Loại bỏ script, event handlers.
+- Chặn external resource.
+- Chặn CSS URL không an toàn.
+- Chặn foreignObject nếu không cần.
+- Rasterize icon không đáng tin cậy khi phù hợp.
+- Kiểm tra kích thước ảnh sau giải mã.
+- Giới hạn số lượng ảnh và dung lượng tổng.
+Ngoài ra, tất cả import phải có giới hạn kích thước và số lượng entity trước khi xử lý sâu.
+20. Cần công khai rõ dữ liệu nào được gửi lên Gemini
+File:
+
+src/components/chat/NetworkAssistantChat.tsx
+
+Ứng dụng lưu bản vẽ tại máy khách, nhưng khi sử dụng AI, phần mềm gửi câu hỏi, lịch sử hội thoại và projectContext lên API Gemini.
+
+Ngữ cảnh này có thể chứa:
+- Tên dự án.
+- Tên thiết bị.
+- Địa chỉ IP.
+- VLAN.
+- Công suất.
+- Thông tin Rack.
+- Các vấn đề kỹ thuật.
+Điều này không có nghĩa toàn bộ file bản vẽ tự động được tải lên, nhưng khách hàng cần được thông báo rõ.
+
+Cần bổ sung:
+- Thông báo trước khi bật AI.
+- Tùy chọn không gửi IP/MAC/serial.
+- Tùy chọn không gửi thông tin dự án.
+- Chính sách lưu lịch sử chat.
+- Chính sách dữ liệu bên thứ ba.
+- Hướng dẫn không đưa mật khẩu, credential hoặc cấu hình bí mật vào AI.
+Đây là điều rất quan trọng khi cung cấp phần mềm cho doanh nghiệp.
+21. Cần kiểm tra PWA cập nhật ứng dụng
+File:
+
+vite.config.ts
+
+Hiện tại:
+registerType: 'autoUpdate'
+
+
+Tôi đề nghị kiểm tra tình huống:
+- Khách hàng đang thiết kế.
+- Một phiên bản mới được triển khai.
+- Service Worker kích hoạt cập nhật.
+- Trình duyệt reload ứng dụng.
+- Khách hàng đang có dữ liệu chưa autosave.
+Nếu reload xảy ra trong khoảng chờ autosave, có nguy cơ mất các thay đổi cuối cùng.
+
+Giải pháp:
+- Có update lifecycle rõ ràng.
+- Kiểm tra trạng thái Dirty.
+- Flush dữ liệu trước khi reload.
+- Hiển thị thông báo có phiên bản mới.
+- Cho phép cập nhật sau khi lưu xong.
+- Có kiểm tra tương thích schema trước và sau cập nhật.
+
+VIII. NHỮNG VẤN ĐỀ KIẾN TRÚC CẦN CẢI TIẾN
+Tôi không khuyến nghị viết lại ứng dụng. Nên tổ chức lại có kiểm soát.
+Kiến trúc đề xuất sau cải tiến
+Presentation Layer
+
+App, Canvas, Sidebar, Properties, Modals, Toolbar
+
+
+Application Services
+
+Project Manager, Undo/Redo, Save Coordinator, Import/Export Coordinator
+
+
+Engineering Engine
+
+IP, VLAN, PoE, UPS, Rack, Cable
+
+
+BOM Engine
+
+SKU, vật tư, giá, hao hụt
+
+
+Drawing Engine
+
+2D, 3D, routing, geometry
+
+
+Project Engine
+
+Schema, migration, integrity
+
+
+
+
+Infrastructure Layer
+
+IndexedDB, Recovery, PWA, Export adapters, AI API
+
+
+Lợi ích:
+- Ít ảnh hưởng chéo.
+- Dễ kiểm thử.
+- Dễ thêm tính năng.
+- Dễ sửa lỗi.
+- Có thể nâng cấp từng phân hệ.
+- Dễ bảo trì lâu dài.
+
+IX. KIỂM TRA KIỂM THỬ HIỆN TẠI
+Chưa đạt điều kiện nghiệm thu
+Tôi thấy dự án có bộ kiểm thử tương đối đáng kể.
+
+Trong src/utils/__tests__/runTests.ts, có nhiều nhóm kiểm tra:
+- Rack geometry.
+- Project migration.
+- Excel import/export.
+- Engineering validation.
+- Cable routing.
+- BOM.
+- PoE.
+- UPS.
+- SVG/DXF.
+- PDF.
+- Layer.
+- 3D.
+- Revision.
+- Excel Tree Import.
+Đây là điểm tốt.
+
+Tuy nhiên, có hai vấn đề.
+1. E2E hiện có lỗi thật
+Báo cáo Playwright ghi nhận lỗi tại:
+await page.keyboard.press('l');
+
+const legendResizeHandle = page.locator(
+  '[data-testid^="legend-resize-se-"]'
+).first();
+
+await expect(legendResizeHandle).toBeVisible();
+
+
+Kết quả:
+Expected: visible
+Error: element(s) not found
+
+
+Lỗi xuất hiện ở desktop và tablet.
+
+Chưa thể kết luận lỗi nằm ở shortcut, selection hay điều kiện render resize handle. Nhưng không được bỏ qua.
+
+Cần sửa test theo đúng hành vi người dùng:
+1. Tạo hoặc cập nhật Legend bằng thao tác giao diện.
+2. Xác nhận node Legend tồn tại.
+3. Xác nhận Legend được chọn.
+4. Xác nhận resize handle xuất hiện khi đối tượng được chọn và không bị khóa.
+5. Thử resize.
+6. Xác nhận kích thước thay đổi.
+7. Lưu và reload.
+8. Kiểm tra kích thước được giữ nguyên.
+2. E2E còn quá ít so với số lượng chức năng
+Hiện file e2e/smoke.spec.ts chỉ có một test chính, dù chạy trên nhiều viewport.
+
+Một smoke test dài không thể thay thế bộ kiểm thử nghiệp vụ.
+
+Tôi đề nghị chia thành các nhóm:
+Nhóm E2E	Nội dung
+Project	Tạo, lưu, mở, nhân bản, xóa
+Canvas	Thêm, kéo, sửa, xóa node
+Cable	Nối cổng, đổi cáp, routing
+Rack	Lắp thiết bị, đổi U, front/rear
+Engineering	Audit, IP, VLAN, PoE
+BOM	Đối soát số lượng và giá
+Excel	Import, preview, validate, commit
+Export	PDF, Excel, DXF, SVG
+Recovery	Crash simulation, khôi phục
+PWA	Offline, update, reload
+Responsive	Desktop, tablet, mobile
+3D	Chuyển đổi, tương tác, export
+
+Giới hạn xác minh trong lần kiểm tra này: Tôi đã thử chạy build nhưng quá trình cài dependencies bị timeout. Lệnh build dừng ở lỗi thiếu type definitions của vite và vite-plugin-pwa, nên chưa thể kết luận mã nguồn TypeScript có lỗi biên dịch hay không. Playwright cũng chưa có đầy đủ browser binary trong môi trường kiểm tra. Vì vậy, đây là thẩm định mã nguồn và báo cáo kiểm thử hiện có, chưa phải chứng nhận toàn bộ ứng dụng đã chạy đạt.
+
+X. DANH SÁCH CẢI TIẾN CẦN GIAO CHO LẬP TRÌNH VIÊN
+Đây là danh sách tôi khuyến nghị sử dụng làm phạm vi sửa chữa chính thức.
+Danh sách nghiệm thu và sửa chữa
+0/22 hoàn thành
+
+
+
+P0 – Bắt buộc
+
+0/7
+
+[ ] Autosave Coordinator
+
+Chống ghi đè snapshot cũ, tuần tự hóa lưu, revision tracking.
+
+
+[ ] Recovery System
+
+Backup thực sự, nhiều snapshot, kiểm tra và khôi phục an toàn.
+
+
+[ ] UPS Engineering Engine
+
+Tính theo power domain, VA/W/PF, battery và tải thực tế.
+
+
+[ ] L2 Loop Detection
+
+Kiểm tra chu trình đúng, không dựa vào chữ trong ghi chú.
+
+
+[ ] API Security
+
+Đồng nhất Express/Vercel, bảo vệ rate limit và chi phí AI.
+
+
+[ ] E2E Legend
+
+Sửa lỗi test desktop/tablet và xác minh resize.
+
+
+[ ] Build & Test Gate
+
+Cài dependency sạch, build và chạy đầy đủ test.
+
+
+
+
+P1 – Cần hoàn thiện
+
+0/11
+
+[ ] Project Schema Validator
+
+Kiểm tra đầy đủ entity và quan hệ dữ liệu.
+
+
+[ ] Project Integrity Engine
+
+Phát hiện asset/node/port/rack/cable tham chiếu sai.
+
+
+[ ] IP/VLAN Engine
+
+Access/Trunk, native VLAN, DHCP, gateway, subnet.
+
+
+[ ] Cable Engineering
+
+Chiều dài thi công, service loop, loss, fiber budget.
+
+
+[ ] PoE Engine
+
+802.3af/at/bt, từng port, từng switch, sụt áp.
+
+
+[ ] Rack Validation
+
+U, tải trọng, chiều sâu, PDU, nguồn A/B.
+
+
+[ ] BOM Reconciliation
+
+Một nguồn dữ liệu chuẩn cho Excel/PDF/CSV.
+
+
+[ ] Export Preflight
+
+Kiểm tra nội dung, tỷ lệ, font, trang và tính toàn vẹn.
+
+
+[ ] PWA Update Safety
+
+Không tự reload khi dự án chưa lưu.
+
+
+[ ] AI Privacy
+
+Minh bạch dữ liệu gửi Gemini và tùy chọn ẩn thông tin.
+
+
+[ ] Performance
+
+Tối ưu canvas lớn, 3D, routing và history.
+
+
+
+
+P2 – Nâng cấp dài hạn
+
+0/4
+
+[ ] Module Refactor
+
+Tách App, Canvas, Store và Export thành module.
+
+
+[ ] Accessibility
+
+Kiểm tra keyboard, screen reader, focus và mobile.
+
+
+[ ] Operational Monitoring
+
+Health, lỗi API, lưu trữ, crash và báo cáo sự cố.
+
+
+[ ] Release Management
+
+Build ID, changelog, migration và rollback.
+
+
+
+
+
+XI. QUY TRÌNH KIỂM TRA CUỐI CÙNG TRƯỚC KHI GIAO KHÁCH HÀNG
+Tôi đề xuất không giao ứng dụng ngay sau khi sửa xong các dòng code.
+
+Phải có một vòng nghiệm thu độc lập.
+Giai đoạn 1 – Kiểm tra chức năng
+- Tạo dự án mới.
+- Tạo nhiều tầng.
+- Thêm 100 thiết bị.
+- Kết nối các thiết bị.
+- Chỉnh sửa thuộc tính.
+- Tạo Rack.
+- Đấu nối patch panel.
+- Gán IP.
+- Gán VLAN.
+- Tính PoE.
+- Tính UPS.
+- Xuất BOM.
+Giai đoạn 2 – Kiểm tra phá hoại
+Đây là bước tôi đặc biệt coi trọng.
+
+Thử các tình huống:
+- Đang lưu thì reload.
+- Đang kéo thiết bị thì đóng tab.
+- Đang import Excel thì hủy.
+- Import file JSON sai cấu trúc.
+- Import dự án có 2 thiết bị trùng ID.
+- Xóa thiết bị đang có cáp.
+- Xóa switch đang có port kết nối.
+- Xóa Rack có thiết bị.
+- Đổi tầng khi đang có thay đổi.
+- Xuất PDF khi có hình ảnh lỗi.
+- Mất IndexedDB quota.
+- Mất mạng khi gọi AI.
+- AI trả lỗi 429.
+- Cập nhật PWA khi đang chỉnh sửa.
+Mục tiêu là ứng dụng phải bảo vệ dữ liệu và giải thích lỗi rõ ràng.
+Giai đoạn 3 – Kiểm tra đối soát kỹ thuật
+Tạo một dự án chuẩn với số liệu được tính thủ công.
+
+Đối chiếu:
+- Tổng thiết bị.
+- Tổng số port.
+- Tổng số kết nối.
+- Tổng chiều dài cáp.
+- Số module quang.
+- Tổng PoE.
+- Tổng tải điện.
+- UPS capacity.
+- Thời gian lưu điện.
+- Rack U.
+- Rack weight.
+- BOM.
+- Chi phí.
+Không chấp nhận sai số mà không có giải thích.
+Giai đoạn 4 – Kiểm tra bàn giao
+Khách hàng cần có khả năng:
+- Cài PWA.
+- Sử dụng offline theo phạm vi được hỗ trợ.
+- Tạo và lưu dự án.
+- Sao lưu.
+- Khôi phục.
+- Chuyển máy.
+- Xuất hồ sơ.
+- Đọc tài liệu hướng dẫn.
+- Biết cách liên hệ hỗ trợ.
+Vì hiện tại dữ liệu lưu trên trình duyệt, cần ghi rõ đây là ứng dụng lưu trữ cục bộ, chưa phải hệ thống cloud collaboration nhiều người.
+
+XII. KẾT LUẬN CỦA CHUYÊN GIA
+Chưa duyệt bàn giao
+Đánh giá dựa trên mã nguồn và bằng chứng kiểm thử trong ZIP, không phải điểm benchmark vận hành.
+
+Những điểm mạnh
+- Nền tảng nghiệp vụ khá phong phú.
+- Có mô hình dữ liệu riêng cho hạ tầng.
+- Có công cụ kiểm tra kỹ thuật.
+- Có BOM Engine.
+- Có nhiều định dạng xuất.
+- Có bộ kiểm thử logic tương đối lớn.
+- Có IndexedDB và PWA.
+  Những điểm chặn bàn giao
+- Autosave chưa có cơ chế chống ghi đè snapshot cũ.
+- Recovery backup chưa được chứng minh có ghi dữ liệu.
+- UPS tính tổng toàn dự án có nguy cơ sai theo power domain.
+- Kiểm tra vòng lặp L2 chưa phản ánh đúng cấu hình mạng.
+- API Express và Vercel không đồng nhất.
+- E2E desktop/tablet đang có lỗi.
+- Chưa xác nhận được build sạch trong môi trường kiểm tra.
+
+Thứ tự tôi khuyến nghị thực hiện
+Không nên yêu cầu lập trình viên sửa 22 hạng mục cùng lúc mà không có thứ tự.
+
+Tôi sẽ chia thành 3 đợt:
+
+Đợt 1 – Bảo vệ sản phẩm
+
+Autosave, Recovery, UPS, L2, API Security, E2E và Build.
+
+Đợt 2 – Hoàn thiện độ chính xác kỹ thuật
+
+Schema Validator, Project Integrity, IP/VLAN, PoE, Cable, Rack, BOM và Export Preflight.
+
+Đợt 3 – Hoàn thiện sản phẩm thương mại
+
+PWA, Privacy, Performance, Refactor, Accessibility và Release Management.
+
+Một nguyên tắc tôi muốn giữ: không xóa chức năng đang hoạt động, không thay đổi giao diện hàng loạt, không viết lại các engine đã có kết quả kiểm thử tốt. Mỗi lần sửa phải giữ tương thích dự án cũ và có test hồi quy.
+
+Tôi không thể cam kết rằng chỉ một lần sửa sẽ tuyệt đối hoàn hảo, nhưng có thể thiết kế một đợt sửa tập trung, có tiêu chí chấp nhận rõ ràng, hạn chế tối đa việc phải sửa đi sửa lại.
+
+Bước tiếp theo tôi đề xuất
+Tôi khuyến nghị chuyển sang bước quan trọng nhất: xây dựng một bản đặc tả sửa chữa kỹ thuật cấp cao cho toàn bộ 22 hạng mục, ghi rõ:
+1. File nào phải sửa.
+2. Hàm nào phải sửa.
+3. Hàm nào cần viết mới.
+4. Logic cũ nào phải giữ.
+5. Logic mới cần triển khai như thế nào.
+6. Dữ liệu cũ phải tương thích ra sao.
+7. Test case nào bắt buộc phải vượt qua.
+8. Tiêu chí nghiệm thu để xác định đã sửa hoàn chỉnh.
+Mục tiêu là có thể giao nguyên bản đặc tả đó cho AI lập trình hoặc đội developer thực hiện trên ZIP gốc, tránh sửa tùy tiện và làm hỏng những phân hệ đang chạy tốt.
