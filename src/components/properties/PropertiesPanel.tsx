@@ -1,0 +1,509 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { ChevronLeft, ChevronRight, SlidersHorizontal, X, Zap } from 'lucide-react';
+import {
+  CableEdge,
+  DeviceAsset,
+  DiagramNode,
+  Floor,
+  ProjectState,
+  RackSide,
+  Room,
+  SelectionState,
+  ServerRack
+} from '../../types/infrastructure';
+import { SnapToGridAlignMode } from '../../utils/snapGuides';
+import { AuditIssue } from '../../utils/engineeringValidator';
+import { AutoAssignIpResult } from '../../utils/ipAutoAssign';
+import { computeProjectPoeSummary } from '../../utils/poeCalculator';
+import { LayoutTier, UIDensity } from '../../hooks/useWorkspaceLayout';
+import { MultiNodeInspector } from './MultiNodeInspector';
+import { RackInspector } from './RackInspector';
+import { FloorInspector, LegendNodeInspector, RoomInspector } from './LegendRoomInspector';
+import { DeviceNodeInspector } from './DeviceNodeInspector';
+import { CableInspector } from './CableInspector';
+import { ProjectSettingsInspector } from './ProjectSettingsInspector';
+import { CableMaterialSummaryPanel } from './CableMaterialSummaryPanel';
+import { PowerEnergyTabPanel } from './PowerEnergyTabPanel';
+import {
+  resolveInspectorTargets,
+  shouldFocusInspectorOnSelectionChange
+} from '../../utils/selectionSync';
+
+interface PropertiesPanelProps {
+  project: ProjectState;
+  selection: SelectionState;
+  auditIssues?: AuditIssue[];
+  is3DView?: boolean;
+  isReadOnlyMode?: boolean;
+  onUpdateAsset: (assetId: string, partial: Partial<DeviceAsset>) => void;
+  onUpdateNode: (nodeId: string, partial: Partial<DiagramNode>) => void;
+  onSetNodeIconOrLogo?: (nodeId: string, payload: { customIcon?: string; customImageUrl?: string }) => void;
+  onToggleNodeLock?: (nodeIds: string[]) => void;
+  onToggleNodeVisibility?: (nodeIds: string[], forceHidden?: boolean) => void;
+  onUpdateCable: (cableId: string, partial: Partial<CableEdge>) => void;
+  onSetCableColor?: (cableId: string, color: string) => void;
+  onSetCablesColorByType?: (cableType: CableEdge['cableType'], color: string) => void;
+  onReconnectCableEndpoint?: (cableId: string, endpoint: 'source' | 'target', newNodeId: string) => void;
+  onSelectCable?: (cableId: string) => void;
+  onSelectNode?: (nodeId: string) => void;
+  onUpdateRoom: (roomId: string, partial: Partial<Room>) => void;
+  onUpdateRack: (rackId: string, partial: Partial<ServerRack>) => void;
+  onAssignDeviceToRackSlot?: (rackId: string, assetId: string, preferredU: number, side?: RackSide) => void;
+  onRemoveDeviceFromRackSlot?: (rackId: string, assetIdOrU: string | number, side?: RackSide) => void;
+  onUpdateFloor: (floorId: string, partial: Partial<Floor>) => void;
+  onUpdateSettings: (partial: Partial<ProjectState['settings']>) => void;
+  onAutoAssignIps?: (options?: { preserveExistingValid?: boolean }) => AutoAssignIpResult;
+  onUpdateProjectMeta?: (meta: Partial<Pick<ProjectState, 'name' | 'author' | 'version'>>) => void;
+  onDuplicateProject?: () => void;
+  onDeleteNode: (nodeId: string) => void;
+  onDeleteNodes?: (nodeIds: string[]) => void;
+  onDuplicateNodes?: (nodeIds: string[]) => void;
+  onGroupNodes?: (nodeIds: string[]) => void;
+  onUngroupNodes?: (nodeIds: string[]) => void;
+  onAlignNodes?: (nodeIds: string[], alignment: 'left' | 'center' | 'right' | 'top' | 'middle' | 'bottom') => void;
+  onDistributeNodes?: (nodeIds: string[], axis: 'horizontal' | 'vertical') => void;
+  onAutoAlignSnapToGrid?: (nodeIds: string[], mode: SnapToGridAlignMode, options?: { evenSpacing?: boolean }) => void;
+  onDeleteCable: (cableId: string) => void;
+  onDeleteRoom: (roomId: string) => void;
+  onDeleteRack: (rackId: string) => void;
+  onOpenDeepInspect: (id: string, rackView?: '2d' | '3d') => void;
+  onCloneFloor: (floorId: string, newLevel: number, newName: string) => void;
+  onResizeLegendToFit?: (nodeId: string) => void;
+  onAutoRouteCable?: (cableId: string) => void;
+  onAutoRouteAllCables?: () => void;
+  hasCopiedStyle?: boolean;
+  onCopyNodeStyle?: (nodeId: string) => void;
+  onPasteNodeStyle?: (nodeIds: string[]) => void;
+  isCollapsed?: boolean;
+  onToggleCollapse?: () => void;
+  onClosePanel?: () => void;
+  requestedTab?: { tab: 'inspector' | 'power'; nonce: number };
+  layoutTier?: LayoutTier;
+  density?: UIDensity;
+  highContrast?: boolean;
+  reducedMotion?: boolean;
+  onToggleDensity?: () => void;
+  onToggleHighContrast?: () => void;
+  onToggleReducedMotion?: () => void;
+  onOpenBomModal?: () => void;
+  onAutoLayerDevices?: () => void;
+}
+
+const POWER_RELEVANT_CATEGORIES = new Set([
+  'core_switch',
+  'switch',
+  'router',
+  'firewall',
+  'server',
+  'storage',
+  'ups',
+  'pdu',
+  'electrical_panel',
+  'ap',
+  'camera',
+  'nvr'
+]);
+
+export const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
+  project,
+  selection,
+  auditIssues = [],
+  is3DView = false,
+  isReadOnlyMode = false,
+  onUpdateAsset,
+  onUpdateNode,
+  onSetNodeIconOrLogo,
+  onToggleNodeLock,
+  onToggleNodeVisibility,
+  onUpdateCable,
+  onSetCableColor,
+  onSetCablesColorByType,
+  onReconnectCableEndpoint,
+  onSelectCable,
+  onSelectNode,
+  onUpdateRoom,
+  onUpdateRack,
+  onAssignDeviceToRackSlot,
+  onRemoveDeviceFromRackSlot,
+  onUpdateFloor,
+  onUpdateSettings,
+  onAutoAssignIps,
+  onUpdateProjectMeta,
+  onDuplicateProject,
+  onDeleteNode,
+  onDeleteNodes,
+  onDuplicateNodes,
+  onGroupNodes,
+  onUngroupNodes,
+  onAlignNodes,
+  onDistributeNodes,
+  onAutoAlignSnapToGrid,
+  onDeleteCable,
+  onDeleteRoom,
+  onDeleteRack,
+  onOpenDeepInspect,
+  onCloneFloor,
+  onResizeLegendToFit,
+  onAutoRouteCable,
+  onAutoRouteAllCables,
+  hasCopiedStyle,
+  onCopyNodeStyle,
+  onPasteNodeStyle,
+  isCollapsed,
+  onToggleCollapse,
+  onClosePanel,
+  requestedTab,
+  layoutTier = 'wide',
+  density = 'compact',
+  highContrast = false,
+  reducedMotion = false,
+  onToggleDensity,
+  onToggleHighContrast,
+  onToggleReducedMotion,
+  onOpenBomModal,
+  onAutoLayerDevices
+}) => {
+  const [confirmDeleteKey, setConfirmDeleteKey] = useState<string | null>(null);
+  const [activePanelTab, setActivePanelTab] = useState<'inspector' | 'power'>('inspector');
+  const [isCableSummaryExpanded, setIsCableSummaryExpanded] = useState(false);
+
+  const poeSummary = useMemo(() => computeProjectPoeSummary(project), [project]);
+
+  const prevSelectionRef = useRef<SelectionState>(selection);
+
+  useEffect(() => {
+    setConfirmDeleteKey(null);
+    if (shouldFocusInspectorOnSelectionChange(prevSelectionRef.current, selection)) {
+      setActivePanelTab('inspector');
+    }
+    prevSelectionRef.current = selection;
+  }, [selection]);
+
+  const {
+    selectedRack,
+    selectedNode,
+    selectedAsset,
+    selectedCable,
+    selectedRoom,
+    selectedFloor,
+    selectedNodeIds
+  } = useMemo(() => resolveInspectorTargets(selection, project), [selection, project]);
+
+  const showPowerTab = useMemo(() => {
+    if (project.activeMode === 'electrical') return true;
+    if (selectedNodeIds.length > 1) return false;
+    if (selection.type === 'none' || selection.type === 'canvas') return true;
+    if (selectedRack) return true;
+    if (selectedNode && selectedNode.type === 'device' && selectedAsset) {
+      return POWER_RELEVANT_CATEGORIES.has(selectedAsset.category);
+    }
+    return false;
+  }, [project.activeMode, selectedNodeIds.length, selection.type, selectedRack, selectedNode, selectedAsset]);
+
+  useEffect(() => {
+    if (!showPowerTab && activePanelTab === 'power') {
+      setActivePanelTab('inspector');
+    }
+  }, [showPowerTab, activePanelTab]);
+
+  useEffect(() => {
+    if (requestedTab) {
+      setActivePanelTab(requestedTab.tab);
+    }
+  }, [requestedTab]);
+
+  if (isCollapsed) {
+    return (
+      <div className="w-12 h-full flex flex-col items-center py-3 bg-white dark:bg-slate-900 border-l border-slate-200 dark:border-slate-800 text-slate-500 shrink-0 select-none">
+        <button
+          type="button"
+          onClick={onToggleCollapse}
+          aria-label="Mở rộng bảng thuộc tính"
+          className="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-md text-[#155EEF] transition-colors"
+          title="Mở rộng bảng thuộc tính"
+        >
+          <ChevronLeft className="w-4 h-4" />
+        </button>
+        <button
+          type="button"
+          onClick={onToggleCollapse}
+          className="mt-4 text-xs font-semibold text-slate-500 hover:text-[#155EEF] rotate-180 cursor-pointer"
+          style={{ writingMode: 'vertical-rl' }}
+        >
+          Thuộc tính
+        </button>
+      </div>
+    );
+  }
+
+  let inspectorContent: React.ReactNode;
+
+  if (selectedNodeIds.length > 1) {
+    const selectedNodes = project.nodes.filter(n => selectedNodeIds.includes(n.id));
+    inspectorContent = (
+      <MultiNodeInspector
+        project={project}
+        selectedNodeIds={selectedNodeIds}
+        selectedNodes={selectedNodes}
+        isReadOnlyMode={isReadOnlyMode}
+        layoutTier={layoutTier}
+        confirmDeleteKey={confirmDeleteKey}
+        setConfirmDeleteKey={setConfirmDeleteKey}
+        onToggleCollapse={onToggleCollapse}
+        onClosePanel={onClosePanel}
+        onDeleteNodes={onDeleteNodes}
+        onDuplicateNodes={onDuplicateNodes}
+        onToggleNodeLock={onToggleNodeLock}
+        onToggleNodeVisibility={onToggleNodeVisibility}
+        onGroupNodes={onGroupNodes}
+        onUngroupNodes={onUngroupNodes}
+        onAlignNodes={onAlignNodes}
+        onDistributeNodes={onDistributeNodes}
+        onAutoAlignSnapToGrid={onAutoAlignSnapToGrid}
+        hasCopiedStyle={hasCopiedStyle}
+        onPasteNodeStyle={onPasteNodeStyle}
+      />
+    );
+  } else if (selectedRack) {
+    inspectorContent = (
+      <RackInspector
+        project={project}
+        selectedRack={selectedRack}
+        auditIssues={auditIssues}
+        isReadOnlyMode={isReadOnlyMode}
+        layoutTier={layoutTier}
+        confirmDeleteKey={confirmDeleteKey}
+        setConfirmDeleteKey={setConfirmDeleteKey}
+        onUpdateRack={onUpdateRack}
+        onDeleteRack={onDeleteRack}
+        onOpenDeepInspect={onOpenDeepInspect}
+        onRemoveDeviceFromRackSlot={onRemoveDeviceFromRackSlot}
+        onSelectNode={onSelectNode}
+        onToggleCollapse={onToggleCollapse}
+        onClosePanel={onClosePanel}
+      />
+    );
+  } else if (selectedNode && selectedNode.type === 'legend') {
+    inspectorContent = (
+      <LegendNodeInspector
+        project={project}
+        selectedNode={selectedNode}
+        isReadOnlyMode={isReadOnlyMode}
+        layoutTier={layoutTier}
+        confirmDeleteKey={confirmDeleteKey}
+        setConfirmDeleteKey={setConfirmDeleteKey}
+        onUpdateNode={onUpdateNode}
+        onDeleteNode={onDeleteNode}
+        onToggleNodeLock={onToggleNodeLock}
+        onToggleNodeVisibility={onToggleNodeVisibility}
+        onResizeLegendToFit={onResizeLegendToFit}
+        onToggleCollapse={onToggleCollapse}
+        onClosePanel={onClosePanel}
+      />
+    );
+  } else if (selectedNode) {
+    inspectorContent = (
+      <DeviceNodeInspector
+        project={project}
+        selectedNode={selectedNode}
+        selectedAsset={selectedAsset}
+        auditIssues={auditIssues}
+        isReadOnlyMode={isReadOnlyMode}
+        layoutTier={layoutTier}
+        confirmDeleteKey={confirmDeleteKey}
+        setConfirmDeleteKey={setConfirmDeleteKey}
+        onUpdateAsset={onUpdateAsset}
+        onUpdateNode={onUpdateNode}
+        onSetNodeIconOrLogo={onSetNodeIconOrLogo}
+        onToggleNodeLock={onToggleNodeLock}
+        onToggleNodeVisibility={onToggleNodeVisibility}
+        onDuplicateNodes={onDuplicateNodes}
+        onDeleteNode={onDeleteNode}
+        onDeleteCable={onDeleteCable}
+        onSelectCable={onSelectCable}
+        onSelectNode={onSelectNode}
+        onAssignDeviceToRackSlot={onAssignDeviceToRackSlot}
+        onRemoveDeviceFromRackSlot={onRemoveDeviceFromRackSlot}
+        onOpenDeepInspect={onOpenDeepInspect}
+        hasCopiedStyle={hasCopiedStyle}
+        onCopyNodeStyle={onCopyNodeStyle}
+        onPasteNodeStyle={onPasteNodeStyle}
+        onAutoLayerDevices={onAutoLayerDevices}
+        onToggleCollapse={onToggleCollapse}
+        onClosePanel={onClosePanel}
+      />
+    );
+  } else if (selectedCable) {
+    inspectorContent = (
+      <CableInspector
+        project={project}
+        selectedCable={selectedCable}
+        auditIssues={auditIssues}
+        isReadOnlyMode={isReadOnlyMode}
+        layoutTier={layoutTier}
+        confirmDeleteKey={confirmDeleteKey}
+        setConfirmDeleteKey={setConfirmDeleteKey}
+        onUpdateCable={onUpdateCable}
+        onSetCableColor={onSetCableColor}
+        onSetCablesColorByType={onSetCablesColorByType}
+        onReconnectCableEndpoint={onReconnectCableEndpoint}
+        onUpdateSettings={onUpdateSettings}
+        onDeleteCable={onDeleteCable}
+        onAutoRouteCable={onAutoRouteCable}
+        onAutoRouteAllCables={onAutoRouteAllCables}
+        onSelectNode={onSelectNode}
+        onToggleCollapse={onToggleCollapse}
+        onClosePanel={onClosePanel}
+      />
+    );
+  } else if (selectedRoom) {
+    inspectorContent = (
+      <RoomInspector
+        project={project}
+        selectedRoom={selectedRoom}
+        isReadOnlyMode={isReadOnlyMode}
+        confirmDeleteKey={confirmDeleteKey}
+        setConfirmDeleteKey={setConfirmDeleteKey}
+        onUpdateRoom={onUpdateRoom}
+        onDeleteRoom={onDeleteRoom}
+        onClosePanel={onClosePanel}
+      />
+    );
+  } else if (selectedFloor) {
+    inspectorContent = (
+      <FloorInspector
+        project={project}
+        selectedFloor={selectedFloor}
+        isReadOnlyMode={isReadOnlyMode}
+        onUpdateFloor={onUpdateFloor}
+        onCloneFloor={onCloneFloor}
+        onClosePanel={onClosePanel}
+      />
+    );
+  } else {
+    inspectorContent = (
+      <ProjectSettingsInspector
+        project={project}
+        is3DView={is3DView}
+        isReadOnlyMode={isReadOnlyMode}
+        layoutTier={layoutTier}
+        density={density}
+        highContrast={highContrast}
+        reducedMotion={reducedMotion}
+        onUpdateSettings={onUpdateSettings}
+        onAutoAssignIps={onAutoAssignIps}
+        onUpdateProjectMeta={onUpdateProjectMeta}
+        onDuplicateProject={onDuplicateProject}
+        onToggleNodeVisibility={onToggleNodeVisibility}
+        onAutoRouteAllCables={onAutoRouteAllCables}
+        onToggleDensity={onToggleDensity}
+        onToggleHighContrast={onToggleHighContrast}
+        onToggleReducedMotion={onToggleReducedMotion}
+        onToggleCollapse={onToggleCollapse}
+        onClosePanel={onClosePanel}
+        onOpenBomModal={onOpenBomModal}
+      />
+    );
+  }
+
+  return (
+    <div className="h-full flex flex-col bg-white dark:bg-slate-900 overflow-hidden">
+      {/* Contextual Top-level Panel Tabs: Thuộc tính | Điện/Năng lượng */}
+      {showPowerTab && (
+        <div className="px-2.5 py-2 border-l border-b border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900 flex items-center justify-between gap-2 shrink-0">
+          <div
+            role="tablist"
+            aria-label="Phân khu bảng thuộc tính"
+            className="flex-1 grid grid-cols-2 gap-1 bg-slate-200/70 dark:bg-slate-800 p-0.5 rounded-lg min-w-0"
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activePanelTab === 'inspector'}
+              onClick={() => setActivePanelTab('inspector')}
+              className={`py-1.5 px-2 rounded-md text-xs font-semibold flex items-center justify-center gap-1.5 whitespace-nowrap truncate transition-colors ${
+                activePanelTab === 'inspector'
+                  ? 'bg-white dark:bg-slate-900 text-[#155EEF] dark:text-blue-400 shadow-2xs'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+              }`}
+            >
+              <SlidersHorizontal className="w-3.5 h-3.5 shrink-0" />
+              <span className="truncate">Thuộc tính</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activePanelTab === 'power'}
+              onClick={() => setActivePanelTab('power')}
+              className={`py-1.5 px-2 rounded-md text-xs font-semibold flex items-center justify-center gap-1.5 whitespace-nowrap truncate transition-colors ${
+                activePanelTab === 'power'
+                  ? 'bg-white dark:bg-slate-900 text-[#155EEF] dark:text-blue-400 shadow-2xs'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+              }`}
+            >
+              <Zap
+                className={`w-3.5 h-3.5 shrink-0 ${
+                  poeSummary.status === 'overload'
+                    ? 'text-rose-500'
+                    : poeSummary.status === 'warning'
+                    ? 'text-amber-500'
+                    : ''
+                }`}
+              />
+              <span className="truncate">Điện/Năng lượng</span>
+            </button>
+          </div>
+
+          {activePanelTab === 'power' && (
+            <div className="flex items-center gap-0.5 shrink-0">
+              {onToggleCollapse && layoutTier === 'wide' && (
+                <button
+                  type="button"
+                  onClick={onToggleCollapse}
+                  aria-label="Thu gọn bảng thuộc tính"
+                  className="p-1.5 hover:bg-slate-200/70 dark:hover:bg-slate-800 rounded-md text-slate-500 hover:text-slate-700 dark:hover:text-slate-200 transition-colors"
+                  title="Thu gọn"
+                >
+                  <ChevronRight className="w-3.5 h-3.5" />
+                </button>
+              )}
+              {onClosePanel && (
+                <button
+                  type="button"
+                  onClick={onClosePanel}
+                  aria-label="Đóng bảng thuộc tính"
+                  className="p-1.5 hover:bg-slate-200/70 dark:hover:bg-slate-800 rounded-md text-slate-500 hover:text-slate-700 dark:hover:text-slate-200 transition-colors"
+                  title="Đóng"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {showPowerTab && activePanelTab === 'power' ? (
+        <div className="flex-1 min-h-0 overflow-hidden">
+          <PowerEnergyTabPanel
+            project={project}
+            selection={selection}
+            onSelectNode={onSelectNode}
+          />
+        </div>
+      ) : (
+        <>
+          <div className="flex-1 min-h-0 overflow-hidden">
+            {inspectorContent}
+          </div>
+          <CableMaterialSummaryPanel
+            cables={project.cables}
+            isExpanded={isCableSummaryExpanded}
+            onToggleExpand={() => setIsCableSummaryExpanded(prev => !prev)}
+            onOpenBomModal={onOpenBomModal}
+          />
+        </>
+      )}
+    </div>
+  );
+};
