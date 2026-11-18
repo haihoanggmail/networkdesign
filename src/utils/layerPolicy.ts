@@ -265,14 +265,6 @@ export function canDragNodeIn3DScene(
   return !isNodeEffectivelyLocked(node, settings, assets, Boolean(options.isReadOnlyMode));
 }
 
-export function canAddDevicesInScene(
-  options: { isReadOnlyMode?: boolean; is3DView?: boolean; is3DDragLocked?: boolean } = {}
-): boolean {
-  if (options.isReadOnlyMode) return false;
-  if (options.is3DView && (options.is3DDragLocked ?? true)) return false;
-  return true;
-}
-
 export function isRoomEffectivelyLocked(
   room: Pick<Room, 'locked'>,
   settings: Partial<CanvasSettings> | undefined,

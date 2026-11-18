@@ -1,10 +1,12 @@
 import { ProjectState } from '../../types/infrastructure';
 import { exportProjectToDxf } from '../../utils/dxfExporter';
-import { ExportContentScope, sanitizeExportBaseName } from './exportTypes';
+import { ExportContentScope, ExportFloorScope, sanitizeExportBaseName } from './exportTypes';
+import { trackExport } from '../../services/tracker';
 
 export function runExportDxf(
   project: ProjectState,
-  contentScope: ExportContentScope = '2d'
+  contentScope: ExportContentScope = '2d',
+  floorScope: ExportFloorScope = 'all'
 ): { filename: string } {
   if (contentScope === '3d') {
     throw new Error(
@@ -12,7 +14,8 @@ export function runExportDxf(
     );
   }
 
-  exportProjectToDxf(project);
+  exportProjectToDxf(project, { floorScope });
   const baseName = sanitizeExportBaseName(project.name);
+  trackExport('dxf');
   return { filename: `${baseName}_AutoCAD_R12.dxf` };
 }

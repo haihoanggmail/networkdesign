@@ -1,4 +1,4 @@
-import { CableEdge, CablePoint, CableTray } from '../types/infrastructure';
+import { CableEdge, CablePoint, CableTray, ProjectState } from '../types/infrastructure';
 
 export interface RectBox {
   x: number;
@@ -1295,5 +1295,76 @@ export function extractTrayGridAnchors(trays: CableTray[]): { xs: number[]; ys: 
     }
   }
   return { xs, ys };
+}
+
+export interface BatchCableRouteUpdate {
+  id: string;
+  controlPoints: CablePoint[];
+  lengthMeters: number;
+}
+
+/**
+ * Pure batch obstacle-avoiding router for all eligible cables in the active mode/floor.
+ * Shared between the Web Worker compute pipeline and synchronous fallback paths.
+ */
+export function computeBatchProjectCableRoutes(project: ProjectState): BatchCableRouteUpdate[] {
+  const modeCables = project.cables.filter(c => c.diagramMode === project.activeMode);
+  if (modeCables.length === 0) return [];
+
+  const nodeMap = new Map(project.nodes.map(n => [n.id, n]));
+  const occupiedSegments: Array<{ a: CablePoint; b: CablePoint }> = [];
+  const preferredTrays = (project.cableTrays || []).filter(
+    t => !project.activeFloorId || !t.floorId || t.floorId === project.activeFloorId
+  );
+
+  const updates: BatchCableRouteUpdate[] = [];
+  for (const cable of modeCables) {
+    const src = nodeMap.get(cable.sourceNodeId);
+    const tgt = nodeMap.get(cable.targetNodeId);
+    if (!src || !tgt) continue;
+    if (project.activeFloorId) {
+      if (src.floorId && src.floorId !== project.activeFloorId && tgt.floorId && tgt.floorId !== project.activeFloorId) {
+        continue;
+      }
+    }
+
+    const obstacles: AutoRouteObstacle[] = project.nodes
+      .filter(n => {
+        if (n.id === src.id || n.id === tgt.id) return false;
+        if (n.type === 'zone' || n.type === 'text') return false;
+        if (n.diagramMode !== cable.diagramMode) return false;
+        if (project.activeFloorId && n.floorId && n.floorId !== project.activeFloorId) return false;
+        return true;
+      })
+      .map(n => ({ id: n.id, x: n.x, y: n.y, width: n.width, height: n.height }));
+
+    const route = computeAutoRoutedWaypoints(src, tgt, obstacles, {
+      gridSize: project.settings.gridSize || 20,
+      clearancePx: 22,
+      occupiedSegments,
+      preferredTrays
+    });
+
+    const sCenter = { x: src.x + src.width / 2, y: src.y + src.height / 2 };
+    const tCenter = { x: tgt.x + tgt.width / 2, y: tgt.y + tgt.height / 2 };
+    const pts = [sCenter, ...route.controlPoints, tCenter];
+    for (let i = 0; i < pts.length - 1; i++) {
+      occupiedSegments.push({ a: pts[i], b: pts[i + 1] });
+    }
+
+    const updatedCable: CableEdge = {
+      ...cable,
+      routingType: 'orthogonal',
+      controlPoints: route.controlPoints
+    };
+    const lengthMeters = estimateCableLengthMeters(updatedCable, src, tgt, project.settings.scale || 30);
+    updates.push({
+      id: cable.id,
+      controlPoints: route.controlPoints,
+      lengthMeters
+    });
+  }
+
+  return updates;
 }
 

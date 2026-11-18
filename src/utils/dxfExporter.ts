@@ -2,21 +2,89 @@ import { ProjectState } from '../types/infrastructure';
 import { computeCablePath } from './cableRouting';
 import { APP_BUILD_HASH, APP_VERSION } from '../config/appInfo';
 
+export interface DxfExportOptions {
+  floorScope?: string;
+}
+
 /**
  * Generates an AutoCAD / LibreCAD compatible ASCII DXF (R12/AC1009) file
  * organized into distinct CAD layers: ROOMS, RACKS, DEVICES, CABLES, LABELS.
  * Y-axis is inverted cleanly so drawings appear upright in CAD viewports.
+ * Supports multi-floor side-by-side arrangement or single-floor filtering via options.floorScope.
  */
-export function generateProjectDxf(project: ProjectState): string {
+export function generateProjectDxf(project: ProjectState, options?: DxfExportOptions): string {
   const lines: string[] = [];
   const push = (...items: (string | number)[]) => {
     items.forEach(item => lines.push(String(item)));
   };
 
+  const sortedFloors = [...(project.floors || [])].sort((a, b) => a.level - b.level);
+  const isFloorBased = ['floorplan', 'cctv', 'wifi', 'fiber'].includes(project.activeMode);
+  const roomFloorMap = new Map((project.rooms || []).map(r => [r.id, r.floorId]));
+  const getNodeFloorId = (n: (typeof project.nodes)[number]) => {
+    const assetRoomId = n.assetId ? project.assets?.[n.assetId]?.roomId : undefined;
+    return n.floorId || (assetRoomId ? roomFloorMap.get(assetRoomId) : undefined) || project.activeFloorId;
+  };
+
+  const rawScope = options?.floorScope ?? 'all';
+  const targetSingleFloorId =
+    rawScope === 'active'
+      ? project.activeFloorId
+      : rawScope !== 'all' && rawScope !== '__ALL__' && sortedFloors.some(f => f.id === rawScope)
+        ? rawScope
+        : null;
+
+  const floorsToRender = targetSingleFloorId
+    ? sortedFloors.filter(f => f.id === targetSingleFloorId)
+    : isFloorBased && sortedFloors.length > 1
+      ? sortedFloors
+      : [];
+
+  // Compute horizontal offsets when laying out multiple floors side-by-side
+  const floorOffsetX = new Map<string, number>();
+  if (floorsToRender.length > 1) {
+    let cursorX = 0;
+    for (const fl of floorsToRender) {
+      let minX = Number.POSITIVE_INFINITY;
+      let maxX = Number.NEGATIVE_INFINITY;
+      project.rooms
+        .filter(r => r.floorId === fl.id)
+        .forEach(r => {
+          minX = Math.min(minX, r.x);
+          maxX = Math.max(maxX, r.x + r.width);
+        });
+      project.nodes
+        .filter(n => !n.hidden && getNodeFloorId(n) === fl.id)
+        .forEach(n => {
+          minX = Math.min(minX, n.x);
+          maxX = Math.max(maxX, n.x + n.width);
+        });
+      const baseMin = Number.isFinite(minX) ? minX : 0;
+      const spanW = Number.isFinite(maxX) ? Math.max(600, maxX - baseMin) : 900;
+      floorOffsetX.set(fl.id, cursorX - baseMin);
+      cursorX += spanW + 240;
+    }
+  } else if (targetSingleFloorId) {
+    floorOffsetX.set(targetSingleFloorId, 0);
+  }
+
+  const scopedRooms = targetSingleFloorId
+    ? project.rooms.filter(r => r.floorId === targetSingleFloorId)
+    : project.rooms;
+  const scopedNodes = (project.nodes || []).filter(n => {
+    if (n.hidden) return false;
+    if (!targetSingleFloorId) return true;
+    return getNodeFloorId(n) === targetSingleFloorId;
+  });
+  const scopedNodeIds = new Set(scopedNodes.map(n => n.id));
+  const scopedCables = (project.cables || []).filter(
+    c => scopedNodeIds.has(c.sourceNodeId) && scopedNodeIds.has(c.targetNodeId)
+  );
+
   // Find maxY to flip SVG Y-down into CAD Y-up coordinates
   let maxY = 1000;
-  project.nodes.forEach(n => { maxY = Math.max(maxY, n.y + n.height + 100); });
-  project.rooms.forEach(r => { maxY = Math.max(maxY, r.y + r.height + 100); });
+  scopedNodes.forEach(n => { maxY = Math.max(maxY, n.y + n.height + 120); });
+  scopedRooms.forEach(r => { maxY = Math.max(maxY, r.y + r.height + 120); });
   const flipY = (y: number) => Number((maxY - y).toFixed(2));
 
   const addLine = (layer: string, x1: number, y1: number, x2: number, y2: number, color = 7) => {
@@ -56,29 +124,45 @@ export function generateProjectDxf(project: ProjectState): string {
   // Entities
   push(0, 'SECTION', 2, 'ENTITIES');
 
-  project.rooms.forEach(room => {
-    addRect('ROOMS', room.x, room.y, room.width, room.height, 8);
-    addText('LABELS', room.x + 10, room.y + 18, 12, room.name, 8);
+  if (floorsToRender.length > 1) {
+    floorsToRender.forEach(fl => {
+      const ox = floorOffsetX.get(fl.id) ?? 0;
+      addText('LABELS', ox + 10, 24, 18, `TANG: ${fl.name}`, 4);
+    });
+  }
+
+  scopedRooms.forEach(room => {
+    const ox = floorsToRender.length > 1 ? (floorOffsetX.get(room.floorId) ?? 0) : 0;
+    addRect('ROOMS', room.x + ox, room.y, room.width, room.height, 8);
+    addText('LABELS', room.x + ox + 10, room.y + 18, 12, room.name, 8);
   });
 
-  const nodeMap = new Map(project.nodes.map(n => [n.id, n]));
+  const nodeMap = new Map(scopedNodes.map(n => [n.id, n]));
 
-  project.nodes.forEach(node => {
+  scopedNodes.forEach(node => {
+    const fId = getNodeFloorId(node);
+    const ox = floorsToRender.length > 1 && fId ? (floorOffsetX.get(fId) ?? 0) : 0;
     const layer = node.type === 'rack' ? 'RACKS' : 'DEVICES';
     const color = node.type === 'rack' ? 4 : 5;
-    addRect(layer, node.x, node.y, node.width, node.height, color);
-    addText('LABELS', node.x, node.y + node.height + 16, 10, node.label, 7);
+    addRect(layer, node.x + ox, node.y, node.width, node.height, color);
+    addText('LABELS', node.x + ox, node.y + node.height + 16, 10, node.label, 7);
     const asset = node.assetId ? project.assets[node.assetId] : undefined;
     if (asset?.ipAddress) {
-      addText('LABELS', node.x, node.y + node.height + 30, 8.5, asset.ipAddress, 3);
+      addText('LABELS', node.x + ox, node.y + node.height + 30, 8.5, asset.ipAddress, 3);
     }
   });
 
-  project.cables.forEach(cable => {
+  scopedCables.forEach(cable => {
     const src = nodeMap.get(cable.sourceNodeId);
     const tgt = nodeMap.get(cable.targetNodeId);
     if (!src || !tgt) return;
-    const pathInfo = computeCablePath(cable, src, tgt);
+    const srcFloor = getNodeFloorId(src);
+    const tgtFloor = getNodeFloorId(tgt);
+    const oxSrc = floorsToRender.length > 1 && srcFloor ? (floorOffsetX.get(srcFloor) ?? 0) : 0;
+    const oxTgt = floorsToRender.length > 1 && tgtFloor ? (floorOffsetX.get(tgtFloor) ?? 0) : 0;
+    const srcAdjusted = oxSrc !== 0 ? { ...src, x: src.x + oxSrc } : src;
+    const tgtAdjusted = oxTgt !== 0 ? { ...tgt, x: tgt.x + oxTgt } : tgt;
+    const pathInfo = computeCablePath(cable, srcAdjusted, tgtAdjusted);
     const pts = pathInfo.pts;
     for (let i = 0; i < pts.length - 1; i++) {
       addLine('CABLES', pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y, 3);
@@ -91,8 +175,8 @@ export function generateProjectDxf(project: ProjectState): string {
   return lines.join('\n');
 }
 
-export function exportProjectToDxf(project: ProjectState) {
-  const dxfContent = generateProjectDxf(project);
+export function exportProjectToDxf(project: ProjectState, options?: DxfExportOptions) {
+  const dxfContent = generateProjectDxf(project, options);
   const blob = new Blob([dxfContent], { type: 'application/dxf' });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');

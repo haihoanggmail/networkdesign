@@ -5,6 +5,7 @@ import { APP_BUILD_HASH, APP_VERSION } from '../config/appInfo';
 import { BomFilterOptions, computeProjectBomStats } from './bomAggregator';
 import { getAssetUHeight, getRackStatistics } from './rackGeometry';
 import { checkImportPayloadSize, MAX_EXCEL_FILE_BYTES } from './security';
+import { trackExport, trackTemplate } from '../services/tracker';
 
 const MAX_EXCEL_IMPORT_ROWS = 2000;
 
@@ -192,6 +193,7 @@ export async function downloadExcelTemplate() {
 
   addStyledSheet(wb, 'Mau_Thiet_Bi', columns, sampleRows);
   await triggerWorkbookDownload(wb, 'HACHIHI_Mau_Nhap_Thiet_Bi.xlsx');
+  trackTemplate('excel_device');
 }
 
 /**
@@ -604,6 +606,7 @@ export async function exportProjectToExcel(project: ProjectState) {
   const wb = buildProjectExcelWorkbook(project);
   const fileName = `${project.name.replace(/\s+/g, '_')}_Ho_So_Ha_Tang.xlsx`;
   await triggerWorkbookDownload(wb, fileName);
+  trackExport('excel');
 }
 
 /**
@@ -948,6 +951,7 @@ export async function exportBomDetailedExcel(project: ProjectState, options?: Bo
   const wb = buildDetailedBomExcelWorkbook(project, options);
   const fileName = `${project.name.replace(/\s+/g, '_')}_BOM_Du_Toan.xlsx`;
   await triggerWorkbookDownload(wb, fileName);
+  trackExport('excel_bom');
 }
 
 function parseCsvLine(line: string): string[] {

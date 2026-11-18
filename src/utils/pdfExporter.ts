@@ -1,12 +1,26 @@
 import { ProjectState } from '../types/infrastructure';
 import { APP_BUILD_HASH, APP_VERSION } from '../config/appInfo';
-import { computePureDiagramBounds, DiagramBounds, generatePureSvgMarkup } from './svgExport';
+import {
+  computePureDiagramBounds,
+  DiagramBounds,
+  generateCompositeBuildingSvgMarkup,
+  generatePureSvgMarkup
+} from './svgExport';
 import { buildProjectLegendData, GeneratedLegendData } from './legendGenerator';
 import { getRackStatistics, getAssetUHeight } from './rackGeometry';
 import { sanitizeSafeImageUrl } from './security';
+import { getHachihiLogoSvgMarkup } from './brandLogoSvg';
+import {
+  A4Orientation,
+  A4ScaleBarSpec,
+  A4ScaleMetrics,
+  PdfPaperSizeUpper,
+  computeA4ScaleMetrics,
+  getPaperDimensionsMm
+} from './pdfScale';
 
-export type A4Orientation = 'landscape' | 'portrait';
-export type PdfPaperSizeUpper = 'A4' | 'A3' | 'A2' | 'A1';
+export type { A4Orientation, A4ScaleBarSpec, A4ScaleMetrics, PdfPaperSizeUpper };
+export { computeA4ScaleMetrics, getPaperDimensionsMm };
 export type PdfContentScope = '2d' | '3d' | 'both';
 
 export interface Captured3DPageInput {
@@ -18,38 +32,13 @@ export interface Captured3DPageInput {
   background?: 'light' | 'dark';
 }
 
-export interface A4ScaleBarSpec {
-  totalMeters: number;
-  segmentMeters: number;
-  segments: number;
-  barWidthMm: number;
-  ticks: number[];
-}
-
-export interface A4ScaleMetrics {
-  pageWidthMm: number;
-  pageHeightMm: number;
-  marginMm: number;
-  drawAreaWidthMm: number;
-  drawAreaHeightMm: number;
-  renderedDrawWidthMm: number;
-  renderedDrawHeightMm: number;
-  mmPerWorldPx: number;
-  pxPerMeter: number;
-  printedMmPerMeter: number;
-  realWorldWidthMeters: number;
-  realWorldHeightMeters: number;
-  engineeringRatioDenominator: number;
-  scaleRatioLabel: string;
-  scaleBar: A4ScaleBarSpec;
-}
-
 export interface ExportA4PdfOptions {
   orientation?: A4Orientation;
   drawingCode?: string;
   drawingScale?: string;
   includeLegendPanel?: boolean;
   legendScope?: 'all' | 'activeFloor';
+  floorScope?: 'all' | 'active' | string;
   includeRackElevation?: boolean;
   includeTables?: boolean;
   pixelRatio?: number;
@@ -60,6 +49,59 @@ export interface ExportTechnicalPdfOptions extends ExportA4PdfOptions {
   paperSize?: PdfPaperSizeUpper;
   includeDiagram?: boolean;
   captures3D?: Captured3DPageInput[];
+}
+
+interface PdfFloorSheetSpec {
+  floorScopeId: string;
+  label: string;
+  isComposite: boolean;
+}
+
+function resolvePdfFloorSheets(
+  project: ProjectState,
+  floorScope: string | undefined
+): PdfFloorSheetSpec[] {
+  const sortedFloors = [...(project.floors || [])].sort((a, b) => a.level - b.level);
+  const isFloorBased = ['floorplan', 'cctv', 'wifi', 'fiber'].includes(project.activeMode);
+
+  if (floorScope === 'active') {
+    const active = sortedFloors.find(f => f.id === project.activeFloorId);
+    if (active) {
+      return [{ floorScopeId: active.id, label: active.name, isComposite: false }];
+    }
+  } else if (floorScope && floorScope !== 'all' && floorScope !== '__ALL__') {
+    const matched = sortedFloors.find(f => f.id === floorScope);
+    if (matched) {
+      return [{ floorScopeId: matched.id, label: matched.name, isComposite: false }];
+    }
+  }
+
+  if (isFloorBased && sortedFloors.length > 1) {
+    return [
+      {
+        floorScopeId: '__ALL__',
+        label: `Toàn bộ tòa nhà (${sortedFloors.length} tầng)`,
+        isComposite: true
+      },
+      ...sortedFloors.map(f => ({
+        floorScopeId: f.id,
+        label: f.name,
+        isComposite: false
+      }))
+    ];
+  }
+
+  const single = sortedFloors[0];
+  return [
+    {
+      floorScopeId: sortedFloors.length > 1 ? '__ALL__' : single?.id || '__ALL__',
+      label:
+        sortedFloors.length > 1
+          ? `Toàn bộ tòa nhà (${sortedFloors.length} tầng)`
+          : single?.name || 'Toàn bộ bản vẽ',
+      isComposite: false
+    }
+  ];
 }
 
 export interface ExportA4PdfResult {
@@ -104,98 +146,6 @@ function escapeHtml(input: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
-}
-
-/**
- * Pure scale calculator for ISO A4 technical drawings.
- * Maintains exact 1:1 world aspect ratio and computes physical mm-per-meter
- * plus a calibrated metric scale bar for the A4 sheet.
- */
-export function computeA4ScaleMetrics(
-  bounds: DiagramBounds,
-  pxPerMeterRaw: number | undefined,
-  orientation: A4Orientation = 'landscape',
-  options?: { includeLegendPanel?: boolean; paperSize?: PdfPaperSizeUpper }
-): A4ScaleMetrics {
-  const dims = getPaperDimensionsMm(options?.paperSize || 'A4', orientation);
-  const pageWidthMm = dims.widthMm;
-  const pageHeightMm = dims.heightMm;
-  const marginMm = 8;
-  const headerHeightMm = 13;
-  const titleBlockHeightMm = 21;
-  const includeLegendPanel = options?.includeLegendPanel ?? true;
-
-  const contentW = pageWidthMm - marginMm * 2;
-  const contentH = pageHeightMm - marginMm * 2 - headerHeightMm - titleBlockHeightMm;
-
-  const legendReserveW = includeLegendPanel && orientation === 'landscape' ? 66 : 0;
-  const legendReserveH = includeLegendPanel && orientation === 'portrait' ? 54 : 0;
-
-  const drawAreaWidthMm = Math.max(80, contentW - legendReserveW - (legendReserveW > 0 ? 3 : 0));
-  const drawAreaHeightMm = Math.max(80, contentH - legendReserveH - (legendReserveH > 0 ? 3 : 0));
-
-  const safeW = Math.max(100, bounds.width);
-  const safeH = Math.max(100, bounds.height);
-  const mmPerWorldPx = Math.min(drawAreaWidthMm / safeW, drawAreaHeightMm / safeH);
-
-  const renderedDrawWidthMm = Number((safeW * mmPerWorldPx).toFixed(2));
-  const renderedDrawHeightMm = Number((safeH * mmPerWorldPx).toFixed(2));
-
-  const pxPerMeter = Math.max(1, Number(pxPerMeterRaw || 30));
-  const printedMmPerMeter = mmPerWorldPx * pxPerMeter;
-  const realWorldWidthMeters = Number((safeW / pxPerMeter).toFixed(2));
-  const realWorldHeightMeters = Number((safeH / pxPerMeter).toFixed(2));
-
-  const engineeringRatioDenominator = Math.max(1, Math.round(1000 / Math.max(0.05, printedMmPerMeter)));
-  const scaleRatioLabel = `1:${engineeringRatioDenominator}`;
-
-  // Pick a clean metric scale bar span between ~22mm and ~56mm on A4
-  const candidateTotals = [0.5, 1, 2, 4, 5, 10, 20, 40, 50, 100, 200, 500];
-  let chosenTotal = 5;
-  let bestDist = Infinity;
-  for (const m of candidateTotals) {
-    const wMm = m * printedMmPerMeter;
-    if (wMm >= 22 && wMm <= 56) {
-      chosenTotal = m;
-      bestDist = 0;
-      break;
-    }
-    const dist = Math.abs(wMm - 38);
-    if (dist < bestDist) {
-      bestDist = dist;
-      chosenTotal = m;
-    }
-  }
-
-  const rawBarWidthMm = chosenTotal * printedMmPerMeter;
-  const clampedBarWidthMm = Number(Math.max(18, Math.min(64, rawBarWidthMm)).toFixed(2));
-  const segments = 4;
-  const segmentMeters = Number((chosenTotal / segments).toFixed(2));
-  const ticks = [0, Number((chosenTotal / 2).toFixed(2)), chosenTotal];
-
-  return {
-    pageWidthMm,
-    pageHeightMm,
-    marginMm,
-    drawAreaWidthMm: Number(drawAreaWidthMm.toFixed(2)),
-    drawAreaHeightMm: Number(drawAreaHeightMm.toFixed(2)),
-    renderedDrawWidthMm,
-    renderedDrawHeightMm,
-    mmPerWorldPx,
-    pxPerMeter,
-    printedMmPerMeter: Number(printedMmPerMeter.toFixed(3)),
-    realWorldWidthMeters,
-    realWorldHeightMeters,
-    engineeringRatioDenominator,
-    scaleRatioLabel,
-    scaleBar: {
-      totalMeters: chosenTotal,
-      segmentMeters,
-      segments,
-      barWidthMm: clampedBarWidthMm,
-      ticks
-    }
-  };
 }
 
 /**
@@ -406,9 +356,14 @@ function buildTitleBlockHtml(
       <tbody>
         <tr>
           <td rowspan="2" style="border:1px solid #14213d;padding:5px 8px;width:36%;vertical-align:middle;">
-            <div style="font-size:8px;font-weight:700;color:#155eef;letter-spacing:0.04em;">HACHIHI NETWORK &amp; ELECTRICAL DESIGNER · hachihi.vn</div>
-            <div style="font-size:11px;font-weight:800;color:#0f172a;margin-top:2px;">${escapeHtml(project.name)}</div>
-            <div style="font-size:7.5px;color:#475569;margin-top:1px;">${options.subtitle ? `${escapeHtml(options.subtitle)} · ` : ''}Hotline: 093 384 2126 · App v${escapeHtml(APP_VERSION)} (${escapeHtml(APP_BUILD_HASH)})</div>
+            <div style="display:flex;align-items:center;gap:8px;">
+              ${getHachihiLogoSvgMarkup(24, 'light', `pdf_${options.pageNumber}`)}
+              <div style="min-width:0;">
+                <div style="font-size:8px;font-weight:700;color:#155eef;letter-spacing:0.04em;">HACHIHI NETWORK &amp; ELECTRICAL DESIGNER · hachihi.vn</div>
+                <div style="font-size:11px;font-weight:800;color:#0f172a;margin-top:2px;">${escapeHtml(project.name)}</div>
+                <div style="font-size:7.5px;color:#475569;margin-top:1px;">${options.subtitle ? `${escapeHtml(options.subtitle)} · ` : ''}Hotline: 093 384 2126 · App v${escapeHtml(APP_VERSION)} (${escapeHtml(APP_BUILD_HASH)})</div>
+              </div>
+            </div>
           </td>
           <td style="border:1px solid #14213d;padding:4px 7px;">
             <span style="color:#64748b;">Số hiệu:</span> <strong style="font-family:'JetBrains Mono',monospace;">${escapeHtml(options.drawingCode)}</strong>
@@ -447,6 +402,8 @@ function createA4DrawingPageElement(
     includeLegendPanel: boolean;
     drawingCode: string;
     drawingScale: string;
+    pageNumber?: number;
+    floorLabel?: string;
     totalPages: number;
   }
 ): HTMLDivElement {
@@ -460,7 +417,8 @@ function createA4DrawingPageElement(
   const renderedH = mmToPx(metrics.renderedDrawHeightMm);
 
   const activeFloor = project.floors.find(f => f.id === project.activeFloorId);
-  const floorBadge = activeFloor ? activeFloor.name : 'Toàn bộ tầng';
+  const floorBadge = options.floorLabel || (activeFloor ? activeFloor.name : 'Toàn bộ tầng');
+  const pageNumber = options.pageNumber ?? 1;
 
   const pageEl = document.createElement('div');
   pageEl.style.width = `${pagePxW}px`;
@@ -512,7 +470,7 @@ function createA4DrawingPageElement(
           drawingScale: options.drawingScale,
           orientation: options.orientation,
           paperSize: paperLabel,
-          pageNumber: 1,
+          pageNumber,
           totalPages: options.totalPages,
           subtitle: `Sơ đồ ${project.activeMode.toUpperCase()} · ${floorBadge}`
         })}
@@ -746,38 +704,89 @@ export async function buildA4PdfArtifact(
     options?.legendScope ||
     (['floorplan', 'cctv', 'wifi', 'fiber'].includes(project.activeMode) ? 'activeFloor' : 'all');
 
-  const bounds = computePureDiagramBounds(project);
+  const floorSheets = resolvePdfFloorSheets(project, options?.floorScope ?? 'active');
+  const firstSheetScopeId = floorSheets[0]?.floorScopeId ?? '__ALL__';
+  const bounds = computePureDiagramBounds(project, { floorScopeId: firstSheetScopeId });
   const scaleMetrics = computeA4ScaleMetrics(bounds, project.settings.scale, orientation, {
     includeLegendPanel
-  });
-
-  const pureSvg = generatePureSvgMarkup(project, {
-    darkTheme: false,
-    includeTitleBlock: false
-  });
-  const diagramPngDataUrl = await rasterizeSvgMarkupToPng(pureSvg, bounds);
-  const legendData = buildProjectLegendData(project, {
-    scope: legendScope,
-    includeCables: true
   });
 
   const hasRackPage = includeRackElevation && project.racks.length > 0;
   const hasSchedulePage =
     includeTables && (Object.keys(project.assets).length > 0 || project.cables.length > 0);
-  const totalPages = 1 + (hasRackPage ? 1 : 0) + (hasSchedulePage ? 1 : 0);
+  const totalPages = floorSheets.length + (hasRackPage ? 1 : 0) + (hasSchedulePage ? 1 : 0);
+
+  if (typeof document === 'undefined') {
+    const { jsPDF } = await import('jspdf');
+    const pdf = new jsPDF({ orientation, unit: 'mm', format: 'a4', compress: true });
+    let pageIdx = 0;
+    for (const sheet of floorSheets) {
+      if (pageIdx > 0) pdf.addPage('a4', orientation);
+      pageIdx++;
+      pdf.setFontSize(13);
+      pdf.text(`HACHIHI 2D CAD - ${sheet.label}`, 12, 16);
+    }
+    if (hasRackPage) {
+      if (pageIdx > 0) pdf.addPage('a4', orientation);
+      pageIdx++;
+      pdf.text(`Rack Elevation Appendix (${project.racks.length})`, 12, 16);
+    }
+    if (hasSchedulePage) {
+      if (pageIdx > 0) pdf.addPage('a4', orientation);
+      pageIdx++;
+      pdf.text(`Schedule Appendix`, 12, 16);
+    }
+    const safeName =
+      (project.name || 'HACHIHI_Network_Design')
+        .trim()
+        .replace(/[^\p{L}\p{N}_-]+/gu, '_')
+        .replace(/^_+|_+$/g, '') || 'HACHIHI_Technical_Drawing';
+    const uint8 = new Uint8Array(pdf.output('arraybuffer'));
+    return {
+      blob: new Blob([uint8], { type: 'application/pdf' }),
+      uint8,
+      filename: `${safeName}_A4_Technical.pdf`,
+      pageCount: pageIdx,
+      scaleMetrics
+    };
+  }
 
   const pageElements: HTMLDivElement[] = [];
-  pageElements.push(
-    createA4DrawingPageElement(project, diagramPngDataUrl, scaleMetrics, legendData, {
-      orientation,
-      includeLegendPanel,
-      drawingCode,
-      drawingScale,
-      totalPages
-    })
-  );
+  let nextPage = 1;
+  for (const sheet of floorSheets) {
+    const sheetBounds = computePureDiagramBounds(project, { floorScopeId: sheet.floorScopeId });
+    const sheetMetrics = computeA4ScaleMetrics(sheetBounds, project.settings.scale, orientation, {
+      includeLegendPanel
+    });
+    const pureSvg = sheet.isComposite
+      ? generateCompositeBuildingSvgMarkup(project, { darkTheme: false, includeTitleBlock: false })
+      : generatePureSvgMarkup(project, {
+          darkTheme: false,
+          includeTitleBlock: false,
+          floorScopeId: sheet.floorScopeId
+        });
+    const diagramPngDataUrl = await rasterizeSvgMarkupToPng(pureSvg, sheetBounds);
+    const sheetProject: ProjectState =
+      sheet.floorScopeId !== '__ALL__' && project.floors.some(f => f.id === sheet.floorScopeId)
+        ? { ...project, activeFloorId: sheet.floorScopeId }
+        : project;
+    const sheetLegendData = buildProjectLegendData(sheetProject, {
+      scope: sheet.isComposite ? 'all' : legendScope,
+      includeCables: true
+    });
+    pageElements.push(
+      createA4DrawingPageElement(sheetProject, diagramPngDataUrl, sheetMetrics, sheetLegendData, {
+        orientation,
+        includeLegendPanel,
+        drawingCode,
+        drawingScale,
+        pageNumber: nextPage++,
+        floorLabel: sheet.label,
+        totalPages
+      })
+    );
+  }
 
-  let nextPage = 2;
   if (hasRackPage) {
     pageElements.push(
       createA4AppendixPageElement(project, scaleMetrics, {
@@ -910,22 +919,6 @@ export async function exportCanvasToA4Pdf(
     pageCount: artifact.pageCount,
     scaleMetrics: artifact.scaleMetrics
   };
-}
-
-function getPaperDimensionsMm(
-  paperSize: PdfPaperSizeUpper,
-  orientation: A4Orientation
-): { widthMm: number; heightMm: number; format: 'a4' | 'a3' | 'a2' | 'a1' } {
-  const baseMap: Record<PdfPaperSizeUpper, { short: number; long: number; format: 'a4' | 'a3' | 'a2' | 'a1' }> = {
-    A4: { short: 210, long: 297, format: 'a4' },
-    A3: { short: 297, long: 420, format: 'a3' },
-    A2: { short: 420, long: 594, format: 'a2' },
-    A1: { short: 594, long: 841, format: 'a1' }
-  };
-  const spec = baseMap[paperSize] || baseMap.A4;
-  return orientation === 'landscape'
-    ? { widthMm: spec.long, heightMm: spec.short, format: spec.format }
-    : { widthMm: spec.short, heightMm: spec.long, format: spec.format };
 }
 
 function create3DFramePageElement(
@@ -1088,13 +1081,14 @@ export async function buildTechnicalPdfArtifact(
   });
 
   const include2DPage = includeDiagram && (contentScope === '2d' || contentScope === 'both');
+  const floorSheets = include2DPage ? resolvePdfFloorSheets(project, options?.floorScope ?? 'all') : [];
   const captures3DToRender = includeDiagram && (contentScope === '3d' || contentScope === 'both') ? captures3D : [];
   const hasRackPage = includeRackElevation && project.racks.length > 0;
   const hasSchedulePage =
     includeTables && (Object.keys(project.assets).length > 0 || project.cables.length > 0);
 
   const totalPages =
-    (include2DPage ? 1 : 0) +
+    floorSheets.length +
     captures3DToRender.length +
     (hasRackPage ? 1 : 0) +
     (hasSchedulePage ? 1 : 0);
@@ -1106,10 +1100,11 @@ export async function buildTechnicalPdfArtifact(
   // Headless Node environment fallback (used by automated unit tests verifying binary PDF creation & aspect ratios)
   if (typeof document === 'undefined') {
     let pageIdx = 0;
-    if (include2DPage) {
+    for (const sheet of floorSheets) {
+      if (pageIdx > 0) pdf.addPage(paperDims.format, orientation);
       pageIdx++;
       pdf.setFontSize(13);
-      pdf.text(`HACHIHI 2D CAD - ${safeName}`, 12, 16);
+      pdf.text(`HACHIHI 2D CAD - ${safeName} (${sheet.label})`, 12, 16);
     }
     for (const cap of captures3DToRender) {
       if (pageIdx > 0) pdf.addPage(paperDims.format, orientation);
@@ -1171,22 +1166,39 @@ export async function buildTechnicalPdfArtifact(
   const jobs: RenderJob[] = [];
   let pageCursor = 1;
 
-  if (include2DPage) {
-    const pureSvg = generatePureSvgMarkup(project, {
-      darkTheme: false,
-      includeTitleBlock: false
+  for (const sheet of floorSheets) {
+    const sheetBounds = computePureDiagramBounds(project, { floorScopeId: sheet.floorScopeId });
+    const sheetMetrics = computeA4ScaleMetrics(sheetBounds, project.settings.scale, orientation, {
+      includeLegendPanel,
+      paperSize
     });
-    const diagramPngDataUrl = await rasterizeSvgMarkupToPng(pureSvg, bounds);
-    const el2d = createA4DrawingPageElement(project, diagramPngDataUrl, scaleMetrics, legendData, {
+    const pureSvg = sheet.isComposite
+      ? generateCompositeBuildingSvgMarkup(project, { darkTheme: false, includeTitleBlock: false })
+      : generatePureSvgMarkup(project, {
+          darkTheme: false,
+          includeTitleBlock: false,
+          floorScopeId: sheet.floorScopeId
+        });
+    const diagramPngDataUrl = await rasterizeSvgMarkupToPng(pureSvg, sheetBounds);
+    const sheetProject: ProjectState =
+      sheet.floorScopeId !== '__ALL__' && project.floors.some(f => f.id === sheet.floorScopeId)
+        ? { ...project, activeFloorId: sheet.floorScopeId }
+        : project;
+    const sheetLegendData = buildProjectLegendData(sheetProject, {
+      scope: sheet.isComposite ? 'all' : legendScope,
+      includeCables: true
+    });
+    const el2d = createA4DrawingPageElement(sheetProject, diagramPngDataUrl, sheetMetrics, sheetLegendData, {
       orientation,
       paperSize,
       includeLegendPanel,
       drawingCode,
       drawingScale,
+      pageNumber: pageCursor++,
+      floorLabel: sheet.label,
       totalPages
     });
     jobs.push({ kind: 'dom', element: el2d });
-    pageCursor++;
   }
 
   for (const cap of captures3DToRender) {

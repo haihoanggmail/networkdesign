@@ -47,6 +47,8 @@ export interface EngineeringAuditReport {
   powerDomains?: UpsPowerDomainAudit[];
 }
 
+export type AuditReport = EngineeringAuditReport;
+
 export interface ResolvedUpsPower {
   activeWatts: number;
   ratedVa: number;

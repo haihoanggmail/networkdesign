@@ -49,6 +49,7 @@ export function createSaveCoordinator<T>(options: SaveCoordinatorOptions<T>): Sa
 
   let dirtyVersion = 0;
   let committedVersion = 0;
+  let generation = 0;
   let hasUnsavedChanges = false;
   let isSaving = false;
   let lastSavedAt: string | null = null;
@@ -81,8 +82,9 @@ export function createSaveCoordinator<T>(options: SaveCoordinatorOptions<T>): Sa
       return activeDrainPromise;
     }
 
-    activeDrainPromise = (async (): Promise<SaveFlushResult> => {
-      while (!disposed && committedVersion < dirtyVersion && latestSnapshot !== undefined) {
+    const opGeneration = generation;
+    const drainPromise = (async (): Promise<SaveFlushResult> => {
+      while (!disposed && opGeneration === generation && committedVersion < dirtyVersion && latestSnapshot !== undefined) {
         const targetVersion = dirtyVersion;
         const savedAtIso = new Date().toISOString();
         const candidate = options.stampSnapshot
@@ -102,12 +104,10 @@ export function createSaveCoordinator<T>(options: SaveCoordinatorOptions<T>): Sa
           };
         }
 
-        if (disposed) {
-          isSaving = false;
-          activeDrainPromise = null;
+        if (disposed || opGeneration !== generation) {
           return {
             ok: false,
-            error: 'SaveCoordinator disposed',
+            error: disposed ? 'SaveCoordinator disposed' : 'SaveCoordinator reset during persist',
             committedVersion,
             dirtyVersion
           };
@@ -154,8 +154,10 @@ export function createSaveCoordinator<T>(options: SaveCoordinatorOptions<T>): Sa
         }
       }
 
-      isSaving = false;
-      emitStatus();
+      if (!disposed && opGeneration === generation) {
+        isSaving = false;
+        emitStatus();
+      }
       return {
         ok: storageError === null,
         error: storageError,
@@ -164,10 +166,13 @@ export function createSaveCoordinator<T>(options: SaveCoordinatorOptions<T>): Sa
       };
     })();
 
+    activeDrainPromise = drainPromise;
     try {
-      return await activeDrainPromise;
+      return await drainPromise;
     } finally {
-      activeDrainPromise = null;
+      if (activeDrainPromise === drainPromise) {
+        activeDrainPromise = null;
+      }
     }
   };
 
@@ -179,26 +184,25 @@ export function createSaveCoordinator<T>(options: SaveCoordinatorOptions<T>): Sa
     return dirtyVersion;
   };
 
-  const scheduleSave = (snapshot: T, delayOverrideMs?: number): number => {
-    const ver = markDirty(snapshot);
+  const scheduleFlushAfterDelay = (delayMs: number) => {
     clearDebounceTimer();
-    if (disposed) return ver;
-
-    const waitMs = Math.max(0, delayOverrideMs ?? debounceMs);
+    if (disposed) return;
     debounceTimer = setTimeout(() => {
       debounceTimer = null;
       if (disposed) return;
       if (options.shouldDeferAutoSave?.()) {
-        // Re-schedule shortly while user finishes dragging
-        debounceTimer = setTimeout(() => {
-          debounceTimer = null;
-          if (!disposed) void runDrainLoop();
-        }, waitMs);
+        // Keep re-deferring until user finishes dragging or interaction ends
+        scheduleFlushAfterDelay(Math.max(10, delayMs));
         return;
       }
       void runDrainLoop();
-    }, waitMs);
+    }, delayMs);
+  };
 
+  const scheduleSave = (snapshot: T, delayOverrideMs?: number): number => {
+    const ver = markDirty(snapshot);
+    const waitMs = Math.max(0, delayOverrideMs ?? debounceMs);
+    scheduleFlushAfterDelay(waitMs);
     return ver;
   };
 
@@ -240,6 +244,8 @@ export function createSaveCoordinator<T>(options: SaveCoordinatorOptions<T>): Sa
 
   const reset = (cleanSnapshot?: T, savedAt: string | null = null) => {
     clearDebounceTimer();
+    generation += 1;
+    activeDrainPromise = null;
     dirtyVersion += 1;
     committedVersion = dirtyVersion;
     latestSnapshot = cleanSnapshot;

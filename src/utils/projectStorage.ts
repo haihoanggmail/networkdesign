@@ -8,6 +8,8 @@ import {
   SubnetSpec,
   PatchLink,
   ProjectRevision,
+  ProjectSnapshot,
+  ProjectSnapshotTrigger,
   RevisionDiffSummary,
   CableTray,
   CanvasGuideLine
@@ -27,12 +29,16 @@ export const RECOVERY_SNAPSHOTS_KEY = 'hachihi_network_designer_recovery_snapsho
 export const MAX_RECOVERY_SNAPSHOTS = 3;
 export const RECOVERY_ENVELOPE_VERSION = 1;
 export const CURRENT_SCHEMA_VERSION = 5;
+export const AUTO_SNAPSHOT_INTERVAL_MS = 10 * 60 * 1000;
+export const MAX_INDEXEDDB_SNAPSHOTS_PER_PROJECT = 24;
+export const MAX_LOCALSTORAGE_RECOVERY_CHARS = 1_500_000;
 
 const IDB_NAME = 'hachihi_designer_db';
-const IDB_VERSION = 2;
+const IDB_VERSION = 3;
 const STORE_PROJECTS = 'projects';
 const STORE_META = 'meta';
 const STORE_REVISIONS = 'revisions';
+const STORE_SNAPSHOTS = 'snapshots';
 
 export const DEFAULT_CANVAS_SETTINGS: CanvasSettings = {
   gridSize: 20,
@@ -54,7 +60,8 @@ export const DEFAULT_CANVAS_SETTINGS: CanvasSettings = {
   ipRangeStart: '192.168.10.10',
   ipRangeEnd: '192.168.10.250',
   ipSubnetMask: '255.255.255.0',
-  ipGateway: '192.168.10.1'
+  ipGateway: '192.168.10.1',
+  experienceMode: 'advanced'
 };
 
 export type MigrationResult =
@@ -544,9 +551,15 @@ function hasIndexedDB(): boolean {
   return typeof indexedDB !== 'undefined';
 }
 
+let sharedDbPromise: Promise<IDBDatabase> | null = null;
+
 function openDB(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
+  if (sharedDbPromise) {
+    return sharedDbPromise;
+  }
+  const promise = new Promise<IDBDatabase>((resolve, reject) => {
     if (!hasIndexedDB()) {
+      sharedDbPromise = null;
       reject(new Error('Trình duyệt không hỗ trợ IndexedDB.'));
       return;
     }
@@ -563,10 +576,42 @@ function openDB(): Promise<IDBDatabase> {
         const revStore = db.createObjectStore(STORE_REVISIONS, { keyPath: 'id' });
         revStore.createIndex('by_project', 'projectId', { unique: false });
       }
+      if (!db.objectStoreNames.contains(STORE_SNAPSHOTS)) {
+        const snapStore = db.createObjectStore(STORE_SNAPSHOTS, { keyPath: 'id' });
+        snapStore.createIndex('by_project', 'projectId', { unique: false });
+      }
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error || new Error('Không thể mở cơ sở dữ liệu IndexedDB.'));
+    req.onsuccess = () => {
+      const db = req.result;
+      db.onversionchange = () => {
+        try {
+          db.close();
+        } catch {
+          // ignore
+        }
+        sharedDbPromise = null;
+      };
+      db.onclose = () => {
+        if (sharedDbPromise === promise) {
+          sharedDbPromise = null;
+        }
+      };
+      resolve(db);
+    };
+    req.onerror = () => {
+      if (sharedDbPromise === promise) {
+        sharedDbPromise = null;
+      }
+      reject(req.error || new Error('Không thể mở cơ sở dữ liệu IndexedDB.'));
+    };
+    req.onblocked = () => {
+      if (sharedDbPromise === promise) {
+        sharedDbPromise = null;
+      }
+    };
   });
+  sharedDbPromise = promise;
+  return promise;
 }
 
 export async function requestPersistentStorage(): Promise<boolean> {
@@ -594,6 +639,28 @@ export function toProjectSummary(rec: StoredProjectRecord): ProjectSummary {
     cableCount: rec.cableCount,
     isTrashed: rec.isTrashed,
     trashedAt: rec.trashedAt
+  };
+}
+
+export function toProjectSummaryFromState(
+  project: ProjectState,
+  isTrashed = false,
+  trashedAt?: string
+): ProjectSummary {
+  const now = new Date().toISOString();
+  return {
+    id: project.id,
+    name: project.name,
+    author: project.author,
+    version: project.version,
+    lastModified: project.lastModified || now,
+    lastSavedAt: project.lastSavedAt || now,
+    nodeCount: project.nodes.length,
+    assetCount: Object.keys(project.assets || {}).length,
+    rackCount: project.racks.length,
+    cableCount: project.cables.length,
+    isTrashed,
+    trashedAt
   };
 }
 
@@ -633,7 +700,6 @@ export async function saveProjectToDB(
       tx.onerror = () => reject(tx.error || new Error('Lỗi ghi dữ liệu vào IndexedDB.'));
       tx.onabort = () => reject(tx.error || new Error('Giao dịch lưu IndexedDB bị hủy.'));
     });
-    db.close();
     return { ok: true };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -650,7 +716,6 @@ export async function listProjectsFromDB(): Promise<ProjectSummary[]> {
       req.onsuccess = () => resolve((req.result || []) as StoredProjectRecord[]);
       req.onerror = () => reject(req.error);
     });
-    db.close();
     return records
       .map(toProjectSummary)
       .sort((a, b) => new Date(b.lastModified).getTime() - new Date(a.lastModified).getTime());
@@ -668,7 +733,6 @@ export async function loadProjectFromDB(projectId: string): Promise<ProjectState
       req.onsuccess = () => resolve(req.result as StoredProjectRecord | undefined);
       req.onerror = () => reject(req.error);
     });
-    db.close();
     if (!record?.data) return null;
     const migrated = migrateAndValidateProject(record.data);
     return migrated.ok ? migrated.project : null;
@@ -695,7 +759,6 @@ export async function setProjectTrashStateInDB(projectId: string, isTrashed: boo
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
-    db.close();
     return true;
   } catch {
     return false;
@@ -706,12 +769,25 @@ export async function deleteProjectPermanentlyFromDB(projectId: string): Promise
   try {
     const db = await openDB();
     await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(STORE_PROJECTS, 'readwrite');
+      const storeNames = db.objectStoreNames.contains(STORE_SNAPSHOTS)
+        ? [STORE_PROJECTS, STORE_SNAPSHOTS]
+        : [STORE_PROJECTS];
+      const tx = db.transaction(storeNames, 'readwrite');
       tx.objectStore(STORE_PROJECTS).delete(projectId);
+      if (db.objectStoreNames.contains(STORE_SNAPSHOTS)) {
+        const snapStore = tx.objectStore(STORE_SNAPSHOTS);
+        const index = snapStore.index('by_project');
+        const req = index.getAllKeys(projectId);
+        req.onsuccess = () => {
+          const keys = (req.result || []) as IDBValidKey[];
+          for (const key of keys) {
+            snapStore.delete(key);
+          }
+        };
+      }
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
-    db.close();
     return true;
   } catch {
     return false;
@@ -727,7 +803,6 @@ export async function getMetaValue<T = string>(key: string): Promise<T | null> {
       req.onsuccess = () => resolve(req.result as { key: string; value: T } | undefined);
       req.onerror = () => reject(req.error);
     });
-    db.close();
     return res ? res.value : null;
   } catch {
     return null;
@@ -743,7 +818,6 @@ export async function setMetaValue<T = string>(key: string, value: T): Promise<v
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
-    db.close();
   } catch {
     // non-fatal
   }
@@ -762,7 +836,6 @@ export async function saveRevisionToDB(revision: ProjectRevision): Promise<boole
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
-    db.close();
     return true;
   } catch {
     return false;
@@ -780,7 +853,6 @@ export async function listRevisionsFromDB(projectId: string): Promise<ProjectRev
       req.onsuccess = () => resolve((req.result || []) as ProjectRevision[]);
       req.onerror = () => reject(req.error);
     });
-    db.close();
     return list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   } catch {
     return [];
@@ -796,7 +868,199 @@ export async function deleteRevisionFromDB(revisionId: string): Promise<boolean>
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
-    db.close();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/* --------------------------------------------------------------------------
+ * Periodic IndexedDB Project Snapshots (Auto 10-min + Manual + Pre-Restore)
+ * -------------------------------------------------------------------------- */
+
+export function computeSnapshotByteSize(project: ProjectState): number {
+  try {
+    const serialized = JSON.stringify(project);
+    if (typeof TextEncoder !== 'undefined') {
+      return new TextEncoder().encode(serialized).length;
+    }
+    return serialized.length * 2;
+  } catch {
+    return 0;
+  }
+}
+
+export function formatByteSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(1)} KB`;
+  const mb = kb / 1024;
+  return `${mb.toFixed(2)} MB`;
+}
+
+export function createProjectSnapshotRecord(
+  project: ProjectState,
+  trigger: ProjectSnapshotTrigger = 'auto_interval',
+  customLabel?: string
+): ProjectSnapshot {
+  const cloned = structuredClone(project);
+  if (!cloned.schemaVersion) {
+    cloned.schemaVersion = CURRENT_SCHEMA_VERSION;
+  }
+  const nowIso = new Date().toISOString();
+  const timeText = new Date(nowIso).toLocaleTimeString('vi-VN', {
+    hour: '2-digit',
+    minute: '2-digit'
+  });
+  const defaultLabel =
+    trigger === 'auto_interval'
+      ? `Snapshot tự động (${timeText})`
+      : trigger === 'pre_restore'
+      ? `Sao lưu trước khi khôi phục (${timeText})`
+      : `Snapshot thủ công (${timeText})`;
+
+  return {
+    id: `snap_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    projectId: cloned.id,
+    projectName: cloned.name || 'HACHIHI Project',
+    createdAt: nowIso,
+    trigger,
+    label: customLabel?.trim() || defaultLabel,
+    checksum: computeProjectChecksum(cloned),
+    byteSize: computeSnapshotByteSize(cloned),
+    nodeCount: (cloned.nodes || []).length,
+    assetCount: Object.keys(cloned.assets || {}).length,
+    rackCount: (cloned.racks || []).length,
+    cableCount: (cloned.cables || []).length,
+    floorCount: (cloned.floors || []).length,
+    snapshot: cloned
+  };
+}
+
+export function selectSnapshotIdsToPrune(
+  snapshots: ProjectSnapshot[],
+  maxPerProject = MAX_INDEXEDDB_SNAPSHOTS_PER_PROJECT
+): string[] {
+  if (snapshots.length <= maxPerProject) return [];
+  const sortedNewestFirst = [...snapshots].sort(
+    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+  );
+  const excess = sortedNewestFirst.length - maxPerProject;
+  // Prefer pruning oldest automatic snapshots first; fall back to oldest overall if needed
+  const oldestFirst = [...sortedNewestFirst].reverse();
+  const toDelete: string[] = [];
+  for (const snap of oldestFirst) {
+    if (toDelete.length >= excess) break;
+    if (snap.trigger === 'auto_interval') {
+      toDelete.push(snap.id);
+    }
+  }
+  for (const snap of oldestFirst) {
+    if (toDelete.length >= excess) break;
+    if (!toDelete.includes(snap.id)) {
+      toDelete.push(snap.id);
+    }
+  }
+  return toDelete;
+}
+
+export async function listProjectSnapshotsFromDB(projectId?: string): Promise<ProjectSnapshot[]> {
+  try {
+    const db = await openDB();
+    if (!db.objectStoreNames.contains(STORE_SNAPSHOTS)) {
+      return [];
+    }
+    const list = await new Promise<ProjectSnapshot[]>((resolve, reject) => {
+      const tx = db.transaction(STORE_SNAPSHOTS, 'readonly');
+      const store = tx.objectStore(STORE_SNAPSHOTS);
+      const req = projectId
+        ? store.index('by_project').getAll(projectId)
+        : store.getAll();
+      req.onsuccess = () => resolve((req.result || []) as ProjectSnapshot[]);
+      req.onerror = () => reject(req.error);
+    });
+    return list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  } catch {
+    return [];
+  }
+}
+
+export async function saveProjectSnapshotToDB(
+  project: ProjectState,
+  options?: {
+    trigger?: ProjectSnapshotTrigger;
+    label?: string;
+    skipIfUnchanged?: boolean;
+    maxPerProject?: number;
+  }
+): Promise<{
+  ok: boolean;
+  snapshot?: ProjectSnapshot;
+  skippedDuplicate?: boolean;
+  error?: string;
+}> {
+  try {
+    const migrated = migrateAndValidateProject(project);
+    if (!migrated.ok) {
+      return { ok: false, error: migrated.error };
+    }
+    const trigger = options?.trigger ?? 'auto_interval';
+    const maxPerProject = options?.maxPerProject ?? MAX_INDEXEDDB_SNAPSHOTS_PER_PROJECT;
+    const record = createProjectSnapshotRecord(migrated.project, trigger, options?.label);
+
+    const db = await openDB();
+    if (!db.objectStoreNames.contains(STORE_SNAPSHOTS)) {
+      return { ok: false, error: 'Cơ sở dữ liệu IndexedDB chưa có kho lưu Snapshot.' };
+    }
+
+    const existing = await new Promise<ProjectSnapshot[]>((resolve, reject) => {
+      const tx = db.transaction(STORE_SNAPSHOTS, 'readonly');
+      const req = tx.objectStore(STORE_SNAPSHOTS).index('by_project').getAll(record.projectId);
+      req.onsuccess = () => resolve((req.result || []) as ProjectSnapshot[]);
+      req.onerror = () => reject(req.error);
+    });
+    existing.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+    if (options?.skipIfUnchanged && existing[0]?.checksum === record.checksum) {
+      return { ok: true, skippedDuplicate: true, snapshot: existing[0] };
+    }
+
+    const pruneIds = selectSnapshotIdsToPrune([record, ...existing], maxPerProject);
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_SNAPSHOTS, 'readwrite');
+      const store = tx.objectStore(STORE_SNAPSHOTS);
+      store.put(record);
+      for (const id of pruneIds) {
+        if (id !== record.id) {
+          store.delete(id);
+        }
+      }
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error || new Error('Không thể ghi Snapshot vào IndexedDB.'));
+      tx.onabort = () => reject(tx.error || new Error('Giao dịch ghi Snapshot bị hủy.'));
+    });
+    return { ok: true, snapshot: record };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err)
+    };
+  }
+}
+
+export async function deleteProjectSnapshotFromDB(snapshotId: string): Promise<boolean> {
+  try {
+    const db = await openDB();
+    if (!db.objectStoreNames.contains(STORE_SNAPSHOTS)) {
+      return false;
+    }
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_SNAPSHOTS, 'readwrite');
+      tx.objectStore(STORE_SNAPSHOTS).delete(snapshotId);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
     return true;
   } catch {
     return false;
@@ -949,7 +1213,6 @@ export async function exportAllProjectsBundle(): Promise<{
     req.onsuccess = () => resolve((req.result || []) as StoredProjectRecord[]);
     req.onerror = () => reject(req.error);
   });
-  db.close();
   return {
     bundleVersion: 1,
     exportedAt: new Date().toISOString(),
@@ -1100,64 +1363,102 @@ function getStorageSafe(): Storage | null {
   }
 }
 
-export function saveRecoverySnapshot(
+export interface PreparedRecoveryEnvelopePayload {
+  envelope: RecoverySnapshotEnvelope;
+  serializedPrimary: string;
+}
+
+interface CachedRingEntry {
+  projectId: string;
+  checksum: string;
+  json: string;
+}
+
+let cachedRingEntries: CachedRingEntry[] | null = null;
+let lastWrittenRingRaw: string | null = null;
+
+export function prepareRecoveryEnvelopePayload(
   project: ProjectState,
   reason: RecoverySnapshotEnvelope['reason'] = 'autosave'
-): { ok: true; envelope: RecoverySnapshotEnvelope } | { ok: false; error: string } {
+): { ok: true; payload: PreparedRecoveryEnvelopePayload } | { ok: false; error: string } {
+  const migrated = migrateAndValidateProject(project);
+  if (!migrated.ok) {
+    return { ok: false, error: migrated.error };
+  }
+  const envelope = buildRecoveryEnvelope(migrated.project, reason);
+  const serializedPrimary = JSON.stringify(envelope);
+  return {
+    ok: true,
+    payload: { envelope, serializedPrimary }
+  };
+}
+
+export function commitPreparedRecoveryEnvelope(
+  envelope: RecoverySnapshotEnvelope,
+  serializedPrimary: string
+): { ok: true; envelope: RecoverySnapshotEnvelope; skippedLocalStorageQuota?: boolean } | { ok: false; error: string } {
   const storage = getStorageSafe();
   if (!storage) {
     return { ok: false, error: 'Trình duyệt không hỗ trợ bộ nhớ cục bộ để ghi recovery snapshot.' };
   }
 
-  const migrated = migrateAndValidateProject(project);
-  if (!migrated.ok) {
-    return { ok: false, error: migrated.error };
+  // Large enterprise projects (>~3 MB UTF-16) already persist in IndexedDB; skip blocking localStorage quota overflow
+  if (serializedPrimary.length > MAX_LOCALSTORAGE_RECOVERY_CHARS) {
+    return { ok: true, envelope, skippedLocalStorageQuota: true };
   }
 
-  const envelope = buildRecoveryEnvelope(migrated.project, reason);
-
-  // Read existing valid ring buffer
-  let existing: RecoverySnapshotEnvelope[] = [];
+  let existingEntries: CachedRingEntry[] = [];
   try {
     const rawRing = storage.getItem(RECOVERY_SNAPSHOTS_KEY);
-    if (rawRing) {
+    if (rawRing && cachedRingEntries !== null && rawRing === lastWrittenRingRaw) {
+      existingEntries = cachedRingEntries;
+    } else if (rawRing) {
       const parsed: unknown = JSON.parse(rawRing);
       if (Array.isArray(parsed)) {
         for (const item of parsed) {
           const verified = verifyRecoveryEnvelope(item);
           if (verified.ok) {
-            existing.push(verified.envelope);
+            existingEntries.push({
+              projectId: verified.envelope.projectId,
+              checksum: verified.envelope.checksum,
+              json: JSON.stringify(verified.envelope)
+            });
           }
         }
       }
     }
   } catch {
-    existing = [];
+    existingEntries = [];
   }
 
-  // Prepend newest snapshot; collapse consecutive identical checksums for the same project
-  const filtered = existing.filter(
+  const filtered = existingEntries.filter(
     e => !(e.projectId === envelope.projectId && e.checksum === envelope.checksum)
   );
-  const nextRing = [envelope, ...filtered].slice(0, MAX_RECOVERY_SNAPSHOTS);
+  const nextRingEntries: CachedRingEntry[] = [
+    { projectId: envelope.projectId, checksum: envelope.checksum, json: serializedPrimary },
+    ...filtered
+  ].slice(0, MAX_RECOVERY_SNAPSHOTS);
 
-  // Persist primary recovery envelope & 3-slot rotating ring buffer (shrink count cleanly under tight quota)
-  const serializedPrimary = JSON.stringify(envelope);
   try {
     storage.setItem(RECOVERY_STORAGE_KEY, serializedPrimary);
   } catch {
-    // Try pruning snapshots key if quota is tight
     try {
       storage.removeItem(RECOVERY_SNAPSHOTS_KEY);
+      cachedRingEntries = null;
+      lastWrittenRingRaw = null;
       storage.setItem(RECOVERY_STORAGE_KEY, serializedPrimary);
     } catch {
       return { ok: false, error: 'Bộ nhớ trình duyệt đã đầy, không thể ghi bản phục hồi khẩn cấp.' };
     }
   }
 
-  for (let count = nextRing.length; count >= 1; count--) {
+  for (let count = nextRingEntries.length; count >= 1; count--) {
+    const slice = nextRingEntries.slice(0, count);
+    const ringJson = `[${slice.map(entry => entry.json).join(',')}]`;
     try {
-      storage.setItem(RECOVERY_SNAPSHOTS_KEY, JSON.stringify(nextRing.slice(0, count)));
+      storage.setItem(RECOVERY_SNAPSHOTS_KEY, ringJson);
+      cachedRingEntries = slice;
+      lastWrittenRingRaw = ringJson;
       break;
     } catch {
       if (count === 1) {
@@ -1167,6 +1468,26 @@ export function saveRecoverySnapshot(
   }
 
   return { ok: true, envelope };
+}
+
+export function saveRecoverySnapshot(
+  project: ProjectState,
+  reason: RecoverySnapshotEnvelope['reason'] = 'autosave'
+): { ok: true; envelope: RecoverySnapshotEnvelope; skippedLocalStorageQuota?: boolean } | { ok: false; error: string } {
+  const storage = getStorageSafe();
+  if (!storage) {
+    return { ok: false, error: 'Trình duyệt không hỗ trợ bộ nhớ cục bộ để ghi recovery snapshot.' };
+  }
+
+  const prepared = prepareRecoveryEnvelopePayload(project, reason);
+  if (!prepared.ok) {
+    return prepared;
+  }
+
+  return commitPreparedRecoveryEnvelope(
+    prepared.payload.envelope,
+    prepared.payload.serializedPrimary
+  );
 }
 
 export function listRecoverySnapshots(): RecoveryInspectEntry[] {
@@ -1240,6 +1561,8 @@ export function loadLatestValidRecoverySnapshot(): {
 }
 
 export function clearRecoverySnapshots(): void {
+  cachedRingEntries = null;
+  lastWrittenRingRaw = null;
   const storage = getStorageSafe();
   if (!storage) return;
   try {

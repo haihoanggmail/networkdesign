@@ -1,13 +1,28 @@
-import { ProjectState } from '../types/infrastructure';
-import { generatePureSvgMarkup } from './svgExport';
+import { DesignMode, ProjectState } from '../types/infrastructure';
+import { generateCompositeBuildingSvgMarkup, generatePureSvgMarkup } from './svgExport';
+import { getDesignModeMeta } from './designModes';
 import { APP_BUILD_HASH, APP_PRODUCT_NAME, APP_VERSION, BRAND_INFO } from '../config/appInfo';
-import { VIEWER_3D_RUNTIME_JS } from './viewer3dRuntimeBundle';
+import { getHachihiLogoSvgMarkup } from './brandLogoSvg';
+import { trackExport } from '../services/tracker';
+import {
+  buildFloorNavigationBarHtml,
+  scanProjectFloors,
+  serializeFloorContext
+} from '../services/export/exportService';
+import type { ExportFloorScope } from '../services/export/exportTypes';
 
 export type HtmlViewerContentScope = '2d' | '3d' | 'both';
 
 export interface HtmlViewerExportOptions {
   contentScope?: HtmlViewerContentScope;
   background3D?: 'light' | 'dark';
+  floorScope?: ExportFloorScope;
+  viewer3DRuntimeJs?: string;
+}
+
+export async function loadViewer3DRuntimeJs(): Promise<string> {
+  const mod = await import('./viewer3dRuntimeBundle');
+  return mod.loadViewer3DRuntimeJs();
 }
 
 function escapeHtml(s: string): string {
@@ -53,15 +68,22 @@ function buildViewerProjectPayload(
     name: project.name,
     author: project.author,
     version: project.version,
+    schemaVersion: project.schemaVersion,
+    lastModified: project.lastModified,
     activeMode: project.activeMode,
+    activeBuildingId: project.activeBuildingId,
     activeFloorId: project.activeFloorId,
     settings: settingsCopy,
+    buildings: project.buildings || [],
     floors: project.floors || [],
     rooms: project.rooms || [],
     racks: project.racks || [],
     nodes: sanitizedNodes,
     cables: project.cables || [],
     cableTrays: project.cableTrays || [],
+    vlans: project.vlans || [],
+    subnets: project.subnets || [],
+    patchLinks: project.patchLinks || [],
     assets: project.assets || {}
   };
 }
@@ -77,20 +99,122 @@ export function generateStandaloneViewerHtml(
 ): string {
   const contentScope: HtmlViewerContentScope = options?.contentScope ?? 'both';
   const startIn3D = contentScope !== '2d';
-  const svgMarkup = generatePureSvgMarkup(project, { darkTheme: false, includeTitleBlock: true });
   const assets = Object.values(project.assets);
   const viewerPayload = buildViewerProjectPayload(project, options);
+  const floorScopeReq: ExportFloorScope = options?.floorScope ?? 'all';
+  const floorMetadata = scanProjectFloors(project, floorScopeReq);
+  const floorContextPayload = serializeFloorContext(project, floorScopeReq);
   const embeddedProjectJson = safeEmbedJson(viewerPayload);
+  const embeddedFloorContextJson = safeEmbedJson(floorContextPayload);
+  const isFloorBasedMode = floorMetadata.isFloorBasedMode;
+  const sortedFloors = [...project.floors].sort((a, b) => a.level - b.level);
+  const hasMultiFloors = floorMetadata.hasMultipleFloors;
+  const defaultFloor2d = hasMultiFloors
+    ? options?.floorScope && floorMetadata.resolvedFloorId !== '__ALL__'
+      ? floorMetadata.resolvedFloorId
+      : isFloorBasedMode && sortedFloors.some(f => f.id === project.activeFloorId)
+        ? project.activeFloorId
+        : '__ALL__'
+    : '__SINGLE__';
+  const defaultFloor3d = hasMultiFloors
+    ? options?.floorScope && floorMetadata.resolvedFloorId !== '__ALL__'
+      ? floorMetadata.resolvedFloorId
+      : '__ALL__'
+    : '__SINGLE__';
+  const floorNavBarHtml = buildFloorNavigationBarHtml(
+    floorMetadata,
+    startIn3D ? defaultFloor3d : defaultFloor2d
+  );
 
-  const floorOptionsHtml =
-    project.floors.length > 1
-      ? [
-          `<option value="__ALL__" selected>Toàn bộ tòa nhà (${project.floors.length} tầng)</option>`,
-          ...([...project.floors]
-            .sort((a, b) => a.level - b.level)
-            .map(f => `<option value="${escapeHtml(f.id)}">${escapeHtml(f.name)}</option>`))
-        ].join('')
+  // Collect distinct 2D diagram modes available for this project so HTML viewer isn't stuck on 1 mode
+  const view2dModes: DesignMode[] = [project.activeMode];
+  if (project.activeMode !== 'floorplan' && (hasMultiFloors || project.rooms.length > 0)) {
+    view2dModes.push('floorplan');
+  }
+  if (project.activeMode !== 'topology' && project.nodes.length > 0) {
+    view2dModes.push('topology');
+  }
+  if (project.activeMode !== 'rack' && project.racks.length > 0) {
+    view2dModes.push('rack');
+  }
+
+  const mode2dOptionsHtml =
+    view2dModes.length > 1
+      ? view2dModes
+          .map(modeId => {
+            const meta = getDesignModeMeta(modeId);
+            const sel = modeId === project.activeMode ? ' selected' : '';
+            return `<option value="${escapeHtml(modeId)}"${sel}>${escapeHtml(meta.label)}</option>`;
+          })
+          .join('')
       : '';
+
+  const floorOptionsHtml = hasMultiFloors
+    ? [
+        `<option value="__ALL__"${defaultFloor3d === '__ALL__' ? ' selected' : ''}>Toàn bộ tòa nhà (${sortedFloors.length} tầng)</option>`,
+        ...sortedFloors.map(f => {
+          const sel = f.id === defaultFloor3d ? ' selected' : '';
+          return `<option value="${escapeHtml(f.id)}"${sel}>${escapeHtml(f.name)}</option>`;
+        })
+      ].join('')
+    : '';
+
+  const floor2dOptionsHtml = hasMultiFloors
+    ? [
+        `<option value="__ALL__"${defaultFloor2d === '__ALL__' ? ' selected' : ''}>Toàn bộ tòa nhà (${sortedFloors.length} tầng)</option>`,
+        ...sortedFloors.map(f => {
+          const sel = f.id === defaultFloor2d ? ' selected' : '';
+          return `<option value="${escapeHtml(f.id)}"${sel}>${escapeHtml(f.name)}</option>`;
+        })
+      ].join('')
+    : '';
+
+  let initialSvgMarkup = '';
+  const view2dTemplates: string[] = [];
+  for (const modeId of view2dModes) {
+    const modeProject: ProjectState =
+      modeId === project.activeMode ? project : { ...project, activeMode: modeId };
+    if (hasMultiFloors) {
+      const allSvg = generateCompositeBuildingSvgMarkup(modeProject, {
+        darkTheme: false,
+        includeTitleBlock: true
+      });
+      if (modeId === project.activeMode && defaultFloor2d === '__ALL__') {
+        initialSvgMarkup = allSvg;
+      }
+      view2dTemplates.push(
+        `<template data-view2d-mode="${escapeHtml(modeId)}" data-floor2d-id="__ALL__">${allSvg}</template>`
+      );
+
+      for (const f of sortedFloors) {
+        const floorSvg = generatePureSvgMarkup(
+          { ...modeProject, activeFloorId: f.id },
+          { darkTheme: false, includeTitleBlock: true, floorScopeId: f.id }
+        );
+        if (modeId === project.activeMode && f.id === defaultFloor2d) {
+          initialSvgMarkup = floorSvg;
+        }
+        view2dTemplates.push(
+          `<template data-view2d-mode="${escapeHtml(modeId)}" data-floor2d-id="${escapeHtml(f.id)}">${floorSvg}</template>`
+        );
+      }
+    } else {
+      const singleSvg = generatePureSvgMarkup(modeProject, {
+        darkTheme: false,
+        includeTitleBlock: true
+      });
+      if (modeId === project.activeMode) {
+        initialSvgMarkup = singleSvg;
+      }
+      view2dTemplates.push(
+        `<template data-view2d-mode="${escapeHtml(modeId)}" data-floor2d-id="__SINGLE__">${singleSvg}</template>`
+      );
+    }
+  }
+  const svgMarkup =
+    initialSvgMarkup ||
+    generatePureSvgMarkup(project, { darkTheme: false, includeTitleBlock: true });
+  const floor2dTemplatesHtml = view2dTemplates.join('\n');
 
   const deviceRowsHtml = assets
     .map(
@@ -132,44 +256,104 @@ export function generateStandaloneViewerHtml(
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: blob:; base-uri 'none';" />
   <title>${escapeHtml(project.name)} — HACHIHI Interactive 3D &amp; 2D Viewer</title>
   <style>
+    :root {
+      --bg-app: #f8fafc;
+      --bg-surface: #ffffff;
+      --bg-subtle: #f1f5f9;
+      --bg-card-hud: rgba(255, 255, 255, 0.94);
+      --border-col: #e2e8f0;
+      --border-btn: #cbd5e1;
+      --text-main: #0f172a;
+      --text-muted: #475569;
+      --text-accent: #1d4ed8;
+      --hdr-bg: #1d4ed8;
+      --hdr-border: #1e40af;
+      --vp2d-bg: #eef2f6;
+      --table-hover: #f8fafc;
+      --code-bg: #f1f5f9;
+    }
+    body.theme-dark {
+      --bg-app: #090e1a;
+      --bg-surface: #0f172a;
+      --bg-subtle: #1e293b;
+      --bg-card-hud: rgba(15, 23, 42, 0.94);
+      --border-col: #1e293b;
+      --border-btn: #334155;
+      --text-main: #f1f5f9;
+      --text-muted: #94a3b8;
+      --text-accent: #60a5fa;
+      --hdr-bg: #0f172a;
+      --hdr-border: #1e293b;
+      --vp2d-bg: #0b1120;
+      --table-hover: #1e293b;
+      --code-bg: #1e293b;
+    }
     * { box-sizing: border-box; }
     html, body { height: 100%; }
     body {
       margin: 0;
       font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-      background: #f8fafc;
-      color: #0f172a;
+      background: var(--bg-app);
+      color: var(--text-main);
       display: flex;
       flex-direction: column;
       min-height: 100vh;
+      transition: background 0.18s ease, color 0.18s ease;
     }
     header {
-      background: #1d4ed8;
+      background: var(--hdr-bg);
+      border-bottom: 1px solid var(--hdr-border);
       color: #fff;
-      padding: 10px 18px;
+      padding: 8px 14px;
       display: flex;
       justify-content: space-between;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
       flex-wrap: wrap;
       flex-shrink: 0;
     }
-    header h1 { margin: 0; font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+    header h1 { margin: 0; font-size: 14.5px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
     header .badge {
       font-size: 10px;
       font-weight: 700;
       padding: 2px 7px;
       border-radius: 999px;
-      background: rgba(255,255,255,0.2);
+      background: rgba(255,255,255,0.18);
       letter-spacing: 0.03em;
     }
-    header .meta { font-size: 11.5px; opacity: 0.92; margin-top: 2px; }
-    .toolbar {
-      background: #ffffff;
-      border-bottom: 1px solid #e2e8f0;
-      padding: 7px 14px;
+    header .meta { font-size: 11px; opacity: 0.9; margin-top: 1px; }
+    .hdr-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .hdr-collapse-btn {
+      background: rgba(255,255,255,0.14);
+      border: 1px solid rgba(255,255,255,0.28);
+      color: #ffffff;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .hdr-collapse-btn:hover { background: rgba(255,255,255,0.25); border-color: rgba(255,255,255,0.45); }
+    .collapsed-strip {
+      background: var(--hdr-bg);
+      border-bottom: 1px solid var(--hdr-border);
+      color: #ffffff;
+      padding: 3px 14px;
       display: flex;
-      gap: 6px;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 11.5px;
+      flex-shrink: 0;
+    }
+    .toolbar {
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--border-col);
+      padding: 6px 12px;
+      display: flex;
+      gap: 5px;
       align-items: center;
       flex-wrap: wrap;
       flex-shrink: 0;
@@ -180,43 +364,179 @@ export function generateStandaloneViewerHtml(
       gap: 4px;
       flex-wrap: wrap;
     }
-    .divider { width: 1px; height: 22px; background: #e2e8f0; margin: 0 4px; }
+    .divider { width: 1px; height: 20px; background: var(--border-col); margin: 0 3px; }
     button, select {
-      border: 1px solid #cbd5e1;
-      background: #ffffff;
-      color: #0f172a;
-      padding: 5px 10px;
+      -webkit-appearance: none;
+      appearance: none;
+      border: 1px solid var(--border-btn);
+      background: var(--bg-surface);
+      color: var(--text-main);
+      padding: 4px 9px;
       border-radius: 6px;
-      font-size: 12px;
+      font-size: 11.5px;
       font-weight: 600;
       cursor: pointer;
       transition: background 0.12s, border-color 0.12s, color 0.12s;
       font-family: inherit;
+      outline: none;
+      user-select: none;
+      line-height: 1.35;
     }
-    button:hover { background: #f1f5f9; border-color: #94a3b8; }
+    select {
+      padding-right: 22px;
+      background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%);
+      background-position: calc(100% - 11px) 50%, calc(100% - 7px) 50%;
+      background-size: 4px 4px, 4px 4px;
+      background-repeat: no-repeat;
+    }
+    button:hover, select:hover { background-color: var(--bg-subtle); border-color: #94a3b8; }
+    button:focus-visible, select:focus-visible { box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.45); }
     button.active { background: #1d4ed8; color: #ffffff; border-color: #1d4ed8; }
+    button.active:hover { background: #1e40af; }
     button.active-teal { background: #0f766e; color: #ffffff; border-color: #0f766e; }
-    .spacer { flex: 1 1 16px; }
+    button.active-amber { background: #d97706; color: #ffffff; border-color: #d97706; }
+    .theme-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      background: var(--bg-subtle);
+    }
+    body.theme-dark .theme-btn {
+      background: #1e293b;
+      color: #fde68a;
+      border-color: #475569;
+    }
+    .icon-btn-compact {
+      padding: 4px 7px;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      color: var(--text-muted);
+    }
+    .restore-pill {
+      position: fixed;
+      top: 8px;
+      right: 12px;
+      z-index: 40;
+      background: var(--bg-card-hud);
+      color: var(--text-main);
+      border: 1px solid var(--border-btn);
+      box-shadow: 0 4px 14px rgba(15, 23, 42, 0.22);
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .restore-pill.footer-restore {
+      top: auto;
+      bottom: 8px;
+      right: 12px;
+    }
+    .floor-nav-bar {
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--border-col);
+      padding: 5px 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      overflow-x: auto;
+      flex-shrink: 0;
+    }
+    .floor-nav-label {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--text-muted);
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .floor-nav-tabs {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      flex-wrap: nowrap;
+    }
+    .floor-nav-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 7px;
+      font-size: 11.5px;
+      font-weight: 600;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .floor-nav-count {
+      font-size: 10px;
+      font-family: ui-monospace, monospace;
+      opacity: 0.78;
+      font-weight: 600;
+    }
+    .floor-nav-btn.active {
+      background: #1d4ed8;
+      color: #ffffff;
+      border-color: #1d4ed8;
+    }
+    .floor-nav-btn.active .floor-nav-count { opacity: 0.92; }
+    .spacer { flex: 1 1 12px; }
     main { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; position: relative; }
     .viewport-2d {
-      flex: 1 1 auto;
+      flex: 1 1 0%;
       min-height: 520px;
       overflow: hidden;
-      background: #f1f5f9;
+      background: var(--vp2d-bg);
       position: relative;
       cursor: grab;
+      touch-action: none;
+      transition: background 0.18s ease;
     }
     .viewport-2d:active { cursor: grabbing; }
-    #stage { transform-origin: 0 0; width: 100%; height: 100%; }
+    #stage {
+      position: absolute;
+      inset: 0;
+      transform-origin: 0 0;
+      width: 100%;
+      height: 100%;
+      will-change: transform;
+    }
     #stage svg { width: 100%; height: 100%; display: block; }
+    /* Seamless 2D CAD SVG Dark Mode Overrides */
+    body.theme-dark #stage svg .svg-bg { fill: #0b1120 !important; }
+    body.theme-dark #stage svg .svg-grid-overlay { opacity: 0.24; }
+    body.theme-dark #stage svg .svg-room-body { fill: #172033 !important; stroke: #475569 !important; }
+    body.theme-dark #stage svg .svg-room-hdr { fill: #263449 !important; }
+    body.theme-dark #stage svg .svg-room-title { fill: #e2e8f0 !important; }
+    body.theme-dark #stage svg .svg-tray-badge { fill: #0f172a !important; }
+    body.theme-dark #stage svg .svg-card-neutral { fill: #1e293b !important; stroke: #475569 !important; }
+    body.theme-dark #stage svg .svg-label-primary { fill: #f1f5f9 !important; }
+    body.theme-dark #stage svg .svg-label-muted { fill: #94a3b8 !important; }
+    body.theme-dark #stage svg .svg-ip-pill { fill: #0f172a !important; stroke: #334155 !important; }
+    body.theme-dark #stage svg .svg-ip-text { fill: #cbd5e1 !important; }
+    body.theme-dark #stage svg .svg-cable-badge { fill: #0f172a !important; }
+    body.theme-dark #stage svg .svg-cable-text { fill: #f1f5f9 !important; }
+    body.theme-dark #stage svg .svg-bundle-badge { fill: #0f172a !important; }
+    body.theme-dark #stage svg .svg-bundle-text { fill: #93c5fd !important; }
+    body.theme-dark #stage svg .svg-legend-bg { fill: #0f172a !important; }
+    body.theme-dark #stage svg .svg-legend-div { stroke: #334155 !important; }
+    body.theme-dark #stage svg .svg-legend-title { fill: #f1f5f9 !important; }
+    body.theme-dark #stage svg .svg-legend-sub { fill: #cbd5e1 !important; }
+    body.theme-dark #stage svg .svg-legend-footer-bg { fill: #1e293b !important; }
+    body.theme-dark #stage svg .svg-legend-footer-txt { fill: #94a3b8 !important; }
+    body.theme-dark #stage svg .svg-titleblock { fill: #0f172a !important; stroke: #3b82f6 !important; }
+    body.theme-dark #stage svg .svg-titleblock-title { fill: #93c5fd !important; }
+    body.theme-dark #stage svg .svg-titleblock-sub { fill: #94a3b8 !important; }
+
     .viewport-3d {
-      flex: 1 1 auto;
+      flex: 1 1 0%;
       min-height: 540px;
       position: relative;
       overflow: hidden;
-      background: #0b1120;
+      background: #e8eff7;
       user-select: none;
     }
+    .viewport-3d.theme-dark { background: #0b1120; }
     #canvas3dHost {
       width: 100%;
       height: 100%;
@@ -247,98 +567,122 @@ export function generateStandaloneViewerHtml(
     .hud-card {
       position: absolute;
       z-index: 10;
-      background: rgba(255, 255, 255, 0.95);
-      color: #0f172a;
-      border: 1px solid #cbd5e1;
+      background: var(--bg-card-hud);
+      color: var(--text-main);
+      border: 1px solid var(--border-btn);
       border-radius: 10px;
       box-shadow: 0 8px 24px rgba(15, 23, 42, 0.16);
       font-size: 11.5px;
-    }
-    .viewport-3d.theme-dark .hud-card {
-      background: rgba(15, 23, 42, 0.94);
-      color: #f1f5f9;
-      border-color: #334155;
+      -webkit-backdrop-filter: blur(6px);
+      backdrop-filter: blur(6px);
     }
     #hudTopLeft {
       top: 10px;
       left: 10px;
-      padding: 6px 10px;
+      padding: 4px 8px;
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
       flex-wrap: wrap;
-      max-width: calc(100% - 110px);
+      max-width: calc(100% - 120px);
     }
-    .hud-title { font-weight: 700; color: #1d4ed8; }
-    .viewport-3d.theme-dark .hud-title { color: #60a5fa; }
-    .hud-hint { color: #64748b; font-size: 11px; }
-    .viewport-3d.theme-dark .hud-hint { color: #94a3b8; }
+    #hudTopLeft[data-collapsed="true"] .hud-hint-body { display: none; }
+    .hud-mini-btn {
+      padding: 2px 6px;
+      font-size: 10.5px;
+      border-radius: 5px;
+      background: var(--bg-subtle);
+      color: var(--text-muted);
+      border: 1px solid var(--border-col);
+    }
+    .hud-icon-btn {
+      padding: 1px 6px;
+      font-size: 11px;
+      line-height: 1.25;
+      border-radius: 5px;
+      background: var(--bg-subtle);
+      color: var(--text-muted);
+      border: 1px solid var(--border-col);
+    }
+    .hud-title { font-weight: 700; color: var(--text-accent); }
+    .hud-hint-body { color: var(--text-muted); font-size: 11px; }
     #xyzGizmoPanel {
       top: 10px;
       right: 10px;
-      padding: 5px;
+      padding: 5px 6px;
       display: flex;
       flex-direction: column;
       align-items: center;
       gap: 2px;
     }
-    #xyzGizmoPanel .gizmo-cap { font-size: 9.5px; font-weight: 700; color: #64748b; letter-spacing: 0.05em; }
-    .viewport-3d.theme-dark #xyzGizmoPanel .gizmo-cap { color: #94a3b8; }
+    #xyzGizmoPanel .gizmo-head {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+    }
+    #xyzGizmoPanel[data-collapsed="true"] svg { display: none; }
+    #xyzGizmoPanel .gizmo-cap { font-size: 9.5px; font-weight: 700; color: var(--text-muted); letter-spacing: 0.05em; }
     #dockBottomLeft {
       bottom: 12px;
       left: 10px;
-      padding: 7px 10px;
+      padding: 6px 9px;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 6px;
+      max-width: calc(100% - 20px);
+    }
+    #dockBottomLeft[data-collapsed="true"] .dock-main-controls,
+    #dockBottomLeft[data-collapsed="true"] #dockRenderSub { display: none; }
+    #dockBottomLeft:not([data-collapsed="true"]) .dock-collapsed-bar { display: none; }
+    .dock-row {
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
       flex-wrap: wrap;
-      max-width: calc(100% - 20px);
+    }
+    .dock-sub-row {
+      padding-top: 5px;
+      border-top: 1px dashed var(--border-col);
+      width: 100%;
     }
     #dockBottomLeft label {
       display: inline-flex;
       align-items: center;
       gap: 5px;
-      font-size: 11.5px;
+      font-size: 11px;
       font-weight: 600;
     }
-    #dockBottomLeft input[type="range"] { width: 84px; accent-color: #1d4ed8; cursor: pointer; }
-    #dockBottomLeft button, #dockBottomLeft select { padding: 4px 8px; font-size: 11px; }
-    .viewport-3d.theme-dark #dockBottomLeft button,
-    .viewport-3d.theme-dark #dockBottomLeft select {
-      background: #1e293b;
-      color: #e2e8f0;
-      border-color: #475569;
-    }
-    .viewport-3d.theme-dark #dockBottomLeft button.active {
-      background: #2563eb;
-      color: #ffffff;
-      border-color: #2563eb;
-    }
+    #dockBottomLeft input[type="range"] { width: 78px; accent-color: #1d4ed8; cursor: pointer; }
+    #dockBottomLeft button, #dockBottomLeft select { padding: 3px 8px; font-size: 11px; }
+    #dockBottomLeft select { padding-right: 20px; }
     #inspector3dCard {
       top: 108px;
       right: 10px;
-      width: 260px;
+      width: 266px;
       max-height: calc(100% - 170px);
       overflow-y: auto;
-      padding: 10px 12px;
+      padding: 9px 11px;
     }
+    #inspector3dCard[data-collapsed="true"] .insp-body-wrap { display: none; }
     #inspector3dCard .insp-head {
       display: flex;
       justify-content: space-between;
       align-items: flex-start;
-      gap: 8px;
-      border-bottom: 1px solid #e2e8f0;
+      gap: 6px;
+      border-bottom: 1px solid var(--border-col);
       padding-bottom: 6px;
-      margin-bottom: 8px;
+      margin-bottom: 7px;
     }
-    .viewport-3d.theme-dark #inspector3dCard .insp-head { border-bottom-color: #334155; }
-    #inspector3dCard .insp-title { font-weight: 700; font-size: 13px; word-break: break-word; }
-    #inspector3dCard .insp-sub { font-size: 10.5px; color: #64748b; margin-top: 2px; }
-    .viewport-3d.theme-dark #inspector3dCard .insp-sub { color: #94a3b8; }
+    #inspector3dCard[data-collapsed="true"] .insp-head { border-bottom: none; padding-bottom: 0; margin-bottom: 0; }
+    #inspector3dCard .insp-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+    #inspector3dCard .insp-title { font-weight: 700; font-size: 12.5px; word-break: break-word; }
+    #inspector3dCard .insp-sub { font-size: 10.5px; color: var(--text-muted); margin-top: 2px; }
     #inspector3dCard .insp-close { padding: 2px 7px; font-size: 12px; line-height: 1.2; }
     .insp-grid { display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; font-size: 11px; margin-bottom: 8px; }
-    .insp-grid .k { color: #64748b; font-weight: 600; }
-    .viewport-3d.theme-dark .insp-grid .k { color: #94a3b8; }
+    .insp-grid .k { color: var(--text-muted); font-weight: 600; }
     .insp-grid .v { font-weight: 600; word-break: break-word; text-align: right; }
     .insp-u-list {
       margin: 6px 0 8px;
@@ -370,24 +714,31 @@ export function generateStandaloneViewerHtml(
     .tables { max-width: 1280px; width: 100%; margin: 16px auto; padding: 0 20px 40px; overflow-x: auto; }
     .table-bar { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
     .search-input {
-      border: 1px solid #cbd5e1;
+      border: 1px solid var(--border-btn);
+      background: var(--bg-surface);
+      color: var(--text-main);
       border-radius: 6px;
       padding: 6px 10px;
       font-size: 12px;
       min-width: 240px;
       font-family: inherit;
+      outline: none;
     }
-    table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e2e8f0; margin-top: 8px; font-size: 12px; }
-    th, td { border: 1px solid #e2e8f0; padding: 8px 10px; text-align: left; }
-    th { background: #f8fafc; font-weight: 700; color: #334155; }
+    .search-input:focus { border-color: #3b82f6; }
+    table { width: 100%; border-collapse: collapse; background: var(--bg-surface); border: 1px solid var(--border-col); margin-top: 8px; font-size: 12px; }
+    th, td { border: 1px solid var(--border-col); padding: 8px 10px; text-align: left; }
+    th { background: var(--bg-subtle); font-weight: 700; color: var(--text-main); }
+    tbody tr:hover { background: var(--table-hover); }
+    code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; font-size: 11px; font-family: ui-monospace, monospace; }
     footer {
-      border-top: 1px solid #e2e8f0;
-      background: #ffffff;
-      padding: 8px 18px;
-      font-size: 11.5px;
-      color: #475569;
+      border-top: 1px solid var(--border-col);
+      background: var(--bg-surface);
+      padding: 6px 16px;
+      font-size: 11px;
+      color: var(--text-muted);
       display: flex;
       justify-content: space-between;
+      align-items: center;
       flex-wrap: wrap;
       gap: 8px;
       flex-shrink: 0;
@@ -395,23 +746,33 @@ export function generateStandaloneViewerHtml(
     .hidden { display: none !important; }
     @media (max-width: 768px) {
       #inspector3dCard { width: calc(100% - 20px); top: auto; bottom: 68px; max-height: 40vh; }
-      .hud-hint { display: none; }
     }
   </style>
 </head>
 <body>
-  <header>
-    <div>
-      <h1>
-        <span>${escapeHtml(project.name)}</span>
-        <span class="badge">3D / 2D OFFLINE VIEWER</span>
-      </h1>
-      <div class="meta">HACHIHI Infrastructure Viewer · Tác giả: ${escapeHtml(project.author)} · Phiên bản: ${escapeHtml(project.version)}</div>
+  <header id="appHeader">
+    <div style="display:flex;align-items:center;gap:10px;min-width:0;">
+      ${getHachihiLogoSvgMarkup(28, 'light', 'viewer_hdr')}
+      <div style="min-width:0;">
+        <h1>
+          <span>${escapeHtml(project.name)}</span>
+          <span class="badge">3D / 2D OFFLINE VIEWER</span>
+        </h1>
+        <div class="meta">HACHIHI Infrastructure Viewer · Tác giả: ${escapeHtml(project.author)} · Phiên bản: ${escapeHtml(project.version)}</div>
+      </div>
     </div>
-    <div class="meta">${assets.length} Thiết bị · ${project.racks.length} Tủ Rack · ${project.cables.length} Tuyến cáp · ${project.floors.length} Tầng</div>
+    <div class="hdr-right">
+      <div class="meta">${assets.length} Thiết bị · ${project.racks.length} Tủ Rack · ${project.cables.length} Tuyến cáp · ${project.floors.length} Tầng</div>
+      <button type="button" id="btnToggleHeader" class="hdr-collapse-btn" title="Thu gọn thanh tiêu đề">Thu gọn ▴</button>
+    </div>
   </header>
 
-  <div class="toolbar">
+  <div id="headerCollapsedBar" class="collapsed-strip hidden">
+    <span style="font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(project.name)}</span>
+    <button type="button" id="btnExpandHeader" class="hdr-collapse-btn" title="Mở rộng thanh tiêu đề">Mở tiêu đề ▾</button>
+  </div>
+
+  <div id="mainToolbar" class="toolbar">
     <div id="controls3dGroup" class="btn-group${startIn3D ? '' : ' hidden'}">
       <button type="button" data-preset="iso" class="preset-btn active" title="Góc nhìn Isometric (Phím 1)">Isometric</button>
       <button type="button" data-preset="top" class="preset-btn" title="Chiếu bằng từ trên xuống (Phím 2)">Trên xuống</button>
@@ -419,16 +780,17 @@ export function generateStandaloneViewerHtml(
       <button type="button" data-preset="back" class="preset-btn" title="Nhìn từ mặt sau (Phím 4)">Mặt sau</button>
       <button type="button" data-preset="left" class="preset-btn" title="Nhìn từ bên trái (Phím 5)">Bên trái</button>
       <button type="button" data-preset="right" class="preset-btn" title="Nhìn từ bên phải (Phím 6)">Bên phải</button>
-      <button type="button" data-preset="backIso" class="preset-btn" title="Góc chéo phía sau">Chéo sau</button>
+      <button type="button" data-preset="backIso" class="preset-btn" title="Góc chéo phía sau (Phím 7)">Chéo sau</button>
       <span class="divider"></span>
       <button type="button" id="btnAutoRotate" title="Tự động xoay ngang 360° (Phím R)">Xoay 360°</button>
       <button type="button" id="btn3dZoomIn" title="Phóng to">+</button>
       <button type="button" id="btn3dZoomOut" title="Thu nhỏ">-</button>
       <button type="button" id="btn3dFit" title="Đưa toàn bộ công trình vào giữa khung hình (Phím F)">Vừa khung</button>
-      <button type="button" id="btn3dTheme">Nền tối / sáng</button>
     </div>
 
     <div id="controls2dGroup" class="btn-group${startIn3D ? ' hidden' : ''}">
+      ${mode2dOptionsHtml ? `<select id="selMode2d" title="Chọn chế độ bản vẽ 2D">${mode2dOptionsHtml}</select>` : ''}
+      ${floor2dOptionsHtml ? `<select id="selFloor2d" title="Chọn tầng hiển thị trong Sơ đồ 2D">${floor2dOptionsHtml}</select>` : ''}
       <button type="button" id="btnZoomIn">Phóng to (+)</button>
       <button type="button" id="btnZoomOut">Thu nhỏ (-)</button>
       <button type="button" id="btnReset">Vừa màn hình</button>
@@ -441,22 +803,37 @@ export function generateStandaloneViewerHtml(
       <button type="button" id="tabDiag" class="${startIn3D ? '' : 'active'}">Sơ đồ 2D</button>
       <button type="button" id="tabDevices">Thiết bị (${assets.length})</button>
       <button type="button" id="tabCables">Cáp nối (${project.cables.length})</button>
+      <span class="divider"></span>
+      <button type="button" id="btn3dTheme" class="theme-btn" title="Chuyển đổi giao diện Sáng / Tối toàn cục">
+        <svg id="iconThemeSun" class="hidden" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+        <svg id="iconThemeMoon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+        <span id="lblThemeToggle">Nền tối</span>
+      </button>
+      <button type="button" id="btnToggleToolbar" class="icon-btn-compact" title="Thu gọn thanh công cụ để xem toàn màn hình">▴</button>
     </div>
   </div>
+
+  <button type="button" id="toolbarRestorePill" class="restore-pill hidden" title="Mở lại thanh công cụ">Mở công cụ ▾</button>
+
+  ${floorNavBarHtml}
 
   <main>
     <div id="view3D" class="viewport-3d${startIn3D ? '' : ' hidden'}">
       <div id="canvas3dHost"></div>
       <div id="labels3dLayer" class="hidden"></div>
 
-      <div id="hudTopLeft" class="hud-card">
-        <span class="hud-title">Không gian 3D</span>
-        <span id="hudCounts">${assets.length} thiết bị · ${project.racks.length} tủ Rack · ${project.cables.length} cáp</span>
-        <span class="hud-hint">· Kéo trái: Xoay ngang/dọc 360° · Kéo phải: Di chuyển · Cuộn: Zoom · Nhấp đối tượng: Xem chi tiết</span>
+      <div id="hudTopLeft" class="hud-card" data-collapsed="true">
+        <span class="hud-title">3D</span>
+        <span id="hudCounts">${assets.length} TB · ${project.racks.length} Rack · ${project.cables.length} cáp</span>
+        <span class="hud-hint-body">· Kéo trái: Xoay 360° · Kéo phải: Di chuyển · Cuộn: Zoom · Nhấp: Chi tiết · Đúp: Phóng cận · Phím 1–7, F, R, W</span>
+        <button type="button" id="btnToggleHudTopLeft" class="hud-mini-btn" aria-expanded="false" title="Mở rộng / thu gọn hướng dẫn thao tác 3D">Hướng dẫn ▾</button>
       </div>
 
-      <div id="xyzGizmoPanel" class="hud-card" title="Trục tọa độ XYZ (Nhấp X/Y/Z để chuyển hướng camera)">
-        <span class="gizmo-cap">XYZ</span>
+      <div id="xyzGizmoPanel" class="hud-card" data-collapsed="false" title="Trục tọa độ XYZ (Nhấp X/Y/Z để chuyển hướng camera)">
+        <div class="gizmo-head">
+          <span class="gizmo-cap">XYZ</span>
+          <button type="button" id="btnToggleGizmo" class="hud-icon-btn" title="Thu gọn / Mở rộng la bàn XYZ">−</button>
+        </div>
         <svg width="76" height="76" viewBox="0 0 76 76" style="overflow:visible">
           <circle cx="38" cy="38" r="30" fill="none" stroke="rgba(148,163,184,0.28)" stroke-width="1" />
           <g id="gizmoLayer">
@@ -483,29 +860,50 @@ export function generateStandaloneViewerHtml(
         </svg>
       </div>
 
-      <div id="inspector3dCard" class="hud-card hidden">
+      <div id="inspector3dCard" class="hud-card hidden" data-collapsed="false">
         <div class="insp-head">
-          <div>
+          <div style="min-width:0;">
             <div id="inspTitle" class="insp-title">Đối tượng</div>
             <div id="inspSub" class="insp-sub">Chi tiết kỹ thuật</div>
           </div>
-          <button type="button" id="inspClose" class="insp-close" title="Đóng bảng chi tiết">×</button>
+          <div class="insp-actions">
+            <button type="button" id="inspCollapse" class="hud-icon-btn" title="Thu gọn / Mở rộng chi tiết">−</button>
+            <button type="button" id="inspClose" class="insp-close" title="Đóng bảng chi tiết">×</button>
+          </div>
         </div>
-        <div id="inspBody"></div>
-        <button type="button" id="btnFocusObject">Hướng camera vào đây</button>
+        <div class="insp-body-wrap">
+          <div id="inspBody"></div>
+          <button type="button" id="btnFocusObject">Hướng camera vào đây</button>
+        </div>
       </div>
 
-      <div id="dockBottomLeft" class="hud-card">
-        ${floorOptionsHtml ? `<label>Tầng: <select id="selFloor3d">${floorOptionsHtml}</select></label>` : ''}
-        <label title="Điều chỉnh khoảng cách giãn tầng / lớp 3D">
-          <span>Giãn tầng:</span>
-          <input type="range" id="rngExplode3d" min="0" max="2" step="0.1" value="0" />
-          <span id="valExplode3d">0.0</span>
-        </label>
-        <button type="button" id="togRooms3d" class="active">Phòng &amp; Tường</button>
-        <button type="button" id="togCables3d" class="active">Dây cáp 3D</button>
-        <button type="button" id="togAxes3d" class="active">Trục XYZ</button>
-        <button type="button" id="togLabels3d">Nhãn tên</button>
+      <div id="dockBottomLeft" class="hud-card" data-collapsed="false">
+        <div class="dock-collapsed-bar">
+          <button type="button" id="btnExpandDock" class="active" title="Mở bảng điều khiển 3D">Điều khiển 3D ▴</button>
+        </div>
+        <div class="dock-row dock-main-controls">
+          ${floorOptionsHtml ? `<label>Tầng: <select id="selFloor3d">${floorOptionsHtml}</select></label>` : ''}
+          <label title="Điều chỉnh khoảng cách giãn tầng / lớp 3D">
+            <span>Giãn tầng:</span>
+            <input type="range" id="rngExplode3d" min="0" max="2" step="0.1" value="0" />
+            <span id="valExplode3d">0.0</span>
+          </label>
+          <button type="button" id="togRooms3d" class="active">Phòng &amp; Tường</button>
+          <button type="button" id="togCables3d" class="active">Dây cáp 3D</button>
+          <button type="button" id="togAxes3d" class="active">Trục XYZ</button>
+          <button type="button" id="togLabels3d">Nhãn tên</button>
+          <button type="button" id="btnToggleRender3d" title="Tùy chọn hiển thị: Khung dây, Chất lượng, Bóng đổ, Nhiệt 3D">Hiển thị ▾</button>
+          <button type="button" id="btnCollapseDock" class="hud-mini-btn" title="Thu gọn thanh điều khiển 3D">Thu gọn ▾</button>
+        </div>
+        <div id="dockRenderSub" class="dock-row dock-sub-row hidden">
+          <button type="button" id="togWireframe3d" title="Bật/tắt chế độ khung dây (Phím W)">Khung dây</button>
+          <span style="font-size:10.5px;color:var(--text-muted);font-weight:600;">Chất lượng:</span>
+          <button type="button" id="qualLow3d" class="qual-btn" data-qual="low">Thấp</button>
+          <button type="button" id="qualMed3d" class="qual-btn" data-qual="medium">TB</button>
+          <button type="button" id="qualHigh3d" class="qual-btn active" data-qual="high">Cao</button>
+          <button type="button" id="togShadows3d" class="active-amber">Bóng đổ</button>
+          <button type="button" id="togThermal3d" class="active-teal">Nhiệt 3D</button>
+        </div>
       </div>
 
       <div id="webglFallback" class="hidden">
@@ -518,6 +916,7 @@ export function generateStandaloneViewerHtml(
     <div id="viewDiag" class="viewport-2d${startIn3D ? ' hidden' : ''}">
       <div id="stage">${svgMarkup}</div>
     </div>
+    ${floor2dTemplatesHtml}
 
     <div id="viewDevices" class="tables hidden">
       <div class="table-bar">
@@ -542,35 +941,306 @@ export function generateStandaloneViewerHtml(
     </div>
   </main>
 
-  <footer>
+  <footer id="appFooter">
     <span>${escapeHtml(APP_PRODUCT_NAME)} · Phiên bản ${escapeHtml(APP_VERSION)} (${escapeHtml(APP_BUILD_HASH)})</span>
-    <span>${escapeHtml(BRAND_INFO.websiteLabel)} · Hotline: ${escapeHtml(BRAND_INFO.hotlineDisplay)}</span>
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+      <span>${escapeHtml(BRAND_INFO.websiteLabel)} · Hotline: ${escapeHtml(BRAND_INFO.hotlineDisplay)}</span>
+      <button type="button" id="btnToggleFooter" class="hud-mini-btn" title="Thu gọn thanh chân trang">Thu gọn ▾</button>
+    </div>
   </footer>
+  <button type="button" id="footerRestorePill" class="restore-pill footer-restore hidden" title="Hiển thị lại thanh chân trang">Thông tin ▴</button>
 
   <script type="application/json" id="hachihi-project-data">${embeddedProjectJson}</script>
-  <script>${VIEWER_3D_RUNTIME_JS}</script>
+  <script type="application/json" id="hachihi-floor-metadata">${embeddedFloorContextJson}</script>
+  <script>${options?.viewer3DRuntimeJs ?? ''}</script>
   <script>
     (function(){
       var dataEl = document.getElementById('hachihi-project-data');
+      var floorMetaEl = document.getElementById('hachihi-floor-metadata');
       var baseProject = dataEl ? JSON.parse(dataEl.textContent || '{}') : {};
+      var floorContext = floorMetaEl ? JSON.parse(floorMetaEl.textContent || '{}') : {};
+      window.HachihiProjectData = Object.assign({}, baseProject, floorContext);
       var startIn3D = ${startIn3D ? 'true' : 'false'};
+      var view3dEl = document.getElementById('view3D');
 
-      // --- 2D Pan & Zoom ---
+      var globalState = {
+        isDark: Boolean(baseProject.settings && baseProject.settings.isDarkMode)
+      };
+
+      var onThemeChanged = null;
+      function syncGlobalTheme(){
+        document.body.classList.toggle('theme-dark', globalState.isDark);
+        if(view3dEl) view3dEl.classList.toggle('theme-dark', globalState.isDark);
+        var lbl = document.getElementById('lblThemeToggle');
+        var sun = document.getElementById('iconThemeSun');
+        var moon = document.getElementById('iconThemeMoon');
+        if(lbl) lbl.textContent = globalState.isDark ? 'Chế độ sáng' : 'Chế độ tối';
+        if(sun) sun.classList.toggle('hidden', !globalState.isDark);
+        if(moon) moon.classList.toggle('hidden', globalState.isDark);
+        if(onThemeChanged) onThemeChanged(globalState.isDark);
+      }
+      syncGlobalTheme();
+
+      var btnTheme = document.getElementById('btn3dTheme');
+      if(btnTheme){
+        btnTheme.onclick = function(){
+          globalState.isDark = !globalState.isDark;
+          syncGlobalTheme();
+        };
+      }
+
+      // --- Collapsible Global Bars (Header, Toolbar, Footer, HUDs) ---
+      var viewer3d = null;
+      function triggerResize(){
+        if(viewer3d) viewer3d.resize();
+      }
+      var appHeader = document.getElementById('appHeader');
+      var headerCollapsedBar = document.getElementById('headerCollapsedBar');
+      var btnToggleHeader = document.getElementById('btnToggleHeader');
+      var btnExpandHeader = document.getElementById('btnExpandHeader');
+      if(btnToggleHeader){
+        btnToggleHeader.onclick = function(){
+          appHeader.classList.add('hidden');
+          headerCollapsedBar.classList.remove('hidden');
+          triggerResize();
+        };
+      }
+      if(btnExpandHeader){
+        btnExpandHeader.onclick = function(){
+          headerCollapsedBar.classList.add('hidden');
+          appHeader.classList.remove('hidden');
+          triggerResize();
+        };
+      }
+
+      var mainToolbar = document.getElementById('mainToolbar');
+      var toolbarRestorePill = document.getElementById('toolbarRestorePill');
+      var btnToggleToolbar = document.getElementById('btnToggleToolbar');
+      if(btnToggleToolbar){
+        btnToggleToolbar.onclick = function(){
+          mainToolbar.classList.add('hidden');
+          toolbarRestorePill.classList.remove('hidden');
+          triggerResize();
+        };
+      }
+      if(toolbarRestorePill){
+        toolbarRestorePill.onclick = function(){
+          toolbarRestorePill.classList.add('hidden');
+          mainToolbar.classList.remove('hidden');
+          triggerResize();
+        };
+      }
+
+      var appFooter = document.getElementById('appFooter');
+      var footerRestorePill = document.getElementById('footerRestorePill');
+      var btnToggleFooter = document.getElementById('btnToggleFooter');
+      if(btnToggleFooter){
+        btnToggleFooter.onclick = function(){
+          appFooter.classList.add('hidden');
+          footerRestorePill.classList.remove('hidden');
+          triggerResize();
+        };
+      }
+      if(footerRestorePill){
+        footerRestorePill.onclick = function(){
+          footerRestorePill.classList.add('hidden');
+          appFooter.classList.remove('hidden');
+          triggerResize();
+        };
+      }
+
+      var hudTopLeft = document.getElementById('hudTopLeft');
+      var btnToggleHudTopLeft = document.getElementById('btnToggleHudTopLeft');
+      if(hudTopLeft && btnToggleHudTopLeft){
+        btnToggleHudTopLeft.onclick = function(){
+          var isCol = hudTopLeft.getAttribute('data-collapsed') === 'true';
+          var nextCol = !isCol;
+          hudTopLeft.setAttribute('data-collapsed', nextCol ? 'true' : 'false');
+          btnToggleHudTopLeft.setAttribute('aria-expanded', nextCol ? 'false' : 'true');
+          btnToggleHudTopLeft.textContent = nextCol ? 'Hướng dẫn ▾' : 'Thu gọn ▴';
+        };
+      }
+
+      var xyzGizmoPanel = document.getElementById('xyzGizmoPanel');
+      var btnToggleGizmo = document.getElementById('btnToggleGizmo');
+      if(xyzGizmoPanel && btnToggleGizmo){
+        btnToggleGizmo.onclick = function(){
+          var nextCol = xyzGizmoPanel.getAttribute('data-collapsed') !== 'true';
+          xyzGizmoPanel.setAttribute('data-collapsed', nextCol ? 'true' : 'false');
+          btnToggleGizmo.textContent = nextCol ? '+' : '−';
+        };
+      }
+
+      var dockBottomLeft = document.getElementById('dockBottomLeft');
+      var btnCollapseDock = document.getElementById('btnCollapseDock');
+      var btnExpandDock = document.getElementById('btnExpandDock');
+      if(dockBottomLeft && btnCollapseDock && btnExpandDock){
+        btnCollapseDock.onclick = function(){ dockBottomLeft.setAttribute('data-collapsed', 'true'); };
+        btnExpandDock.onclick = function(){ dockBottomLeft.setAttribute('data-collapsed', 'false'); };
+      }
+
+      var btnToggleRender3d = document.getElementById('btnToggleRender3d');
+      var dockRenderSub = document.getElementById('dockRenderSub');
+      if(btnToggleRender3d && dockRenderSub){
+        btnToggleRender3d.onclick = function(){
+          var hiddenNow = dockRenderSub.classList.toggle('hidden');
+          btnToggleRender3d.textContent = hiddenNow ? 'Hiển thị ▾' : 'Hiển thị ▴';
+          btnToggleRender3d.classList.toggle('active', !hiddenNow);
+        };
+      }
+
+      var inspCardEl = document.getElementById('inspector3dCard');
+      var inspCollapseBtn = document.getElementById('inspCollapse');
+      if(inspCardEl && inspCollapseBtn){
+        inspCollapseBtn.onclick = function(){
+          var nextCol = inspCardEl.getAttribute('data-collapsed') !== 'true';
+          inspCardEl.setAttribute('data-collapsed', nextCol ? 'true' : 'false');
+          inspCollapseBtn.textContent = nextCol ? '+' : '−';
+        };
+      }
+
+      // --- 2D Pan, Zoom (Pointer-Anchored) & Multi-Floor Switch ---
       var stage = document.getElementById('stage');
       var vp2d = document.getElementById('viewDiag');
       var scale = 1, tx = 0, ty = 0, dragging2d = false, sx = 0, sy = 0;
       function apply2d(){ stage.style.transform = 'translate(' + tx + 'px,' + ty + 'px) scale(' + scale + ')'; }
-      vp2d.addEventListener('mousedown', function(e){ dragging2d = true; sx = e.clientX - tx; sy = e.clientY - ty; });
-      window.addEventListener('mousemove', function(e){ if(!dragging2d) return; tx = e.clientX - sx; ty = e.clientY - sy; apply2d(); });
-      window.addEventListener('mouseup', function(){ dragging2d = false; });
+      function zoom2dAt(factor, clientX, clientY){
+        var rect = vp2d.getBoundingClientRect();
+        var px = (typeof clientX === 'number' ? clientX : rect.left + rect.width / 2) - rect.left;
+        var py = (typeof clientY === 'number' ? clientY : rect.top + rect.height / 2) - rect.top;
+        var nextScale = Math.min(8, Math.max(0.25, scale * factor));
+        var ratio = nextScale / scale;
+        tx = px - (px - tx) * ratio;
+        ty = py - (py - ty) * ratio;
+        scale = nextScale;
+        apply2d();
+      }
+      vp2d.addEventListener('pointerdown', function(e){
+        if(e.button !== 0 && e.pointerType === 'mouse') return;
+        dragging2d = true;
+        sx = e.clientX - tx;
+        sy = e.clientY - ty;
+      });
+      window.addEventListener('pointermove', function(e){
+        if(!dragging2d) return;
+        tx = e.clientX - sx;
+        ty = e.clientY - sy;
+        apply2d();
+      });
+      window.addEventListener('pointerup', function(){ dragging2d = false; });
+      window.addEventListener('pointercancel', function(){ dragging2d = false; });
       vp2d.addEventListener('wheel', function(e){
         e.preventDefault();
-        scale = Math.min(6, Math.max(0.25, scale * (e.deltaY < 0 ? 1.12 : 0.89)));
-        apply2d();
+        zoom2dAt(e.deltaY < 0 ? 1.12 : 0.89, e.clientX, e.clientY);
       }, { passive: false });
-      document.getElementById('btnZoomIn').onclick = function(){ scale = Math.min(6, scale * 1.2); apply2d(); };
-      document.getElementById('btnZoomOut').onclick = function(){ scale = Math.max(0.25, scale * 0.82); apply2d(); };
+      document.getElementById('btnZoomIn').onclick = function(){ zoom2dAt(1.2); };
+      document.getElementById('btnZoomOut').onclick = function(){ zoom2dAt(0.82); };
       document.getElementById('btnReset').onclick = function(){ scale = 1; tx = 0; ty = 0; apply2d(); };
+
+      var selFloor2d = document.getElementById('selFloor2d');
+      var selMode2d = document.getElementById('selMode2d');
+      var selFloor3dEl = document.getElementById('selFloor3d');
+      var defaultMode2d = ${safeEmbedJson(project.activeMode)};
+      var defaultFloor2d = ${safeEmbedJson(defaultFloor2d)};
+      var defaultFloor3d = ${safeEmbedJson(defaultFloor3d)};
+      var activeViewerFloorScope = startIn3D ? defaultFloor3d : defaultFloor2d;
+      var onViewer3dFloorChange = null;
+
+      function updateFloorNavButtons(fid){
+        var navBtns = document.querySelectorAll('#floorNavBar [data-floor-nav]');
+        for(var i = 0; i < navBtns.length; i++){
+          var val = navBtns[i].getAttribute('data-floor-nav');
+          var active = val === fid;
+          navBtns[i].classList.toggle('active', active);
+          navBtns[i].setAttribute('aria-pressed', active ? 'true' : 'false');
+        }
+      }
+
+      function applyFloorLayerVisibility(fid){
+        var layerEls = stage ? stage.querySelectorAll('[data-floor-layer]') : [];
+        for(var i = 0; i < layerEls.length; i++){
+          var layerFid = layerEls[i].getAttribute('data-floor-layer');
+          layerEls[i].style.display = (!fid || fid === '__ALL__' || fid === '__SINGLE__' || layerFid === fid) ? '' : 'none';
+        }
+        var cards = stage ? stage.querySelectorAll('[data-layer="floor-card"][data-floor-id]') : [];
+        for(var j = 0; j < cards.length; j++){
+          cards[j].style.cursor = 'pointer';
+          cards[j].onclick = (function(targetFloorId){
+            return function(){ setActiveViewerFloor(targetFloorId); };
+          })(cards[j].getAttribute('data-floor-id'));
+        }
+      }
+
+      function sync2dStageView(){
+        var mid = selMode2d ? selMode2d.value : defaultMode2d;
+        var fid = selFloor2d ? selFloor2d.value : activeViewerFloorScope;
+        var tpls = document.querySelectorAll('template[data-floor2d-id]');
+        var matched = null;
+        for(var i = 0; i < tpls.length; i++){
+          var tMode = tpls[i].getAttribute('data-view2d-mode') || defaultMode2d;
+          var tFloor = tpls[i].getAttribute('data-floor2d-id');
+          if(tMode === mid && tFloor === fid){
+            matched = tpls[i];
+            break;
+          }
+          if(!matched && tFloor === fid){
+            matched = tpls[i];
+          }
+        }
+        if(matched){
+          stage.innerHTML = matched.innerHTML;
+          scale = 1; tx = 0; ty = 0; apply2d();
+        }
+        applyFloorLayerVisibility(fid);
+      }
+
+      function setActiveViewerFloor(fid){
+        if(!fid) return;
+        activeViewerFloorScope = fid;
+        if(window.HachihiProjectData){
+          window.HachihiProjectData.activeFloorScope = fid;
+        }
+        updateFloorNavButtons(fid);
+        if(selFloor2d && selFloor2d.value !== fid){
+          selFloor2d.value = fid;
+        }
+        sync2dStageView();
+        if(selFloor3dEl && selFloor3dEl.value !== fid){
+          selFloor3dEl.value = fid;
+        }
+        if(onViewer3dFloorChange){
+          onViewer3dFloorChange(fid);
+        }
+      }
+
+      var navFloorBtns = document.querySelectorAll('#floorNavBar [data-floor-nav]');
+      for(var nb = 0; nb < navFloorBtns.length; nb++){
+        navFloorBtns[nb].addEventListener('click', function(){
+          setActiveViewerFloor(this.getAttribute('data-floor-nav'));
+        });
+      }
+      if(selFloor2d){
+        selFloor2d.addEventListener('change', function(){
+          setActiveViewerFloor(selFloor2d.value);
+        });
+      }
+      if(selMode2d){
+        selMode2d.addEventListener('change', sync2dStageView);
+      }
+      applyFloorLayerVisibility(defaultFloor2d);
+      updateFloorNavButtons(activeViewerFloorScope);
+
+      window.HachihiFloorNav = {
+        getFloors: function(){
+          return (window.HachihiProjectData && window.HachihiProjectData.floors) ? window.HachihiProjectData.floors : (baseProject.floors || []);
+        },
+        getActiveFloor: function(){
+          return activeViewerFloorScope;
+        },
+        setFloor: function(fid){
+          setActiveViewerFloor(fid);
+        }
+      };
 
       // --- Searchable BOM Tables ---
       function wireTableFilter(inputId, tbodyId){
@@ -590,9 +1260,6 @@ export function generateStandaloneViewerHtml(
       wireTableFilter('filterCables', 'tbodyCables');
 
       // --- 3D Interactive Scene Engine ---
-      var viewer3d = null;
-      var view3dEl = document.getElementById('view3D');
-
       function escText(v){
         return String(v == null ? '' : v)
           .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -620,38 +1287,48 @@ export function generateStandaloneViewerHtml(
           return;
         }
 
-        var w = host.clientWidth || window.innerWidth || 1000;
-        var h = host.clientHeight || 600;
-        renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, isSoftwareGl ? 1 : 2));
-        renderer.setSize(w, h);
-        renderer.domElement.style.display = 'block';
-        renderer.domElement.style.width = '100%';
-        renderer.domElement.style.height = '100%';
-        renderer.domElement.style.touchAction = 'none';
-        host.innerHTML = '';
-        host.appendChild(renderer.domElement);
+        var hasManyFloors = Array.isArray(baseProject.floors) && baseProject.floors.length > 1;
+        var initViewAllFloors = hasManyFloors && (activeViewerFloorScope === '__ALL__' || activeViewerFloorScope === '__SINGLE__' || !activeViewerFloorScope);
+        var initActiveFloorId = (!initViewAllFloors && activeViewerFloorScope && activeViewerFloorScope !== '__ALL__' && activeViewerFloorScope !== '__SINGLE__')
+          ? activeViewerFloorScope
+          : (baseProject.activeFloorId || '');
 
         var state = {
-          isDark: Boolean(baseProject.settings && baseProject.settings.isDarkMode),
-          viewAllFloors: Array.isArray(baseProject.floors) && baseProject.floors.length > 1,
-          activeFloorId: baseProject.activeFloorId || '',
+          viewAllFloors: initViewAllFloors,
+          activeFloorId: initActiveFloorId,
           explodeSpread: 0,
           showRooms: true,
           showCables: true,
           showAxes: true,
           showLabels: false,
           autoRotate: false,
+          wireframeMode: false,
+          renderQuality: isSoftwareGl ? 'medium' : 'high',
+          shadowsEnabled: !isSoftwareGl,
+          showThermalHeatmap: true,
           activePreset: 'iso',
           selectedId: undefined,
           selectedType: undefined
         };
 
-        function syncThemeClasses(){
-          view3dEl.classList.toggle('theme-dark', state.isDark);
-          var btnTheme = document.getElementById('btn3dTheme');
-          if(btnTheme) btnTheme.textContent = state.isDark ? 'Nền sáng' : 'Nền tối';
+        function computeDpr(){
+          if(Runtime.getPixelRatioForQuality){
+            return Runtime.getPixelRatioForQuality(state.renderQuality, window.devicePixelRatio || 1, isSoftwareGl);
+          }
+          return Math.min(window.devicePixelRatio || 1, isSoftwareGl ? 1 : 2);
         }
-        syncThemeClasses();
+
+        var w = host.clientWidth || window.innerWidth || 1000;
+        var h = host.clientHeight || 600;
+        renderer.setPixelRatio(computeDpr());
+        renderer.setSize(w, h);
+        if(THREE.SRGBColorSpace) renderer.outputColorSpace = THREE.SRGBColorSpace;
+        renderer.domElement.style.display = 'block';
+        renderer.domElement.style.width = '100%';
+        renderer.domElement.style.height = '100%';
+        renderer.domElement.style.touchAction = 'none';
+        host.innerHTML = '';
+        host.appendChild(renderer.domElement);
 
         var scene = new THREE.Scene();
         var camera = new THREE.PerspectiveCamera(42, w / h, 0.2, 220);
@@ -668,7 +1345,14 @@ export function generateStandaloneViewerHtml(
         controls.target.set(0, 0.4, 0);
         controls.update();
 
-        var studioRig = Runtime.setupStudioEnvironment(scene, renderer, state.isDark, isSoftwareGl);
+        var studioRig = Runtime.setupStudioEnvironment(scene, renderer, globalState.isDark, isSoftwareGl);
+        if(studioRig.setShadowsEnabled){
+          studioRig.setShadowsEnabled(state.shadowsEnabled && !isSoftwareGl);
+        }
+        if(studioRig.setRenderQuality){
+          studioRig.setRenderQuality(state.renderQuality, isSoftwareGl, state.shadowsEnabled && !isSoftwareGl);
+        }
+
         var shadowTex = Runtime.createContactShadowTexture();
         var lockBadgeTex = Runtime.createLockBadgeTexture();
         var worldRoot = new THREE.Group();
@@ -703,9 +1387,7 @@ export function generateStandaloneViewerHtml(
             var pos = entry.group.position;
             var yOff = entry.node.type === 'rack' ? 2.45 : 0.95;
             labelProjVec.set(pos.x, pos.y + yOff, pos.z).project(camera);
-            if(labelProjVec.z > 1 || labelProjVec.z < -1){
-              return;
-            }
+            if(labelProjVec.z > 1 || labelProjVec.z < -1) return;
             var sxPx = (labelProjVec.x * 0.5 + 0.5) * width;
             var syPx = (-labelProjVec.y * 0.5 + 0.5) * height;
             if(sxPx < -40 || sxPx > width + 40 || syPx < -20 || syPx > height + 40) return;
@@ -848,9 +1530,10 @@ export function generateStandaloneViewerHtml(
 
           var projForBuild = Object.assign({}, baseProject, {
             activeFloorId: state.activeFloorId || baseProject.activeFloorId,
-            settings: Object.assign({}, baseProject.settings || {}, { isDarkMode: state.isDark })
+            settings: Object.assign({}, baseProject.settings || {}, { isDarkMode: globalState.isDark })
           });
 
+          var effShadow = state.shadowsEnabled && !isSoftwareGl;
           var populated = Runtime.populateInfrastructure3DWorld(
             worldRoot,
             projForBuild,
@@ -859,12 +1542,25 @@ export function generateStandaloneViewerHtml(
               showRooms: state.showRooms,
               showCables: state.showCables,
               explodeSpread: state.explodeSpread,
-              castShadow: !isSoftwareGl,
+              castShadow: effShadow,
               shadowTex: shadowTex,
               lockBadgeTex: lockBadgeTex,
-              viewAllFloors: state.viewAllFloors
+              viewAllFloors: state.viewAllFloors,
+              renderQuality: state.renderQuality,
+              wireframe: state.wireframeMode,
+              showThermalHeatmap: state.showThermalHeatmap
             }
           );
+
+          if(Runtime.applyGlobalShadowMapping){
+            Runtime.applyGlobalShadowMapping(renderer, scene, effShadow);
+          }
+          if(Runtime.applySceneWireframeMode && state.wireframeMode){
+            Runtime.applySceneWireframeMode(worldRoot, true);
+          }
+          if(!isSoftwareGl && renderer.compile){
+            renderer.compile(scene, camera);
+          }
 
           worldBounds = populated.bounds;
           nodeGroups = populated.nodeGroups;
@@ -880,6 +1576,11 @@ export function generateStandaloneViewerHtml(
         }
 
         rebuildWorld(true);
+
+        onThemeChanged = function(isDark){
+          studioRig.updateTheme(isDark);
+          rebuildWorld(false);
+        };
 
         controls.addEventListener('change', requestRender);
         controls.addEventListener('start', function(){ transitioning = false; });
@@ -899,7 +1600,6 @@ export function generateStandaloneViewerHtml(
         var raycaster = new THREE.Raycaster();
         var pointerNdc = new THREE.Vector2();
         var downClient = null;
-        var inspCard = document.getElementById('inspector3dCard');
         var inspTitle = document.getElementById('inspTitle');
         var inspSub = document.getElementById('inspSub');
         var inspBody = document.getElementById('inspBody');
@@ -921,7 +1621,7 @@ export function generateStandaloneViewerHtml(
             state.selectedId = undefined;
             state.selectedType = undefined;
             focusedWorldPoint = null;
-            inspCard.classList.add('hidden');
+            inspCardEl.classList.add('hidden');
             rebuildWorld(false);
             return;
           }
@@ -943,7 +1643,7 @@ export function generateStandaloneViewerHtml(
               '<span class="k">Chiều dài</span><span class="v">' + escText((cable.lengthMeters || 0) + ' m') + '</span>' +
               '<span class="k">Kiểu đi dây</span><span class="v">' + escText(cable.routingType || 'orthogonal') + '</span>' +
               '</div>';
-            inspCard.classList.remove('hidden');
+            inspCardEl.classList.remove('hidden');
             rebuildWorld(false);
             return;
           }
@@ -963,15 +1663,17 @@ export function generateStandaloneViewerHtml(
             var rackAssets = Object.values(baseProject.assets || {}).filter(function(a){ return rack && a.rackId === rack.id; });
             rackAssets.sort(function(a, b){ return (b.uPosition || 0) - (a.uPosition || 0); });
             var usedU = rackAssets.reduce(function(sum, a){ return sum + (a.uHeight || 1); }, 0);
+            var totalW = rackAssets.reduce(function(sum, a){ return sum + (a.powerWatts || 0); }, 0);
             inspTitle.textContent = (rack && rack.name) || node.label || 'Tủ Rack';
-            inspSub.textContent = 'Tủ Server Rack · ' + usedU + ' / ' + ((rack && rack.totalU) || 42) + 'U đang dùng';
+            inspSub.textContent = 'Tủ Rack · ' + usedU + '/' + ((rack && rack.totalUnits) || (rack && rack.totalU) || 42) + 'U · ' + totalW + 'W';
             var html = '<div class="insp-grid">' +
               (floorObj ? '<span class="k">Tầng</span><span class="v">' + escText(floorObj.name) + '</span>' : '') +
               '<span class="k">Thiết bị trong tủ</span><span class="v">' + rackAssets.length + '</span>' +
+              '<span class="k">Tổng công suất</span><span class="v">' + totalW + ' W</span>' +
               '</div>';
             if(rackAssets.length > 0){
               html += '<div class="insp-u-list">' + rackAssets.map(function(a){
-                return '<div class="insp-u-item"><span><strong>U' + (a.uPosition || '?') + '</strong> · ' + escText(a.name) + '</span><span>' + escText(a.model || a.category || '') + '</span></div>';
+                return '<div class="insp-u-item"><span><strong>U' + (a.uPosition || '?') + '</strong> · ' + escText(a.name) + '</span><span>' + escText(a.ipAddress || a.model || a.category || '') + '</span></div>';
               }).join('') + '</div>';
             }
             inspBody.innerHTML = html;
@@ -988,7 +1690,7 @@ export function generateStandaloneViewerHtml(
               '<span class="k">Tọa độ CAD</span><span class="v">X:' + Math.round(node.x) + ' · Y:' + Math.round(node.y) + '</span>' +
               '</div>';
           }
-          inspCard.classList.remove('hidden');
+          inspCardEl.classList.remove('hidden');
           rebuildWorld(false);
         }
 
@@ -1085,24 +1787,20 @@ export function generateStandaloneViewerHtml(
         };
         document.getElementById('btn3dFit').onclick = function(){ applyPreset(state.activePreset, false); };
 
-        document.getElementById('btn3dTheme').onclick = function(){
-          state.isDark = !state.isDark;
-          syncThemeClasses();
-          studioRig.updateTheme(state.isDark);
-          rebuildWorld(false);
+        onViewer3dFloorChange = function(v){
+          if(v === '__ALL__' || v === '__SINGLE__'){
+            state.viewAllFloors = hasManyFloors;
+          } else {
+            state.viewAllFloors = false;
+            state.activeFloorId = v;
+          }
+          rebuildWorld(true);
         };
 
         var selFloor = document.getElementById('selFloor3d');
         if(selFloor){
           selFloor.addEventListener('change', function(){
-            var v = selFloor.value;
-            if(v === '__ALL__'){
-              state.viewAllFloors = true;
-            } else {
-              state.viewAllFloors = false;
-              state.activeFloorId = v;
-            }
-            rebuildWorld(true);
+            setActiveViewerFloor(selFloor.value);
           });
         }
 
@@ -1116,23 +1814,60 @@ export function generateStandaloneViewerHtml(
           });
         }
 
-        function wireToggle(btnId, key, onAfter){
+        function wireToggle(btnId, key, activeCls, onAfter){
           var btn = document.getElementById(btnId);
           if(!btn) return;
+          btn.classList.toggle(activeCls, Boolean(state[key]));
           btn.onclick = function(){
             state[key] = !state[key];
-            btn.classList.toggle('active', Boolean(state[key]));
+            btn.classList.toggle(activeCls, Boolean(state[key]));
             if(onAfter) onAfter();
           };
         }
-        wireToggle('togRooms3d', 'showRooms', function(){ rebuildWorld(false); });
-        wireToggle('togCables3d', 'showCables', function(){ rebuildWorld(false); });
-        wireToggle('togAxes3d', 'showAxes', function(){
+        wireToggle('togRooms3d', 'showRooms', 'active', function(){ rebuildWorld(false); });
+        wireToggle('togCables3d', 'showCables', 'active', function(){ rebuildWorld(false); });
+        wireToggle('togAxes3d', 'showAxes', 'active', function(){
           axesGroup.visible = state.showAxes;
-          document.getElementById('xyzGizmoPanel').classList.toggle('hidden', !state.showAxes);
+          xyzGizmoPanel.classList.toggle('hidden', !state.showAxes);
           requestRender();
         });
-        wireToggle('togLabels3d', 'showLabels', function(){ syncLabelsOverlay(); });
+        wireToggle('togLabels3d', 'showLabels', 'active', function(){ syncLabelsOverlay(); });
+        wireToggle('togWireframe3d', 'wireframeMode', 'active', function(){
+          if(Runtime.applySceneWireframeMode){
+            Runtime.applySceneWireframeMode(worldRoot, state.wireframeMode);
+            requestRender();
+          } else {
+            rebuildWorld(false);
+          }
+        });
+        wireToggle('togShadows3d', 'shadowsEnabled', 'active-amber', function(){
+          var eff = state.shadowsEnabled && !isSoftwareGl;
+          if(studioRig.setShadowsEnabled) studioRig.setShadowsEnabled(eff);
+          else if(Runtime.applyGlobalShadowMapping) Runtime.applyGlobalShadowMapping(renderer, scene, eff);
+          requestRender();
+        });
+        wireToggle('togThermal3d', 'showThermalHeatmap', 'active-teal', function(){
+          rebuildWorld(false);
+        });
+
+        var qualButtons = document.querySelectorAll('.qual-btn');
+        function syncQualButtons(){
+          for(var q = 0; q < qualButtons.length; q++){
+            qualButtons[q].classList.toggle('active', qualButtons[q].getAttribute('data-qual') === state.renderQuality);
+          }
+        }
+        syncQualButtons();
+        for(var q = 0; q < qualButtons.length; q++){
+          qualButtons[q].addEventListener('click', function(){
+            state.renderQuality = this.getAttribute('data-qual') || 'high';
+            syncQualButtons();
+            renderer.setPixelRatio(computeDpr());
+            if(studioRig.setRenderQuality){
+              studioRig.setRenderQuality(state.renderQuality, isSoftwareGl, state.shadowsEnabled && !isSoftwareGl);
+            }
+            rebuildWorld(false);
+          });
+        }
 
         window.addEventListener('keydown', function(e){
           if(view3dEl.classList.contains('hidden')) return;
@@ -1143,12 +1878,21 @@ export function generateStandaloneViewerHtml(
           else if(e.key === '4') applyPreset('back', false);
           else if(e.key === '5') applyPreset('left', false);
           else if(e.key === '6') applyPreset('right', false);
+          else if(e.key === '7') applyPreset('backIso', false);
           else if(e.key === 'f' || e.key === 'F') applyPreset(state.activePreset, false);
           else if(e.key === 'r' || e.key === 'R') btnAutoRotate.click();
+          else if(e.key === 'w' || e.key === 'W') {
+            var wfBtn = document.getElementById('togWireframe3d');
+            if(wfBtn) wfBtn.click();
+          } else if(e.key === 'l' || e.key === 'L') {
+            var lbBtn = document.getElementById('togLabels3d');
+            if(lbBtn) lbBtn.click();
+          }
         });
 
         viewer3d = {
           resize: function(){
+            if(view3dEl.classList.contains('hidden')) return;
             var nw = host.clientWidth || 800;
             var nh = host.clientHeight || 500;
             camera.aspect = nw / nh;
@@ -1196,11 +1940,22 @@ export function generateStandaloneViewerHtml(
 </html>`;
 }
 
-export function exportProjectToHtmlViewer(
+export async function generateStandaloneViewerHtmlAsync(
   project: ProjectState,
   options?: HtmlViewerExportOptions
-) {
-  const html = generateStandaloneViewerHtml(project, options);
+): Promise<string> {
+  const viewer3DRuntimeJs = options?.viewer3DRuntimeJs ?? (await loadViewer3DRuntimeJs());
+  return generateStandaloneViewerHtml(project, {
+    ...options,
+    viewer3DRuntimeJs
+  });
+}
+
+export async function exportProjectToHtmlViewer(
+  project: ProjectState,
+  options?: HtmlViewerExportOptions
+): Promise<void> {
+  const html = await generateStandaloneViewerHtmlAsync(project, options);
   const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
@@ -1211,4 +1966,5 @@ export function exportProjectToHtmlViewer(
   link.click();
   document.body.removeChild(link);
   URL.revokeObjectURL(url);
+  trackExport(`html:${options?.contentScope || '2d'}`);
 }

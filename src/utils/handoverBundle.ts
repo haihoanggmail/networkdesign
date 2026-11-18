@@ -1,18 +1,21 @@
 import { zipSync, strToU8 } from 'fflate';
 import { ProjectState } from '../types/infrastructure';
-import { generatePureSvgMarkup } from './svgExport';
+import { generateCompositeBuildingSvgMarkup, generatePureSvgMarkup } from './svgExport';
 import { generateProjectDxf } from './dxfExporter';
-import { generateStandaloneViewerHtml, HtmlViewerExportOptions } from './htmlViewerExporter';
+import { generateStandaloneViewerHtml, HtmlViewerExportOptions, loadViewer3DRuntimeJs } from './htmlViewerExporter';
 import { buildPatchAndCableSchedule, formatScheduleCsv, runEngineeringAudit } from './engineeringValidator';
+import { trackExport } from '../services/tracker';
 
 export interface HandoverZipInput {
   project: ProjectState;
+  floorScope?: string;
   pdfBytes?: Uint8Array;
   pdfFilename?: string;
   excelBytes?: Uint8Array;
   excelFilename?: string;
   captured3DImages?: Array<{ filename: string; bytes: Uint8Array }>;
   viewerOptions?: HtmlViewerExportOptions;
+  viewer3DRuntimeJs?: string;
 }
 
 export interface HandoverZipResult {
@@ -35,15 +38,34 @@ export function sanitizeArchiveBaseName(name: string): string {
  * 3D rendered PNG views, and binary Technical PDF + Excel Workbook into a single compressed ZIP archive.
  */
 export function buildHandoverZipBytes(input: HandoverZipInput): HandoverZipResult {
-  const { project, pdfBytes, pdfFilename, excelBytes, excelFilename, captured3DImages, viewerOptions } = input;
+  const { project, floorScope, pdfBytes, pdfFilename, excelBytes, excelFilename, captured3DImages, viewerOptions, viewer3DRuntimeJs } = input;
   const baseName = sanitizeArchiveBaseName(project.name);
 
-  const pureSvg = generatePureSvgMarkup(project, {
-    darkTheme: false,
-    includeTitleBlock: true
+  const isFloorBased = ['floorplan', 'cctv', 'wifi', 'fiber'].includes(project.activeMode);
+  const hasMultiFloors = (project.floors?.length ?? 0) > 1;
+  const resolvedScope = floorScope ?? viewerOptions?.floorScope ?? 'all';
+  const pureSvg =
+    hasMultiFloors && isFloorBased && (resolvedScope === 'all' || resolvedScope === '__ALL__')
+      ? generateCompositeBuildingSvgMarkup(project, {
+          darkTheme: false,
+          includeTitleBlock: true
+        })
+      : generatePureSvgMarkup(project, {
+          darkTheme: false,
+          includeTitleBlock: true,
+          floorScopeId:
+            resolvedScope === 'active'
+              ? project.activeFloorId
+              : resolvedScope === 'all'
+                ? '__ALL__'
+                : resolvedScope
+        });
+  const dxfText = generateProjectDxf(project, { floorScope: resolvedScope });
+  const viewerHtml = generateStandaloneViewerHtml(project, {
+    ...viewerOptions,
+    floorScope: resolvedScope,
+    viewer3DRuntimeJs: viewer3DRuntimeJs ?? viewerOptions?.viewer3DRuntimeJs
   });
-  const dxfText = generateProjectDxf(project);
-  const viewerHtml = generateStandaloneViewerHtml(project, viewerOptions);
   const scheduleRows = buildPatchAndCableSchedule(project);
   const scheduleCsv = formatScheduleCsv(scheduleRows);
   const auditReport = runEngineeringAudit(project);
@@ -114,6 +136,7 @@ export function buildHandoverZipBytes(input: HandoverZipInput): HandoverZipResul
 export async function exportHandoverZipBundle(
   project: ProjectState,
   options?: {
+    floorScope?: string;
     drawingCode?: string;
     drawingScale?: string;
     orientation?: 'landscape' | 'portrait';
@@ -125,15 +148,17 @@ export async function exportHandoverZipBundle(
     viewerOptions?: HtmlViewerExportOptions;
   }
 ): Promise<{ filename: string; totalBytes: number; entries: string[] }> {
-  const [{ buildA4PdfArtifact }, { buildProjectExcelUint8Array }] = await Promise.all([
+  const [{ buildA4PdfArtifact }, { buildProjectExcelUint8Array }, viewer3DRuntimeJs] = await Promise.all([
     import('./pdfExporter'),
-    import('./excelService')
+    import('./excelService'),
+    loadViewer3DRuntimeJs()
   ]);
 
   const [pdfArtifact, excelBytes] = await Promise.all([
     options?.customPdfArtifact
       ? Promise.resolve(options.customPdfArtifact)
       : buildA4PdfArtifact(project, {
+          floorScope: options?.floorScope,
           orientation: options?.orientation || 'landscape',
           drawingCode: options?.drawingCode || 'NET-ELV-01',
           drawingScale: options?.drawingScale || '',
@@ -147,12 +172,14 @@ export async function exportHandoverZipBundle(
   const baseName = sanitizeArchiveBaseName(project.name);
   const archive = buildHandoverZipBytes({
     project,
+    floorScope: options?.floorScope,
     pdfBytes: pdfArtifact.uint8,
     pdfFilename: pdfArtifact.filename,
     excelBytes,
     excelFilename: `${baseName}_Ho_So_Ha_Tang.xlsx`,
     captured3DImages: options?.captured3DImages,
-    viewerOptions: options?.viewerOptions
+    viewerOptions: options?.viewerOptions,
+    viewer3DRuntimeJs
   });
 
   const blob = new Blob([new Uint8Array(archive.bytes)], { type: 'application/zip' });
@@ -164,6 +191,7 @@ export async function exportHandoverZipBundle(
   link.click();
   document.body.removeChild(link);
   window.setTimeout(() => URL.revokeObjectURL(url), 1500);
+  trackExport('handover_bundle');
 
   return {
     filename: archive.filename,

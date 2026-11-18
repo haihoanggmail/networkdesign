@@ -7,8 +7,63 @@ import type {
 import type { A4Orientation } from '../../utils/pdfExporter';
 
 export type ExportContentScope = '2d' | '3d' | 'both';
+export type ExportFloorScope = 'all' | 'active' | string;
 export type ExportFormat = 'png' | 'svg' | 'dxf' | 'pdf' | 'bundle' | 'html';
 export type PdfPaperSize = 'A4' | 'A3' | 'A2' | 'A1';
+
+export interface ExportFloorSummary {
+  id: string;
+  name: string;
+  level: number;
+  buildingId?: string;
+  elevationMeters: number;
+  widthMeters: number;
+  heightMeters: number;
+  roomCount: number;
+  nodeCount: number;
+  rackCount: number;
+  cableCount: number;
+}
+
+export interface ExportFloorMetadata {
+  hasMultipleFloors: boolean;
+  totalFloors: number;
+  activeFloorId: string;
+  requestedFloorScope: ExportFloorScope;
+  resolvedFloorId: '__ALL__' | string;
+  isFloorBasedMode: boolean;
+  floors: ExportFloorSummary[];
+}
+
+export interface ExportFloorLayerMap {
+  [floorId: string]: {
+    roomIds: string[];
+    nodeIds: string[];
+    rackIds: string[];
+    cableIds: string[];
+  };
+}
+
+export interface SerializedHachihiProjectData {
+  id: string;
+  name: string;
+  author: string;
+  version: string;
+  activeMode: string;
+  activeBuildingId?: string;
+  activeFloorId: string;
+  activeFloorScope: '__ALL__' | string;
+  floorMetadata: ExportFloorMetadata;
+  floors: ExportFloorSummary[];
+  floorLayerIds: ExportFloorLayerMap;
+}
+
+export interface ExportHtmlViewerConfig {
+  contentScope?: ExportContentScope;
+  background3D?: 'light' | 'dark';
+  floorScope?: ExportFloorScope;
+  viewer3DRuntimeJs?: string;
+}
 
 export interface Export2DViewportRect {
   pan: { x: number; y: number };
@@ -28,6 +83,7 @@ export interface Captured3DSnapshotInput {
 
 export interface ExportPngConfig {
   contentScope: ExportContentScope;
+  floorScope?: ExportFloorScope;
   background3D?: Capture3DBackground;
   viewport2D?: Export2DViewportRect;
   quickView?: boolean;
@@ -37,6 +93,7 @@ export interface ExportPngConfig {
 
 export interface ExportPdfConfig {
   contentScope: ExportContentScope;
+  floorScope?: ExportFloorScope;
   paperSize?: PdfPaperSize;
   orientation: A4Orientation;
   drawingCode: string;
@@ -52,6 +109,7 @@ export interface ExportPdfConfig {
 
 export interface ExportBundleConfig {
   contentScope: ExportContentScope;
+  floorScope?: ExportFloorScope;
   orientation: A4Orientation;
   drawingCode: string;
   drawingScale: string;

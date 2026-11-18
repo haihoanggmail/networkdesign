@@ -7,6 +7,19 @@ export const CANVAS_RACK_RAIL_W = 30;
 export const CANVAS_RACK_PAD_TOP = 4;
 export const CANVAS_RACK_PAD_BOTTOM = 4;
 export const CANVAS_RACK_DEFAULT_SLOT_H = 14;
+export const CANVAS_RACK_COLLAPSED_BODY_H = 36;
+export const CANVAS_RACK_COLLAPSED_H =
+  CANVAS_RACK_HEADER_H + CANVAS_RACK_COLLAPSED_BODY_H + CANVAS_RACK_FOOTER_H;
+
+export function isRackNodeCollapsed(rackNode: Pick<DiagramNode, 'customData'>): boolean {
+  return Boolean(rackNode.customData?.collapsed);
+}
+
+export function getEffectiveRackDisplayHeight(
+  rackNode: Pick<DiagramNode, 'height' | 'customData'>
+): number {
+  return isRackNodeCollapsed(rackNode) ? CANVAS_RACK_COLLAPSED_H : rackNode.height;
+}
 
 /**
  * Clamp custom rack U height to sensible 19-inch cabinet limits (4U..60U).

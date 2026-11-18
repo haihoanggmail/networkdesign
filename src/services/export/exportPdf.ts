@@ -6,6 +6,7 @@ import {
 } from '../../utils/pdfExporter';
 import { capture3DAnglesStrict, capture3DSnapshotStrict } from './capture3D';
 import { ExportPdfConfig } from './exportTypes';
+import { trackExport } from '../../services/tracker';
 
 export async function runExportPdf(
   project: ProjectState,
@@ -32,8 +33,9 @@ export async function runExportPdf(
           ];
   }
 
-  return exportTechnicalPdf(project, {
+  const res = await exportTechnicalPdf(project, {
     contentScope: config.contentScope,
+    floorScope: config.floorScope,
     paperSize: config.paperSize || 'A4',
     orientation: config.orientation,
     drawingCode: config.drawingCode,
@@ -44,6 +46,8 @@ export async function runExportPdf(
     includeTables: config.includeTables,
     captures3D
   });
+  trackExport(`pdf:${config.paperSize || 'A4'}_${config.contentScope}`);
+  return res;
 }
 
 export async function buildExportPdfForBundle(
@@ -70,6 +74,7 @@ export async function buildExportPdfForBundle(
 
   const pdfArtifact = await buildTechnicalPdfArtifact(project, {
     contentScope: config.contentScope,
+    floorScope: config.floorScope,
     paperSize: config.paperSize || 'A4',
     orientation: config.orientation,
     drawingCode: config.drawingCode,

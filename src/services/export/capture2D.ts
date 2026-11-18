@@ -4,10 +4,12 @@ import {
   computeViewportDiagramBounds,
   exportCurrentViewToPng,
   exportProjectToPng,
+  generateCompositeBuildingSvgMarkup,
   generatePureSvgMarkup
 } from '../../utils/svgExport';
 import { resolveCanvasAppearance } from '../../utils/canvasBackgrounds';
-import type { Export2DViewportRect } from './exportTypes';
+import { scanProjectFloors } from './exportService';
+import type { Export2DViewportRect, ExportFloorScope } from './exportTypes';
 
 export interface Export2DPngResult {
   blob: Blob;
@@ -16,18 +18,38 @@ export interface Export2DPngResult {
 
 export function generate2DSvgString(
   project: ProjectState,
-  options?: { darkTheme?: boolean; includeTitleBlock?: boolean }
+  options?: { darkTheme?: boolean; includeTitleBlock?: boolean; floorScope?: ExportFloorScope }
 ): string {
+  const darkTheme = options?.darkTheme ?? project.settings.isDarkMode;
+  const includeTitleBlock = options?.includeTitleBlock ?? true;
+  const meta = scanProjectFloors(project, options?.floorScope ?? 'all');
+
+  if (meta.hasMultipleFloors && meta.isFloorBasedMode && meta.resolvedFloorId === '__ALL__') {
+    return generateCompositeBuildingSvgMarkup(project, {
+      darkTheme,
+      includeTitleBlock
+    });
+  }
+
   return generatePureSvgMarkup(project, {
-    darkTheme: options?.darkTheme ?? project.settings.isDarkMode,
-    includeTitleBlock: options?.includeTitleBlock ?? true
+    darkTheme,
+    includeTitleBlock,
+    floorScopeId: meta.resolvedFloorId
   });
 }
 
-export function download2DHighResPng(project: ProjectState): Promise<void> {
+export function download2DHighResPng(
+  project: ProjectState,
+  floorScope: ExportFloorScope = 'active'
+): Promise<void> {
+  const meta = scanProjectFloors(project, floorScope);
+  const scopedProject =
+    meta.resolvedFloorId && meta.resolvedFloorId !== '__ALL__' && meta.resolvedFloorId !== '__SINGLE__'
+      ? { ...project, activeFloorId: meta.resolvedFloorId }
+      : project;
   return new Promise((resolve, reject) => {
     exportProjectToPng(
-      project,
+      scopedProject,
       () => resolve(),
       errMsg => reject(new Error(errMsg))
     );
@@ -59,9 +81,12 @@ export async function render2DPngBlob(
     viewport?: Export2DViewportRect;
     whiteBackground?: boolean;
     includeTitleBlock?: boolean;
+    floorScope?: ExportFloorScope;
   }
 ): Promise<Blob> {
   const whiteBackground = options?.whiteBackground ?? false;
+  const meta = scanProjectFloors(project, options?.floorScope ?? 'active');
+  const floorScopeId = meta.resolvedFloorId;
   const bounds =
     (options?.viewport
       ? computeViewportDiagramBounds(
@@ -69,14 +94,22 @@ export async function render2DPngBlob(
           options.viewport.zoom,
           options.viewport.viewportSize
         )
-      : undefined) || computePureDiagramBounds(project);
+      : undefined) || computePureDiagramBounds(project, { floorScopeId });
 
-  const svgMarkup = generatePureSvgMarkup(project, {
-    darkTheme: whiteBackground ? false : project.settings.isDarkMode,
-    includeTitleBlock: options?.includeTitleBlock ?? true,
-    boundsOverride: bounds,
-    whiteBackground
-  });
+  const svgMarkup =
+    meta.hasMultipleFloors && meta.isFloorBasedMode && floorScopeId === '__ALL__' && !options?.viewport
+      ? generateCompositeBuildingSvgMarkup(project, {
+          darkTheme: whiteBackground ? false : project.settings.isDarkMode,
+          includeTitleBlock: options?.includeTitleBlock ?? true,
+          whiteBackground
+        })
+      : generatePureSvgMarkup(project, {
+          darkTheme: whiteBackground ? false : project.settings.isDarkMode,
+          includeTitleBlock: options?.includeTitleBlock ?? true,
+          boundsOverride: bounds,
+          whiteBackground,
+          floorScopeId
+        });
 
   const appearance = resolveCanvasAppearance(project.settings, project.settings.isDarkMode);
   const bgColor = whiteBackground ? '#ffffff' : appearance.backgroundColor;

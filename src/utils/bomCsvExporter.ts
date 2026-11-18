@@ -4,6 +4,7 @@ import {
   computeProjectBomStats
 } from './bomAggregator';
 import { sanitizeArchiveBaseName } from './handoverBundle';
+import { trackExport } from '../services/tracker';
 
 export interface BomCsvSummary {
   assetCount: number;
@@ -287,6 +288,7 @@ export function exportProjectBomCsv(
   link.click();
   document.body.removeChild(link);
   window.setTimeout(() => URL.revokeObjectURL(url), 1500);
+  trackExport('bom_csv');
   return {
     filename: result.filename,
     summary: result.summary

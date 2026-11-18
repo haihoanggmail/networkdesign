@@ -10,6 +10,7 @@ import {
   sanitizeExportBaseName,
   triggerBlobDownload
 } from './exportTypes';
+import { trackExport } from '../../services/tracker';
 
 export interface ExportPngOutcome {
   exportedFiles: string[];
@@ -30,9 +31,11 @@ export async function runExportPng(
         config.viewport2D,
         config.whiteBackground2D ?? true
       );
+      trackExport('png:quick_2d');
       return { exportedFiles: [`${baseName}_QuickView.png`] };
     }
-    await download2DHighResPng(project);
+    await download2DHighResPng(project, config.floorScope ?? 'active');
+    trackExport('png:2d');
     return { exportedFiles: [`${baseName}_HighRes.png`] };
   }
 
@@ -44,6 +47,7 @@ export async function runExportPng(
     });
     const filename = `${baseName}_3D_${snap3D.preset.toUpperCase()}.png`;
     triggerBlobDownload(new Blob([new Uint8Array(snap3D.bytes)], { type: 'image/png' }), filename);
+    trackExport(config.quickView ? 'png:quick_3d' : 'png:3d');
     return {
       exportedFiles: [filename],
       width: snap3D.width,
@@ -60,13 +64,15 @@ export async function runExportPng(
   const blob2D = await render2DPngBlob(project, {
     viewport: config.quickView ? config.viewport2D : undefined,
     whiteBackground: config.quickView ? (config.whiteBackground2D ?? true) : false,
-    includeTitleBlock: !config.quickView
+    includeTitleBlock: !config.quickView,
+    floorScope: config.floorScope ?? 'active'
   });
 
   const file2D = `${baseName}_2D.png`;
   const file3D = `${baseName}_3D_${snap3D.preset.toUpperCase()}.png`;
   triggerBlobDownload(blob2D, file2D);
   triggerBlobDownload(new Blob([new Uint8Array(snap3D.bytes)], { type: 'image/png' }), file3D);
+  trackExport('png:both');
 
   return {
     exportedFiles: [file2D, file3D],

@@ -1,4 +1,10 @@
-import { DeviceAsset, RackSide, ServerRack } from '../types/infrastructure';
+import {
+  DeviceAsset,
+  DiagramNode,
+  RackSensorReading,
+  RackSide,
+  ServerRack
+} from '../types/infrastructure';
 import { getAssetUHeight, getRackSlotsForSide } from './rackGeometry';
 
 export type RackDoorAirflowType = 'perforated' | 'open' | 'glass';
@@ -361,5 +367,351 @@ export function analyzeRackAirflow(
     hotspots,
     bypassGaps,
     recommendations
+  };
+}
+
+export interface RackSensorPoint {
+  id: string;
+  label: string;
+  zone: 'intake' | 'mid' | 'exhaust' | 'ambient';
+  u: number;
+  temperatureC: number;
+  humidityPct?: number;
+  source: 'hardware_sensor' | 'node_telemetry' | 'calculated_probe';
+  status: ThermalRiskLevel;
+}
+
+export interface RackUnitThermalReading {
+  u: number;
+  tempC: number;
+  heatNorm: number; // 0..1 normalized between 18°C and 46°C
+  zone: ThermalRiskLevel;
+  color: string;
+  frontAssetId?: string;
+  rearAssetId?: string;
+}
+
+export interface RackThermalOverlayData {
+  analysis: RackAirflowAnalysis;
+  sensors: RackSensorPoint[];
+  unitReadings: RackUnitThermalReading[]; // sorted U1..UN
+  hasHardwareSensors: boolean;
+  intakeTempC: number;
+  exhaustTempC: number;
+  avgTempC: number;
+  peakTempC: number;
+  peakU: number;
+}
+
+export function classifyTempRisk(tempC: number): ThermalRiskLevel {
+  if (tempC >= 37) return 'hot';
+  if (tempC >= 30.5) return 'warm';
+  if (tempC >= 24.5) return 'nominal';
+  return 'cool';
+}
+
+export function thermalHeatToColor(heatNorm: number, zone?: ThermalRiskLevel): string {
+  const t = Math.max(0, Math.min(1, heatNorm));
+  if (zone === 'hot' || t >= 0.72) {
+    // Amber-orange -> Red (#f97316 -> #ef4444)
+    return t >= 0.85 ? '#ef4444' : '#f97316';
+  }
+  if (zone === 'warm' || t >= 0.48) {
+    // Yellow-amber (#eab308 -> #f59e0b)
+    return '#f59e0b';
+  }
+  if (zone === 'nominal' || t >= 0.24) {
+    // Emerald / Cyan-green (#10b981)
+    return '#10b981';
+  }
+  // Cool intake blue (#0ea5e9)
+  return '#0ea5e9';
+}
+
+function defaultUForZone(
+  zone: RackSensorReading['zone'],
+  totalUnits: number
+): number {
+  if (zone === 'intake' || zone === 'ambient') return Math.min(totalUnits, 2);
+  if (zone === 'mid') return Math.max(1, Math.round(totalUnits * 0.5));
+  return Math.max(1, totalUnits - 1);
+}
+
+export function computeRackThermalOverlayData(
+  rack: ServerRack | undefined,
+  assets: Record<string, DeviceAsset>,
+  rackNode?: Pick<DiagramNode, 'customData'>,
+  config: RackAirflowConfig = {}
+): RackThermalOverlayData {
+  const effectiveRack: ServerRack = rack || {
+    id: 'virtual_rack',
+    name: 'Rack',
+    totalUnits: rackNode?.customData?.totalUnits || 42,
+    widthMm: 600,
+    depthMm: 1000,
+    maxLoadKg: 800,
+    x: 0,
+    y: 0,
+    slots: {}
+  };
+
+  const totalUnits = Math.max(4, effectiveRack.totalUnits || 42);
+  const analysis = analyzeRackAirflow(effectiveRack, assets, config);
+
+  const collectedSensors: RackSensorPoint[] = [];
+
+  // 1) Retrieve explicit rack.sensors array if populated
+  if (Array.isArray(effectiveRack.sensors)) {
+    for (const s of effectiveRack.sensors) {
+      if (typeof s.temperatureC !== 'number' || !Number.isFinite(s.temperatureC)) continue;
+      const u = Math.max(1, Math.min(totalUnits, Math.round(s.u ?? defaultUForZone(s.zone, totalUnits))));
+      collectedSensors.push({
+        id: s.id,
+        label: s.label,
+        zone: s.zone,
+        u,
+        temperatureC: Number(s.temperatureC.toFixed(1)),
+        humidityPct: s.humidityPct,
+        source: 'hardware_sensor',
+        status: classifyTempRisk(s.temperatureC)
+      });
+    }
+  }
+
+  // 2) Retrieve sensor / IoT DeviceAssets attached to or mounted inside this rack
+  const mountedAssetIds = new Set<string>([
+    ...Object.values(effectiveRack.slots || {}),
+    ...Object.values(effectiveRack.rearSlots || {})
+  ]);
+  for (const asset of Object.values(assets)) {
+    if (!asset) continue;
+    const belongsToRack =
+      asset.rackId === effectiveRack.id || mountedAssetIds.has(asset.id);
+    if (!belongsToRack) continue;
+    const isSensorAsset =
+      asset.category === 'sensor' || asset.sensorSpecs?.temperatureC !== undefined;
+    if (!isSensorAsset) continue;
+
+    const probeZone = asset.sensorSpecs?.probeLocation ?? 'mid';
+    const rawU = asset.rackUnitStart ?? defaultUForZone(probeZone, totalUnits);
+    const u = Math.max(1, Math.min(totalUnits, Math.round(rawU)));
+    const cell = analysis.unitCells[u - 1];
+    const tempC =
+      typeof asset.sensorSpecs?.temperatureC === 'number' &&
+      Number.isFinite(asset.sensorSpecs.temperatureC)
+        ? asset.sensorSpecs.temperatureC
+        : Number(
+            (
+              analysis.ambientTempC +
+              (cell ? cell.convectionScore * (analysis.estimatedExhaustTempC - analysis.ambientTempC + 4) : 2)
+            ).toFixed(1)
+          );
+
+    if (!collectedSensors.some(existing => existing.id === asset.id)) {
+      collectedSensors.push({
+        id: asset.id,
+        label: asset.name,
+        zone: probeZone,
+        u,
+        temperatureC: Number(tempC.toFixed(1)),
+        humidityPct: asset.sensorSpecs?.humidityPct,
+        source: 'hardware_sensor',
+        status: classifyTempRisk(tempC)
+      });
+    }
+  }
+
+  // 3) Retrieve optional telemetry numbers stored in rackNode.customData
+  const customIntake = Number(rackNode?.customData?.intakeTempC);
+  const customExhaust = Number(rackNode?.customData?.exhaustTempC);
+  const customSensor = Number(rackNode?.customData?.sensorTempC);
+  if (Number.isFinite(customIntake) && !collectedSensors.some(s => s.zone === 'intake')) {
+    collectedSensors.push({
+      id: `${effectiveRack.id}_intake_telemetry`,
+      label: 'Cảm biến Nạp',
+      zone: 'intake',
+      u: Math.min(totalUnits, 2),
+      temperatureC: Number(customIntake.toFixed(1)),
+      source: 'node_telemetry',
+      status: classifyTempRisk(customIntake)
+    });
+  }
+  if (Number.isFinite(customSensor) && !collectedSensors.some(s => s.zone === 'mid')) {
+    collectedSensors.push({
+      id: `${effectiveRack.id}_mid_telemetry`,
+      label: 'Cảm biến Thân tủ',
+      zone: 'mid',
+      u: Math.max(1, Math.round(totalUnits * 0.5)),
+      temperatureC: Number(customSensor.toFixed(1)),
+      source: 'node_telemetry',
+      status: classifyTempRisk(customSensor)
+    });
+  }
+  if (Number.isFinite(customExhaust) && !collectedSensors.some(s => s.zone === 'exhaust')) {
+    collectedSensors.push({
+      id: `${effectiveRack.id}_exhaust_telemetry`,
+      label: 'Cảm biến Xả',
+      zone: 'exhaust',
+      u: Math.max(1, totalUnits - 1),
+      temperatureC: Number(customExhaust.toFixed(1)),
+      source: 'node_telemetry',
+      status: classifyTempRisk(customExhaust)
+    });
+  }
+
+  const hasHardwareSensors = collectedSensors.some(
+    s => s.source === 'hardware_sensor' || s.source === 'node_telemetry'
+  );
+
+  // Calibrate baseline intake & exhaust from any attached sensors
+  const intakeSensors = collectedSensors.filter(s => s.zone === 'intake' || s.zone === 'ambient');
+  const exhaustSensors = collectedSensors.filter(s => s.zone === 'exhaust');
+  const intakeTempC =
+    intakeSensors.length > 0
+      ? Number((intakeSensors.reduce((sum, s) => sum + s.temperatureC, 0) / intakeSensors.length).toFixed(1))
+      : analysis.ambientTempC;
+  const exhaustTempC =
+    exhaustSensors.length > 0
+      ? Number((exhaustSensors.reduce((sum, s) => sum + s.temperatureC, 0) / exhaustSensors.length).toFixed(1))
+      : analysis.estimatedExhaustTempC;
+
+  const spanDeltaC = Math.max(1.5, exhaustTempC - intakeTempC);
+
+  // Compute per-U thermal readings (U1..UN) incorporating direct load, convection plume & sensor anchors
+  const unitReadings: RackUnitThermalReading[] = analysis.unitCells.map(cell => {
+    const heightRatio = (cell.u - 1) / Math.max(1, totalUnits - 1);
+    const localLoadBoostC = Math.min(11, (cell.directWatts / 320) * 6.5);
+    let baseTempC =
+      intakeTempC +
+      spanDeltaC * (0.28 * heightRatio + 0.72 * cell.convectionScore) +
+      localLoadBoostC;
+
+    // Pull toward nearest explicit sensor readings using inverse-distance Gaussian weighting
+    if (collectedSensors.length > 0) {
+      let weightSum = 0;
+      let weightedDiffSum = 0;
+      for (const s of collectedSensors) {
+        const distU = Math.abs(cell.u - s.u);
+        const w = Math.exp(-(distU * distU) / (2 * 36));
+        weightSum += w;
+        weightedDiffSum += w * (s.temperatureC - baseTempC);
+      }
+      if (weightSum > 0.05) {
+        baseTempC += (weightedDiffSum / weightSum) * Math.min(0.9, weightSum);
+      }
+    }
+
+    const tempC = Number(Math.max(15, Math.min(68, baseTempC)).toFixed(1));
+    const heatNorm = Math.max(0, Math.min(1, (tempC - 20) / 24));
+    const zone = classifyTempRisk(tempC);
+    const color = thermalHeatToColor(heatNorm, zone);
+
+    return {
+      u: cell.u,
+      tempC,
+      heatNorm: Number(heatNorm.toFixed(3)),
+      zone,
+      color,
+      frontAssetId: cell.frontAssetId,
+      rearAssetId: cell.rearAssetId
+    };
+  });
+
+  let peakTempC = unitReadings[0]?.tempC ?? intakeTempC;
+  let peakU = 1;
+  let sumTemp = 0;
+  for (const r of unitReadings) {
+    sumTemp += r.tempC;
+    if (r.tempC > peakTempC) {
+      peakTempC = r.tempC;
+      peakU = r.u;
+    }
+  }
+  const avgTempC = Number((sumTemp / Math.max(1, unitReadings.length)).toFixed(1));
+
+  // If no explicit sensors exist, append calibrated virtual probes so telemetry badges always reflect intake/peak/exhaust
+  if (collectedSensors.length === 0) {
+    const midU = Math.max(1, Math.round(totalUnits * 0.5));
+    const topU = Math.max(1, totalUnits - 1);
+    const intakeReading = unitReadings[Math.min(unitReadings.length - 1, 1)];
+    const midReading = unitReadings[Math.min(unitReadings.length - 1, midU - 1)];
+    const topReading = unitReadings[Math.min(unitReadings.length - 1, topU - 1)];
+
+    collectedSensors.push(
+      {
+        id: `${effectiveRack.id}_probe_intake`,
+        label: 'Đầu dò Nạp (U2)',
+        zone: 'intake',
+        u: Math.min(totalUnits, 2),
+        temperatureC: intakeReading?.tempC ?? intakeTempC,
+        source: 'calculated_probe',
+        status: classifyTempRisk(intakeReading?.tempC ?? intakeTempC)
+      },
+      {
+        id: `${effectiveRack.id}_probe_peak`,
+        label: peakU !== topU && peakU !== 2 ? `Điểm nóng (U${peakU})` : `Đầu dò Giữa (U${midU})`,
+        zone: 'mid',
+        u: peakU !== topU && peakU !== 2 ? peakU : midU,
+        temperatureC:
+          peakU !== topU && peakU !== 2
+            ? peakTempC
+            : midReading?.tempC ?? avgTempC,
+        source: 'calculated_probe',
+        status: classifyTempRisk(
+          peakU !== topU && peakU !== 2
+            ? peakTempC
+            : midReading?.tempC ?? avgTempC
+        )
+      },
+      {
+        id: `${effectiveRack.id}_probe_exhaust`,
+        label: `Đầu dò Xả (U${topU})`,
+        zone: 'exhaust',
+        u: topU,
+        temperatureC: topReading?.tempC ?? exhaustTempC,
+        source: 'calculated_probe',
+        status: classifyTempRisk(topReading?.tempC ?? exhaustTempC)
+      }
+    );
+  }
+
+  collectedSensors.sort((a, b) => a.u - b.u);
+
+  return {
+    analysis,
+    sensors: collectedSensors,
+    unitReadings,
+    hasHardwareSensors,
+    intakeTempC,
+    exhaustTempC,
+    avgTempC,
+    peakTempC,
+    peakU
+  };
+}
+
+export function getSubDeviceThermalReading(
+  overlay: RackThermalOverlayData,
+  startU: number,
+  uHeight: number
+): { tempC: number; zone: ThermalRiskLevel; color: string; heatNorm: number } {
+  const lo = Math.max(1, startU);
+  const hi = Math.min(overlay.unitReadings.length, startU + Math.max(1, uHeight) - 1);
+  let maxTemp = overlay.avgTempC;
+  let found = false;
+  for (let u = lo; u <= hi; u++) {
+    const r = overlay.unitReadings[u - 1];
+    if (r && (!found || r.tempC > maxTemp)) {
+      maxTemp = r.tempC;
+      found = true;
+    }
+  }
+  const heatNorm = Math.max(0, Math.min(1, (maxTemp - 20) / 24));
+  const zone = classifyTempRisk(maxTemp);
+  return {
+    tempC: Number(maxTemp.toFixed(1)),
+    zone,
+    color: thermalHeatToColor(heatNorm, zone),
+    heatNorm: Number(heatNorm.toFixed(3))
   };
 }

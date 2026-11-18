@@ -164,6 +164,13 @@ export interface DeviceAsset {
     redundancyMode?: 'standalone' | 'parallel' | 'n_plus_1';
     powerDomain?: string;
   };
+  sensorSpecs?: {
+    temperatureC?: number;
+    humidityPct?: number;
+    probeLocation?: 'intake' | 'mid' | 'exhaust' | 'ambient';
+    warningTempC?: number;
+    criticalTempC?: number;
+  };
 
   ports: DevicePort[];
 }
@@ -215,6 +222,16 @@ export interface Room {
   locked?: boolean;
 }
 
+export interface RackSensorReading {
+  id: string;
+  label: string;
+  zone: 'intake' | 'mid' | 'exhaust' | 'ambient';
+  u?: number;
+  temperatureC: number;
+  humidityPct?: number;
+  status?: 'ok' | 'warm' | 'critical';
+}
+
 export interface ServerRack {
   id: string;
   name: string; // "Rack A01"
@@ -231,6 +248,8 @@ export interface ServerRack {
   slots: Record<number, string>;
   // unit index (1-based) to asset ID (Rear rail)
   rearSlots?: Record<number, string>;
+  // optional telemetry sensors mounted on or monitoring this rack
+  sensors?: RackSensorReading[];
 }
 
 export type NodeType = 
@@ -247,6 +266,8 @@ export type NodeType =
 
 export interface NodeCustomData {
   locked?: boolean;
+  collapsed?: boolean;
+  showThermalOverlay?: boolean;
   rackId?: string;
   totalUnits?: number;
   fov?: number;
@@ -396,6 +417,7 @@ export interface CanvasSettings {
   ipRangeEnd?: string;
   ipSubnetMask?: string;
   ipGateway?: string;
+  experienceMode?: 'basic' | 'advanced';
 }
 
 export interface VlanSpec {
@@ -440,6 +462,25 @@ export interface ProjectRevision {
   assetCount: number;
   rackCount: number;
   cableCount: number;
+  snapshot: ProjectState;
+}
+
+export type ProjectSnapshotTrigger = 'auto_interval' | 'manual' | 'pre_restore';
+
+export interface ProjectSnapshot {
+  id: string;
+  projectId: string;
+  projectName: string;
+  createdAt: string;
+  trigger: ProjectSnapshotTrigger;
+  label: string;
+  checksum: string;
+  byteSize?: number;
+  nodeCount: number;
+  assetCount: number;
+  rackCount: number;
+  cableCount: number;
+  floorCount: number;
   snapshot: ProjectState;
 }
 

@@ -178,7 +178,8 @@ const KNOWN_SETTINGS_KEYS = new Set<string>([
   'ipRangeStart',
   'ipRangeEnd',
   'ipSubnetMask',
-  'ipGateway'
+  'ipGateway',
+  'experienceMode'
 ]);
 
 function isPlainObject(val: unknown): val is Record<string, unknown> {

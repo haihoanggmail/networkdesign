@@ -11,6 +11,7 @@ export async function runExportBundle(
 
   const { pdfArtifact, captures3D } = await buildExportPdfForBundle(project, {
     contentScope: config.contentScope,
+    floorScope: config.floorScope,
     paperSize: 'A4',
     orientation: config.orientation,
     drawingCode: config.drawingCode,
@@ -30,6 +31,7 @@ export async function runExportBundle(
   }));
 
   return exportHandoverZipBundle(project, {
+    floorScope: config.floorScope,
     drawingCode: config.drawingCode,
     drawingScale: config.drawingScale,
     orientation: config.orientation,
@@ -43,7 +45,8 @@ export async function runExportBundle(
     captured3DImages,
     viewerOptions: {
       contentScope: config.contentScope,
-      background3D: config.background3D
+      background3D: config.background3D,
+      floorScope: config.floorScope
     }
   });
 }

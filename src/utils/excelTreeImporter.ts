@@ -14,6 +14,7 @@ import {
 import { DEVICE_CATALOG } from '../data/deviceCatalog';
 import { DEFAULT_CANVAS_SETTINGS } from './projectStorage';
 import { checkImportPayloadSize, MAX_EXCEL_FILE_BYTES } from './security';
+import { trackExport, trackTemplate } from '../services/tracker';
 
 export type TreeLayoutMode = 'vertical' | 'horizontal' | 'by_floor';
 export type TreeApplyMode = 'new_project' | 'merge';
@@ -719,6 +720,7 @@ async function downloadWorkbookAsXlsx(wb: ExcelJS.Workbook, fileName: string): P
 export async function downloadRouterTreeExcelTemplate() {
   const wb = buildRouterTreeTemplateWorkbook();
   await downloadWorkbookAsXlsx(wb, 'HACHIHI_Mau_So_Do_Router_Da_Tang.xlsx');
+  trackTemplate('excel_router');
 }
 
 const CATEGORY_HIERARCHY_RANK: Record<DeviceCategory, number> = {
@@ -944,6 +946,7 @@ export async function exportProjectRouterTreeToExcel(project: ProjectState): Pro
     .replace(/[^a-zA-Z0-9_\-\u00C0-\u024F\u1E00-\u1EFF]+/g, '_')
     .replace(/^_+|_+$/g, '');
   await downloadWorkbookAsXlsx(wb, `${safeBase || 'HACHIHI'}_Cay_Router.xlsx`);
+  trackExport('excel_router');
 }
 
 const STANDARD_TREE_COLUMN_HEADERS = [
