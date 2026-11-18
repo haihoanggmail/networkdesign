@@ -27,15 +27,17 @@ import { createProjectPackage } from '../../utils/projectPackage';
 import { getRackStatistics, getAssetUHeight } from '../../utils/rackGeometry';
 import { exportProjectBomCsv } from '../../utils/bomCsvExporter';
 import { computeProjectCableSummary } from '../../utils/cableRouting';
-import { computePureDiagramBounds, generatePureSvgMarkup } from '../../utils/svgExport';
-import { computeA4ScaleMetrics } from '../../utils/pdfExporter';
+import { computePureDiagramBounds } from '../../utils/svgExport';
+import { computeA4ScaleMetrics } from '../../utils/pdfScale';
 import { useFocusTrap } from '../../hooks/useFocusTrap';
+import { trackExport } from '../../services/tracker';
 import type {
   CameraPresetId,
   Capture3DBackground,
   Capture3DRequestOptions,
   Capture3DResult
 } from '../../contexts/ViewportContext';
+import { generate2DSvgString } from '../../services/export/capture2D';
 import {
   CAMERA_PRESET_LABELS,
   ExportContentScope,
@@ -45,6 +47,7 @@ import {
 export type PaperSize = 'A4' | 'A3' | 'A2' | 'A1';
 export type PrintOrientation = 'landscape' | 'portrait';
 export type PrintScaleMode = 'fit' | 'tile2x2';
+export type ExportCategoryTab = 'drawings' | 'bom' | 'report' | 'handover';
 
 interface ExportModalProps {
   project: ProjectState;
@@ -80,6 +83,12 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 }) => {
   const [statusBanner, setStatusBanner] = useState<{ type: 'info' | 'success' | 'error'; text: string } | null>(null);
 
+  // UX #7: 4 clear export categories & floor scope
+  const [activeCategoryTab, setActiveCategoryTab] = useState<ExportCategoryTab>('drawings');
+  const [floorScope, setFloorScope] = useState<string>(
+    project.floors.length > 1 ? 'all' : project.activeFloorId || 'all'
+  );
+
   // Content Scope & 3D Export Settings
   const [contentScope, setContentScope] = useState<ExportContentScope>(is3DView ? '3d' : '2d');
   const [background3D, setBackground3D] = useState<Capture3DBackground>('light');
@@ -109,10 +118,13 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 
   useEffect(() => {
     if (isOpen) {
+      setActiveCategoryTab('drawings');
+      setFloorScope(project.floors.length > 1 ? 'all' : project.activeFloorId || 'all');
       setContentScope(is3DView ? '3d' : '2d');
+      setBackground3D(project.settings?.isDarkMode ? 'dark' : 'light');
       setStatusBanner(null);
     }
-  }, [isOpen, is3DView]);
+  }, [isOpen, is3DView, project.settings?.isDarkMode, project.floors.length, project.activeFloorId]);
 
   const toggle3DAngle = (preset: CameraPresetId) => {
     setSelected3DAngles(prev => {
@@ -134,7 +146,14 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     });
   }, []);
 
-  const bounds = useMemo(() => computePureDiagramBounds(project), [project]);
+  const bounds = useMemo(
+    () =>
+      computePureDiagramBounds(
+        project,
+        floorScope !== 'all' ? { floorScopeId: floorScope } : undefined
+      ),
+    [project, floorScope]
+  );
   const a4ScalePreview = useMemo(
     () =>
       computeA4ScaleMetrics(bounds, project.settings.scale, orientation, {
@@ -142,6 +161,25 @@ export const ExportModal: React.FC<ExportModalProps> = ({
       }),
     [bounds, project.settings.scale, orientation, includeLegendPanel]
   );
+  const previewSvgDataUrl = useMemo(() => {
+    if (!isOpen || contentScope === '3d') return '';
+    try {
+      const svgMarkup = generate2DSvgString(project, {
+        darkTheme: project.settings.isDarkMode,
+        includeTitleBlock: false,
+        floorScope
+      });
+      return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgMarkup)}`;
+    } catch {
+      return '';
+    }
+  }, [isOpen, contentScope, project, floorScope]);
+  const selectedFloorSummary = useMemo(() => {
+    if (floorScope === 'all') {
+      return `Toàn bộ tòa nhà (${project.floors.length} tầng)`;
+    }
+    return project.floors.find(f => f.id === floorScope)?.name || 'Tầng đang chọn';
+  }, [floorScope, project.floors]);
 
   useEffect(() => {
     if (!isPrinting) return;
@@ -199,6 +237,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     try {
       const result = await ExportService.exportPng(project, {
         contentScope,
+        floorScope,
         background3D,
         capture3D: onCapture3D
       });
@@ -217,9 +256,9 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   };
 
   // 2. Export Pure Vector SVG (2D CAD only)
-  const handleExportSvg = () => {
+  const handleExportSvg = async () => {
     try {
-      const res = ExportService.exportSvg(project, contentScope);
+      const res = await ExportService.exportSvg(project, contentScope, floorScope);
       setStatusBanner({ type: 'success', text: `Đã xuất Vector SVG chuẩn CAD (${res.filename}) thành công!` });
     } catch (err: unknown) {
       setStatusBanner({ type: 'error', text: err instanceof Error ? err.message : String(err) });
@@ -227,9 +266,9 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   };
 
   // 2b. Export AutoCAD DXF (2D CAD only)
-  const handleExportDxf = () => {
+  const handleExportDxf = async () => {
     try {
-      const res = ExportService.exportDxf(project, contentScope);
+      const res = await ExportService.exportDxf(project, contentScope, floorScope);
       setStatusBanner({ type: 'success', text: `Đã xuất tệp AutoCAD DXF đa lớp (${res.filename}) thành công!` });
     } catch (err: unknown) {
       setStatusBanner({ type: 'error', text: err instanceof Error ? err.message : String(err) });
@@ -237,21 +276,26 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   };
 
   // 2c. Export Standalone Offline Interactive HTML Viewer (3D WebGL + 2D CAD + BOM)
-  const handleExportHtmlViewer = () => {
-    const res = ExportService.exportHtmlViewer(project, {
-      contentScope,
-      background3D
-    });
-    const scopeLabel =
-      contentScope === '3d'
-        ? '3D WebGL xoay 360° đa hướng'
-        : contentScope === 'both'
-        ? '3D WebGL + Sơ đồ 2D & BOM'
-        : 'Sơ đồ 2D + 3D WebGL & BOM';
-    setStatusBanner({
-      type: 'success',
-      text: `Đã xuất trình xem HTML độc lập ${scopeLabel} (${res.filename}) — mở trực tiếp bằng trình duyệt, không cần cài phần mềm!`
-    });
+  const handleExportHtmlViewer = async () => {
+    try {
+      const res = await ExportService.exportHtmlViewer(project, {
+        contentScope,
+        background3D,
+        floorScope
+      });
+      const scopeLabel =
+        contentScope === '3d'
+          ? '3D WebGL xoay 360° đa hướng'
+          : contentScope === 'both'
+          ? '3D WebGL + Sơ đồ 2D & BOM'
+          : 'Sơ đồ 2D + 3D WebGL & BOM';
+      setStatusBanner({
+        type: 'success',
+        text: `Đã xuất trình xem HTML độc lập ${scopeLabel} (${res.filename}) — mở trực tiếp bằng trình duyệt, không cần cài phần mềm!`
+      });
+    } catch (err: unknown) {
+      setStatusBanner({ type: 'error', text: err instanceof Error ? err.message : String(err) });
+    }
   };
 
   // 2d. Export BOM CSV (Assets, Cable Lengths, & Rack Components)
@@ -318,6 +362,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
+      trackExport('project_package');
 
       const extras: string[] = [];
       if (pkg.manifest.counts.embeddedImages > 0) extras.push(`${pkg.manifest.counts.embeddedImages} ảnh nhúng`);
@@ -395,6 +440,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     try {
       const result = await ExportService.exportPdf(project, {
         contentScope,
+        floorScope,
         paperSize,
         orientation,
         drawingCode,
@@ -435,6 +481,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     try {
       const res = await ExportService.exportBundle(project, {
         contentScope,
+        floorScope,
         drawingCode,
         drawingScale,
         orientation,
@@ -499,7 +546,11 @@ export const ExportModal: React.FC<ExportModalProps> = ({
       return;
     }
 
-    const pureSvg = generatePureSvgMarkup(project, { darkTheme: false, includeTitleBlock: false });
+    const pureSvg = generate2DSvgString(project, {
+      darkTheme: false,
+      includeTitleBlock: false,
+      floorScope
+    });
     const urlApi = window.URL || window.webkitURL;
     const nextBlobTiles = diagramTiles.map(tile => {
       const tileSvg = pureSvg.replace(/viewBox="[^"]*"/i, `viewBox="${tile.viewBox}"`);
@@ -592,688 +643,845 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               </div>
             )}
 
-            {/* Scrollable Body */}
-            <div className="p-4 sm:p-6 overflow-y-auto space-y-5">
-              {/* Content Scope Selector (2D / 3D / Both) */}
-              <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-800/40 space-y-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div>
-                    <div className="text-xs font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
-                      <Cuboid className="w-4 h-4 text-[#155EEF]" />
-                      <span>Phạm vi nội dung xuất (Content Scope)</span>
-                    </div>
-                    <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
-                      Chọn xuất bản vẽ 2D CAD, mô hình không gian 3D WebGL hoặc gộp cả hai vào hồ sơ bàn giao
-                    </p>
-                  </div>
-                  <div
-                    role="group"
-                    aria-label="Chọn phạm vi xuất dữ liệu"
-                    className="inline-flex rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-0.5 gap-0.5"
-                  >
-                    {(
-                      [
-                        { id: '2d', label: 'Bản vẽ 2D' },
-                        { id: '3d', label: 'Mô hình 3D' },
-                        { id: 'both', label: 'Cả 2D và 3D' }
-                      ] as const
-                    ).map(opt => (
-                      <button
-                        key={opt.id}
-                        type="button"
-                        data-testid={`export-scope-${opt.id}`}
-                        onClick={() => setContentScope(opt.id)}
-                        aria-pressed={contentScope === opt.id}
-                        className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-colors whitespace-nowrap ${
-                          contentScope === opt.id
-                            ? 'bg-[#155EEF] text-white shadow-2xs'
-                            : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
-                        }`}
-                      >
-                        {opt.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {contentScope !== '2d' && (
-                  <div className="pt-2.5 border-t border-slate-200/80 dark:border-slate-700/70 space-y-2.5">
-                    {!is3DView && (
-                      <div className="px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/70 text-amber-800 dark:text-amber-200 text-[11px] font-medium flex items-center gap-2">
-                        <AlertCircle className="w-4 h-4 shrink-0 text-amber-600 dark:text-amber-400" />
-                        <span>
-                          Hiện bạn đang ở chế độ 2D CAD. Để chụp &amp; xuất hình 3D WebGL sắc nét, hãy chuyển sang chế độ 3D trước khi bấm xuất (hệ thống không thay thế bằng hình 2D).
-                        </span>
-                      </div>
-                    )}
-
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      <div>
-                        <div className="text-[10px] font-bold uppercase text-slate-500 dark:text-slate-400 mb-1">
-                          Nền kết xuất 3D
-                        </div>
-                        <div className="grid grid-cols-2 gap-1">
-                          <button
-                            type="button"
-                            onClick={() => setBackground3D('light')}
-                            className={`py-1.5 px-2 rounded-md border text-[11px] font-semibold transition-colors ${
-                              background3D === 'light'
-                                ? 'bg-[#155EEF] text-white border-[#155EEF]'
-                                : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200'
-                            }`}
-                          >
-                            Nền sáng (Chuẩn in)
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setBackground3D('dark')}
-                            className={`py-1.5 px-2 rounded-md border text-[11px] font-semibold transition-colors ${
-                              background3D === 'dark'
-                                ? 'bg-[#155EEF] text-white border-[#155EEF]'
-                                : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200'
-                            }`}
-                          >
-                            Nền tối (Studio)
-                          </button>
-                        </div>
-                      </div>
-
-                      <div>
-                        <div className="text-[10px] font-bold uppercase text-slate-500 dark:text-slate-400 mb-1">
-                          Góc camera 3D xuất PDF / ZIP
-                        </div>
-                        <div className="flex flex-wrap gap-1.5">
-                          {(['iso', 'top', 'front', 'side'] as CameraPresetId[]).map(preset => {
-                            const checked = selected3DAngles.includes(preset);
-                            return (
-                              <button
-                                key={preset}
-                                type="button"
-                                onClick={() => toggle3DAngle(preset)}
-                                aria-pressed={checked}
-                                title={CAMERA_PRESET_LABELS[preset]}
-                                className={`px-2 py-1 rounded-md border text-[11px] font-semibold transition-colors ${
-                                  checked
-                                    ? 'bg-blue-50 dark:bg-blue-950/60 border-[#155EEF] text-[#155EEF] dark:text-blue-300'
-                                    : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
-                                }`}
-                              >
-                                {preset === 'iso'
-                                  ? 'Isometric'
-                                  : preset === 'top'
-                                  ? 'Trên xuống'
-                                  : preset === 'front'
-                                  ? 'Trực diện'
-                                  : 'Bên hông'}
-                              </button>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* 1-Click Unified Handover Bundle Banner */}
-              <div className="p-4 rounded-xl border border-blue-200 dark:border-blue-800 bg-blue-50/70 dark:bg-blue-950/30 flex flex-wrap items-center justify-between gap-3">
-                <div className="flex items-start gap-3 min-w-0">
-                  <div className="w-10 h-10 rounded-lg bg-[#155EEF] text-white flex items-center justify-center shrink-0">
-                    <Archive className="w-5 h-5" />
-                  </div>
-                  <div className="min-w-0">
-                    <h3 className="font-bold text-sm text-slate-900 dark:text-white">
-                      Gói Bàn Giao 1 Nút (.zip)
-                    </h3>
-                    <p className="text-[11px] text-slate-600 dark:text-slate-300 mt-0.5">
-                      {contentScope === '2d'
-                        ? 'Đóng gói đồng bộ: PDF kỹ thuật + Workbook Excel 6 sheet + AutoCAD DXF + SVG + Trình xem HTML + Bảng cáp CSV + JSON sao lưu.'
-                        : 'Đóng gói đồng bộ: PDF (kèm ảnh 3D đa góc nhìn) + Ảnh PNG 3D + Workbook Excel 6 sheet + AutoCAD DXF + SVG + JSON sao lưu.'}
-                    </p>
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => void handleExportHandoverBundle()}
-                  disabled={isExportingBundle || isCapturing3D}
-                  aria-label="Tải gói bàn giao hồ sơ ZIP tổng hợp"
-                  className="px-4 py-2 bg-[#155EEF] hover:bg-[#124CC7] disabled:opacity-60 text-white rounded-lg font-semibold flex items-center gap-2 whitespace-nowrap shrink-0 transition-colors"
-                >
-                  {isExportingBundle ? <Loader2 className="w-4 h-4 animate-spin" /> : <Archive className="w-4 h-4" />}
-                  <span>{isExportingBundle ? 'Đang nén gói ZIP...' : 'Tải Gói Bàn Giao (.zip)'}</span>
-                </button>
-              </div>
-
-              {/* Export Cards Grid */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
-                {/* Option 1: Full Excel .xlsx Workbook (6 sheets) */}
-                <div
-                  onClick={async () => {
-                    try {
-                      setStatusBanner({ type: 'info', text: 'Đang nạp bộ xuất Excel & đóng gói 6 sheet...' });
-                      const { exportProjectToExcel } = await import('../../utils/excelService');
-                      await exportProjectToExcel(project);
-                      setStatusBanner({ type: 'success', text: 'Đã xuất Workbook Excel 6 sheet thành công!' });
-                    } catch (err: unknown) {
-                      setStatusBanner({ type: 'error', text: `Lỗi xuất Excel: ${err instanceof Error ? err.message : String(err)}` });
-                    }
-                  }}
-                  className="p-4 rounded-xl border-2 border-emerald-500/80 hover:border-emerald-600 bg-emerald-50/30 hover:bg-emerald-50/60 dark:bg-emerald-950/20 dark:hover:bg-emerald-950/40 transition-all cursor-pointer flex items-start gap-3 shadow-xs"
-                >
-                  <div className="w-10 h-10 rounded-lg bg-emerald-600 text-white flex items-center justify-center shrink-0 shadow-xs">
-                    <FileSpreadsheet className="w-5 h-5" />
-                  </div>
-                  <div>
-                    <div className="font-bold text-sm text-slate-900 dark:text-white">
-                      Xuất Excel Kỹ Thuật (.xlsx – 6 Sheet)
-                    </div>
-                    <div className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                      Gồm: Tổng Quan, BOM Vật Tư, Thiết Bị, Danh Bạ Cáp, Chi Tiết Tủ Rack (Trước/Sau) &amp; Theo Khu Vực
-                    </div>
-                    <div className="text-xs text-emerald-700 dark:text-emerald-400 font-bold mt-1.5">
-                      Tải Workbook Excel (.xlsx) &rarr;
-                    </div>
-                  </div>
-                </div>
-
-                {/* Option 2: Export Parent-Child Router Tree (.xlsx) */}
-                <div
-                  onClick={async () => {
-                    try {
-                      setStatusBanner({ type: 'info', text: 'Đang trích xuất cây Router Cha–Con ra Excel...' });
-                      const { exportProjectRouterTreeToExcel } = await import('../../utils/excelTreeImporter');
-                      await exportProjectRouterTreeToExcel(project);
-                      setStatusBanner({ type: 'success', text: 'Đã xuất Cây Router Cha–Con (.xlsx) thành công!' });
-                      onAfterExportRouterTree?.();
-                    } catch (err: unknown) {
-                      setStatusBanner({
-                        type: 'error',
-                        text: `Lỗi xuất cây Router: ${err instanceof Error ? err.message : String(err)}`
-                      });
-                    }
-                  }}
-                  className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 hover:border-emerald-500 bg-slate-50/50 hover:bg-emerald-50/20 dark:bg-slate-800/30 transition-all cursor-pointer flex items-start gap-3"
-                >
-                  <div className="w-10 h-10 rounded-lg bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 flex items-center justify-center shrink-0">
-                    <GitFork className="w-5 h-5" />
-                  </div>
-                  <div>
-                    <div className="font-bold text-sm text-slate-900 dark:text-white">
-                      Xuất Cây Router Cha–Con (.xlsx)
-                    </div>
-                    <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
-                      Xuất cấu trúc phân cấp thiết bị, Router Cha (Uplink), IP/VLAN, Cổng &amp; Loại cáp tương thích nhập ngược lại
-                    </div>
-                    <div className="text-[10px] text-emerald-600 font-semibold mt-1.5">
-                      Tải file Cây Router (.xlsx) &rarr;
-                    </div>
-                  </div>
-                </div>
-
-                {/* Option 2B: Download Excel Template */}
-                <div
-                  onClick={async () => {
-                    try {
-                      const { downloadExcelTemplate } = await import('../../utils/excelService');
-                      await downloadExcelTemplate();
-                      setStatusBanner({ type: 'success', text: 'Đã tải xuống tệp Excel mẫu!' });
-                    } catch (err: unknown) {
-                      setStatusBanner({ type: 'error', text: `Lỗi tải mẫu: ${err instanceof Error ? err.message : String(err)}` });
-                    }
-                  }}
-                  className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 hover:border-emerald-500 bg-slate-50/50 hover:bg-emerald-50/20 dark:bg-slate-800/30 transition-all cursor-pointer flex items-start gap-3"
-                >
-                  <div className="w-10 h-10 rounded-lg bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 flex items-center justify-center shrink-0">
-                    <Table className="w-5 h-5" />
-                  </div>
-                  <div>
-                    <div className="font-bold text-sm text-slate-900 dark:text-white">Tải Mẫu Excel Nhập Liệu</div>
-                    <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
-                      Chuẩn cột Ultimate: Mã tài sản, Model, IP, VLAN, Tủ Rack, Vị trí U, Số U &amp; Mặt tủ (Trước/Sau)
-                    </div>
-                    <div className="text-[10px] text-emerald-600 font-semibold mt-1.5">
-                      Tải file mẫu Excel (.xlsx) &rarr;
-                    </div>
-                  </div>
-                </div>
-
-                {/* Option 3: High-res PNG (2D / 3D / Both) */}
-                <button
-                  type="button"
-                  onClick={() => void handleExportPng()}
-                  disabled={isExportingPng || isCapturing3D}
-                  className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 hover:border-blue-500 bg-slate-50/50 hover:bg-blue-50/30 dark:bg-slate-800/30 transition-all cursor-pointer flex items-start gap-3 text-left disabled:opacity-50 disabled:cursor-wait"
-                >
-                  <div className="w-10 h-10 rounded-lg bg-blue-100 dark:bg-blue-900/40 text-blue-600 flex items-center justify-center shrink-0">
-                    {isExportingPng ? <Loader2 className="w-5 h-5 animate-spin" /> : <Image className="w-5 h-5" />}
-                  </div>
-                  <div>
-                    <div className="font-bold text-sm text-slate-900 dark:text-white">
-                      {contentScope === '3d'
-                        ? 'Ảnh PNG Mô Hình 3D Nét Cao'
-                        : contentScope === 'both'
-                        ? 'Ảnh PNG (2D CAD + Mô Hình 3D)'
-                        : 'Ảnh PNG Toàn Cảnh Nét Cao'}
-                    </div>
-                    <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
-                      {contentScope === '3d'
-                        ? `Kết xuất trực tiếp từ Three.js WebGL (${background3D === 'light' ? 'nền trắng chuẩn in' : 'nền tối Studio'})`
-                        : contentScope === 'both'
-                        ? 'Tải cả ảnh vector 2D 2x và ảnh chụp WebGL 3D hiện tại'
-                        : 'Kết xuất vector thuần độ phân giải 2x (không bị lỗi mất chữ/mất biểu tượng)'}
-                    </div>
-                    <div className="text-[10px] text-blue-600 font-semibold mt-1.5">
-                      {isExportingPng ? 'Đang kết xuất PNG...' : 'Tải file PNG →'}
-                    </div>
-                  </div>
-                </button>
-
-                {/* Option 4: Vector SVG (2D CAD only; dimmed when scope is 3d) */}
-                <button
-                  type="button"
-                  disabled={contentScope === '3d'}
-                  onClick={handleExportSvg}
-                  title={contentScope === '3d' ? 'Vector SVG chỉ hỗ trợ bản vẽ 2D CAD' : 'Tải Vector SVG chuẩn CAD'}
-                  className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 hover:border-blue-500 bg-slate-50/50 hover:bg-blue-50/30 dark:bg-slate-800/30 transition-all cursor-pointer flex items-start gap-3 text-left disabled:opacity-35 disabled:cursor-not-allowed disabled:hover:border-slate-200"
-                >
-                  <div className="w-10 h-10 rounded-lg bg-sky-100 dark:bg-sky-900/40 text-sky-600 flex items-center justify-center shrink-0">
-                    <FileCode className="w-5 h-5" />
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="font-bold text-sm text-slate-900 dark:text-white">Vector SVG Chuẩn CAD</span>
-                      {contentScope === '3d' && (
-                        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300 shrink-0">
-                          Chỉ 2D
-                        </span>
-                      )}
-                    </div>
-                    <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
-                      Định dạng vector sắc nét vô hạn, tương thích Visio, Corel, Illustrator
-                    </div>
-                    <div className="text-[10px] text-sky-600 font-semibold mt-1.5">
-                      {contentScope === '3d' ? 'Không áp dụng cho phạm vi 3D' : 'Tải file SVG →'}
-                    </div>
-                  </div>
-                </button>
-
-                {/* Option 5: AutoCAD DXF (2D CAD only; dimmed when scope is 3d) */}
-                <button
-                  type="button"
-                  disabled={contentScope === '3d'}
-                  onClick={handleExportDxf}
-                  title={contentScope === '3d' ? 'AutoCAD DXF chỉ hỗ trợ bản vẽ 2D CAD' : 'Tải AutoCAD DXF đa lớp'}
-                  className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 hover:border-indigo-500 bg-slate-50/50 hover:bg-indigo-50/30 dark:bg-slate-800/30 transition-all cursor-pointer flex items-start gap-3 text-left disabled:opacity-35 disabled:cursor-not-allowed disabled:hover:border-slate-200"
-                >
-                  <div className="w-10 h-10 rounded-lg bg-indigo-100 dark:bg-indigo-900/40 text-indigo-600 flex items-center justify-center shrink-0">
-                    <Compass className="w-5 h-5" />
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="font-bold text-sm text-slate-900 dark:text-white">AutoCAD DXF Đa Lớp (.dxf)</span>
-                      {contentScope === '3d' && (
-                        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300 shrink-0">
-                          Chỉ 2D
-                        </span>
-                      )}
-                    </div>
-                    <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
-                      Xuất tệp CAD R12 tách lớp riêng ROOMS, RACKS, DEVICES, CABLES &amp; LABELS
-                    </div>
-                    <div className="text-[10px] text-indigo-600 font-semibold mt-1.5">
-                      {contentScope === '3d' ? 'Không áp dụng cho phạm vi 3D' : 'Tải file AutoCAD DXF →'}
-                    </div>
-                  </div>
-                </button>
-
-                {/* Option 6: Standalone Interactive HTML Viewer (3D WebGL 360° + 2D CAD + BOM) */}
-                <button
-                  type="button"
-                  onClick={handleExportHtmlViewer}
-                  title={
-                    contentScope === '3d'
-                      ? 'Tải trình xem HTML 3D tương tác: xoay ngang dọc 360°, chuyển 7 hướng camera & xem thông số thiết bị offline'
-                      : 'Tải trình xem HTML độc lập gồm mô hình 3D WebGL xoay 360° + sơ đồ 2D CAD & bảng BOM'
-                  }
-                  className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 hover:border-teal-500 bg-slate-50/50 hover:bg-teal-50/30 dark:bg-slate-800/30 transition-all cursor-pointer flex items-start gap-3 text-left"
-                >
-                  <div className="w-10 h-10 rounded-lg bg-teal-100 dark:bg-teal-900/40 text-teal-600 flex items-center justify-center shrink-0">
-                    <Globe className="w-5 h-5" />
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="font-bold text-sm text-slate-900 dark:text-white">Trình Xem HTML Độc Lập (.html)</span>
-                      <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-teal-100 dark:bg-teal-900/50 text-teal-700 dark:text-teal-300 shrink-0">
-                        {contentScope === '3d' ? '3D Xoay 360°' : '2D + 3D WebGL'}
-                      </span>
-                    </div>
-                    <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
-                      {contentScope === '3d'
-                        ? 'Mô hình 3D WebGL xoay ngang dọc 360°, 7 hướng camera, giãn tầng & kiểm tra thiết bị offline'
-                        : 'Sơ đồ 2D CAD + Mô hình 3D WebGL xoay 360° đa hướng & bảng BOM chạy offline'}
-                    </div>
-                    <div className="text-[10px] text-teal-600 font-semibold mt-1.5">
-                      {contentScope === '3d' ? 'Tải file HTML Viewer 3D →' : 'Tải file HTML Viewer (3D + 2D) →'}
-                    </div>
-                  </div>
-                </button>
-
-                {/* Option 7: Export BOM CSV & Open BOM Dashboard */}
-                <div className="md:col-span-2 p-4 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-800/40 flex flex-wrap items-start justify-between gap-3">
-                  <div className="flex items-start gap-3 min-w-0 flex-1">
-                    <div className="w-10 h-10 rounded-lg bg-blue-100 dark:bg-blue-900/50 text-[#155EEF] dark:text-blue-300 flex items-center justify-center shrink-0">
-                      <ClipboardList className="w-5 h-5" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <span className="font-bold text-sm text-slate-900 dark:text-white">
-                          Bảng Kê Vật Tư &amp; Dự Toán (BOM)
-                        </span>
-                        <span className="text-xs font-mono tabular-nums text-slate-600 dark:text-slate-300">
-                          {allAssets.length} thiết bị · {bomCableSummary.totalMeters}m cáp · {bomRackComponentCount} thành phần Rack
-                        </span>
-                      </div>
-                      <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                        Xem bảng tổng hợp trực quan theo tầng/nhóm, sao chép sang Excel hoặc tải tệp CSV chuẩn cột UTF-8 BOM.
-                      </p>
-                      <div className="flex flex-wrap items-center gap-2 mt-2.5">
-                        {onOpenBomModal && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              onClose();
-                              onOpenBomModal();
-                            }}
-                            className="px-3 py-1.5 rounded-lg bg-[#155EEF] hover:bg-[#124CC7] text-white font-semibold text-xs flex items-center gap-1.5 transition-colors"
-                          >
-                            <ClipboardList className="w-3.5 h-3.5" />
-                            <span>Xem Thống kê Vật tư (BOM)</span>
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          onClick={handleExportBomCsv}
-                          aria-label="Export BOM CSV summarizing assets, cable lengths, and rack components"
-                          className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-100 font-semibold text-xs flex items-center gap-1.5 transition-colors"
-                        >
-                          <Download className="w-3.5 h-3.5" />
-                          <span>Tải CSV BOM (.csv)</span>
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* PDF / Multi-Page Blueprint Print Config */}
-              <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/30 space-y-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex items-center gap-2">
-                    <div className="w-8 h-8 rounded-lg bg-[#155EEF] text-white flex items-center justify-center shrink-0">
-                      <FileText className="w-4 h-4" />
-                    </div>
-                    <div>
-                      <h3 className="font-bold text-sm text-slate-900 dark:text-white">
-                        Print to PDF · Xuất Bản Vẽ Kỹ Thuật A4
-                      </h3>
-                      <p className="text-[11px] text-slate-500 dark:text-slate-400 font-mono tabular-nums">
-                        Tỷ lệ A4: {a4ScalePreview.scaleRatioLabel} · Thước {a4ScalePreview.scaleBar.totalMeters}m · Khung {a4ScalePreview.realWorldWidthMeters}×{a4ScalePreview.realWorldHeightMeters}m
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2">
+            {/* 4-Group Navigation Tabs (Bản vẽ | Bảng vật tư | Báo cáo kỹ thuật | Hồ sơ bàn giao) */}
+            <div className="px-4 sm:px-6 pt-2.5 pb-2 border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shrink-0">
+              <div
+                role="tablist"
+                aria-label="Nhóm hồ sơ xuất"
+                className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 bg-slate-100 dark:bg-slate-800 p-1 rounded-xl"
+              >
+                {(
+                  [
+                    { id: 'drawings', label: 'Bản vẽ', testId: 'export-tab-drawings' },
+                    { id: 'bom', label: 'Bảng vật tư', testId: 'export-tab-bom' },
+                    { id: 'report', label: 'Báo cáo kỹ thuật', testId: 'export-tab-report' },
+                    { id: 'handover', label: 'Hồ sơ bàn giao', testId: 'export-tab-handover' }
+                  ] as const
+                ).map(tab => {
+                  const selected = activeCategoryTab === tab.id;
+                  return (
                     <button
+                      key={tab.id}
                       type="button"
-                      onClick={() => void handleExportTechnicalPdf()}
-                      disabled={isExportingPdf || isCapturing3D}
-                      className="px-3.5 py-2 bg-[#155EEF] hover:bg-[#124CC7] disabled:opacity-60 text-white rounded-lg font-semibold flex items-center gap-1.5 shadow-sm transition-colors whitespace-nowrap"
+                      role="tab"
+                      data-testid={tab.testId}
+                      aria-selected={selected}
+                      onClick={() => setActiveCategoryTab(tab.id)}
+                      className={`py-1.5 px-2.5 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap ${
+                        selected
+                          ? 'bg-white dark:bg-slate-900 text-[#155EEF] dark:text-blue-400 shadow-2xs'
+                          : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
+                      }`}
                     >
-                      {isExportingPdf ? (
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                      ) : (
-                        <FileDown className="w-4 h-4" />
-                      )}
-                      <span>
-                        {isExportingPdf
-                          ? `Đang tạo PDF ${paperSize}...`
-                          : contentScope === '3d'
-                          ? `Tải PDF 3D (${paperSize})`
-                          : contentScope === 'both'
-                          ? `Tải PDF 2D + 3D (${paperSize})`
-                          : `Tải PDF ${paperSize} (Chuẩn CAD)`}
-                      </span>
+                      {tab.label}
                     </button>
-
-                    <button
-                      type="button"
-                      disabled={contentScope === '3d'}
-                      onClick={handleStartPdfPrint}
-                      title={
-                        contentScope === '3d'
-                          ? 'In trình duyệt chỉ áp dụng cho bản vẽ 2D CAD. Hãy chọn Tải PDF 3D ở bên cạnh.'
-                          : `Mở hộp thoại in trình duyệt khổ ${paperSize}`
-                      }
-                      className="px-3 py-2 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 rounded-lg font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap disabled:opacity-35 disabled:cursor-not-allowed"
-                    >
-                      <Printer className="w-4 h-4" />
-                      <span>In trình duyệt ({paperSize})</span>
-                    </button>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1">
-                  <div>
-                    <label className="block text-[10px] font-bold uppercase text-slate-500 dark:text-slate-400 mb-1">
-                      Khổ giấy (Paper Size)
-                    </label>
-                    <div className="grid grid-cols-4 gap-1">
-                      {(['A4', 'A3', 'A2', 'A1'] as PaperSize[]).map(sz => (
-                        <button
-                          key={sz}
-                          onClick={() => setPaperSize(sz)}
-                          className={`py-1.5 rounded border font-bold text-[11px] transition-colors ${
-                            paperSize === sz
-                              ? 'bg-blue-600 text-white border-blue-600'
-                              : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 hover:border-blue-400'
-                          }`}
-                        >
-                          {sz}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div>
-                    <label className="block text-[10px] font-bold uppercase text-slate-500 dark:text-slate-400 mb-1">
-                      Hướng giấy (Orientation)
-                    </label>
-                    <div className="grid grid-cols-2 gap-1">
-                      <button
-                        onClick={() => setOrientation('landscape')}
-                        className={`py-1.5 rounded border font-semibold text-[11px] ${
-                          orientation === 'landscape'
-                            ? 'bg-blue-600 text-white border-blue-600'
-                            : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700'
-                        }`}
-                      >
-                        Ngang (Landscape)
-                      </button>
-                      <button
-                        onClick={() => setOrientation('portrait')}
-                        className={`py-1.5 rounded border font-semibold text-[11px] ${
-                          orientation === 'portrait'
-                            ? 'bg-blue-600 text-white border-blue-600'
-                            : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700'
-                        }`}
-                      >
-                        Dọc (Portrait)
-                      </button>
-                    </div>
-                  </div>
-
-                  <div>
-                    <label className="block text-[10px] font-bold uppercase text-slate-500 dark:text-slate-400 mb-1">
-                      Tỉ lệ trang bản vẽ
-                    </label>
-                    <div className="grid grid-cols-2 gap-1">
-                      <button
-                        onClick={() => setScaleMode('fit')}
-                        className={`py-1.5 rounded border font-semibold text-[11px] ${
-                          scaleMode === 'fit'
-                            ? 'bg-blue-600 text-white border-blue-600'
-                            : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700'
-                        }`}
-                      >
-                        Vừa 1 Trang
-                      </button>
-                      <button
-                        onClick={() => setScaleMode('tile2x2')}
-                        className={`py-1.5 rounded border font-semibold text-[11px] ${
-                          scaleMode === 'tile2x2'
-                            ? 'bg-blue-600 text-white border-blue-600'
-                            : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700'
-                        }`}
-                      >
-                        Chia 4 Mảnh (2×2)
-                      </button>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
-                  <div>
-                    <label className="block text-[10px] font-bold uppercase text-slate-500 dark:text-slate-400 mb-1">
-                      Số hiệu bản vẽ (Khung tên)
-                    </label>
-                    <input
-                      type="text"
-                      value={drawingCode}
-                      onChange={e => setDrawingCode(e.target.value)}
-                      className="w-full px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 font-mono text-[11px]"
-                      placeholder="NET-ELV-01"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[10px] font-bold uppercase text-slate-500 dark:text-slate-400 mb-1">
-                      Tỷ lệ bản vẽ (Scale)
-                    </label>
-                    <input
-                      type="text"
-                      value={drawingScale}
-                      onChange={e => setDrawingScale(e.target.value)}
-                      className="w-full px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 font-mono text-[11px]"
-                      placeholder="1:100 / NTS"
-                    />
-                  </div>
-                </div>
-
-                <div className="flex flex-wrap items-center gap-4 pt-1 text-[11px]">
-                  <label className="flex items-center gap-1.5 cursor-pointer font-medium">
-                    <input
-                      type="checkbox"
-                      checked={includeDiagram}
-                      onChange={e => setIncludeDiagram(e.target.checked)}
-                      className="rounded text-[#155EEF]"
-                    />
-                    <span>Bản vẽ sơ đồ hạ tầng</span>
-                  </label>
-                  <label className="flex items-center gap-1.5 cursor-pointer font-medium">
-                    <input
-                      type="checkbox"
-                      checked={includeLegendPanel}
-                      onChange={e => setIncludeLegendPanel(e.target.checked)}
-                      className="rounded text-[#155EEF]"
-                    />
-                    <span>Bảng Chú giải &amp; Thước tỷ lệ A4</span>
-                  </label>
-                  <label className="flex items-center gap-1.5 cursor-pointer font-medium">
-                    <input
-                      type="checkbox"
-                      checked={includeRackElevation}
-                      onChange={e => setIncludeRackElevation(e.target.checked)}
-                      className="rounded text-[#155EEF]"
-                    />
-                    <span>Hồ sơ Tủ Rack (Mặt Trước & Sau)</span>
-                  </label>
-                  <label className="flex items-center gap-1.5 cursor-pointer font-medium">
-                    <input
-                      type="checkbox"
-                      checked={includeTables}
-                      onChange={e => setIncludeTables(e.target.checked)}
-                      className="rounded text-[#155EEF]"
-                    />
-                    <span>Bảng tổng hợp thiết bị & Cáp ({allAssets.length} TB / {project.cables.length} Cáp)</span>
-                  </label>
-                </div>
+                  );
+                })}
               </div>
             </div>
 
-            {/* Portable Project Package (.hachihi.json) & Excel Import Strip */}
-            <div className="px-6 py-4 bg-slate-50 dark:bg-slate-800/50 border-t border-slate-200 dark:border-slate-800 space-y-3 shrink-0">
-              <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-                <span className="font-semibold text-slate-700 dark:text-slate-200">
-                  Gói dự án di động (.hachihi.json · tự nhúng ảnh, thiết bị đang dùng &amp; SHA-256)
-                </span>
-                <div className="flex flex-wrap items-center gap-4">
-                  <label className="flex items-center gap-1.5 cursor-pointer text-slate-700 dark:text-slate-300">
-                    <input
-                      type="checkbox"
-                      checked={pkgIncludeRevisions}
-                      onChange={e => setPkgIncludeRevisions(e.target.checked)}
-                      className="rounded accent-[#155EEF]"
-                    />
-                    <span>Kèm lịch sử phiên bản</span>
-                  </label>
-                  <label className="flex items-center gap-1.5 cursor-pointer text-slate-700 dark:text-slate-300">
-                    <input
-                      type="checkbox"
-                      checked={pkgIncludeCustomLibrary}
-                      onChange={e => setPkgIncludeCustomLibrary(e.target.checked)}
-                      className="rounded accent-[#155EEF]"
-                    />
-                    <span>Kèm thư viện thiết bị tùy chỉnh</span>
-                  </label>
-                </div>
-              </div>
+            {/* Scrollable Body */}
+            <div className="p-4 sm:p-6 overflow-y-auto space-y-5 flex-1">
+              {activeCategoryTab === 'drawings' && (
+                <>
+                  {/* Content Scope & Floor Scope Controls */}
+                  <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-800/40 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <div className="text-xs font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
+                          <Cuboid className="w-4 h-4 text-[#155EEF]" />
+                          <span>Phạm vi nội dung xuất (Content Scope)</span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                          Chọn xuất bản vẽ 2D CAD, mô hình không gian 3D WebGL hoặc gộp cả hai
+                        </p>
+                      </div>
+                      <div
+                        role="group"
+                        aria-label="Chọn phạm vi xuất dữ liệu"
+                        className="inline-flex rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-0.5 gap-0.5"
+                      >
+                        {(
+                          [
+                            { id: '2d', label: 'Bản vẽ 2D' },
+                            { id: '3d', label: 'Mô hình 3D' },
+                            { id: 'both', label: 'Cả 2D và 3D' }
+                          ] as const
+                        ).map(opt => (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            data-testid={`export-scope-${opt.id}`}
+                            onClick={() => setContentScope(opt.id)}
+                            aria-pressed={contentScope === opt.id}
+                            className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-colors whitespace-nowrap ${
+                              contentScope === opt.id
+                                ? 'bg-[#155EEF] text-white shadow-2xs'
+                                : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
+                            }`}
+                          >
+                            {opt.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
 
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="flex flex-wrap items-center gap-2">
-                  <label className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-md font-semibold flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors">
-                    <Upload className="w-3.5 h-3.5" />
-                    <span>Nhập từ File Excel (.xlsx / .csv)</span>
-                    <input
-                      type="file"
-                      accept=".xlsx,.xls,.csv"
-                      onChange={handleExcelFileUpload}
-                      className="hidden"
-                    />
-                  </label>
+                    {/* Multi-floor Selector */}
+                    {project.floors.length > 1 && (
+                      <div className="pt-2.5 border-t border-slate-200/80 dark:border-slate-700/70 flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                          <label
+                            htmlFor="export-floor-scope"
+                            className="text-xs font-bold text-slate-800 dark:text-slate-200 block"
+                          >
+                            Phạm vi tầng tòa nhà ({project.floors.length} tầng)
+                          </label>
+                          <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                            HTML Độc Lập luôn giữ thanh chuyển tầng tương tác; ảnh PNG/SVG/DXF kết xuất theo tầng đã chọn
+                          </p>
+                        </div>
+                        <select
+                          id="export-floor-scope"
+                          data-testid="export-floor-scope"
+                          value={floorScope}
+                          onChange={e => setFloorScope(e.target.value)}
+                          className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-semibold text-slate-800 dark:text-slate-100 min-w-[200px]"
+                        >
+                          <option value="all">Toàn bộ tòa nhà ({project.floors.length} tầng)</option>
+                          {[...project.floors]
+                            .sort((a, b) => a.level - b.level)
+                            .map(fl => (
+                              <option key={fl.id} value={fl.id}>
+                                {fl.name} (Tầng {fl.level})
+                              </option>
+                            ))}
+                        </select>
+                      </div>
+                    )}
 
-                  <button
-                    type="button"
-                    disabled={isExportingPackage}
-                    onClick={() => void handleExportPackage()}
-                    className="px-3.5 py-2 bg-[#155EEF] hover:bg-[#124CC7] disabled:opacity-60 text-white rounded-md font-semibold flex items-center gap-1.5 transition-colors"
+                    {contentScope !== '2d' && (
+                      <div className="pt-2.5 border-t border-slate-200/80 dark:border-slate-700/70 space-y-2.5">
+                        {!is3DView && (
+                          <div className="px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/70 text-amber-800 dark:text-amber-200 text-[11px] font-medium flex items-center gap-2">
+                            <AlertCircle className="w-4 h-4 shrink-0 text-amber-600 dark:text-amber-400" />
+                            <span>
+                              Hiện bạn đang ở chế độ 2D CAD. Để chụp &amp; xuất hình 3D WebGL sắc nét, hãy chuyển sang chế độ 3D trước khi bấm xuất (hệ thống không thay thế bằng hình 2D).
+                            </span>
+                          </div>
+                        )}
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          <div>
+                            <div className="text-[10px] font-bold uppercase text-slate-500 dark:text-slate-400 mb-1">
+                              Nền kết xuất 3D
+                            </div>
+                            <div className="grid grid-cols-2 gap-1">
+                              <button
+                                type="button"
+                                onClick={() => setBackground3D('light')}
+                                className={`py-1.5 px-2 rounded-md border text-[11px] font-semibold transition-colors ${
+                                  background3D === 'light'
+                                    ? 'bg-[#155EEF] text-white border-[#155EEF]'
+                                    : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200'
+                                }`}
+                              >
+                                Nền sáng (Chuẩn in)
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setBackground3D('dark')}
+                                className={`py-1.5 px-2 rounded-md border text-[11px] font-semibold transition-colors ${
+                                  background3D === 'dark'
+                                    ? 'bg-[#155EEF] text-white border-[#155EEF]'
+                                    : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200'
+                                }`}
+                              >
+                                Nền tối (Studio)
+                              </button>
+                            </div>
+                          </div>
+
+                          <div>
+                            <div className="text-[10px] font-bold uppercase text-slate-500 dark:text-slate-400 mb-1">
+                              Góc camera 3D xuất PDF / ZIP
+                            </div>
+                            <div className="flex flex-wrap gap-1.5">
+                              {(['iso', 'top', 'front', 'side'] as CameraPresetId[]).map(preset => {
+                                const checked = selected3DAngles.includes(preset);
+                                return (
+                                  <button
+                                    key={preset}
+                                    type="button"
+                                    onClick={() => toggle3DAngle(preset)}
+                                    aria-pressed={checked}
+                                    title={CAMERA_PRESET_LABELS[preset]}
+                                    className={`px-2 py-1 rounded-md border text-[11px] font-semibold transition-colors ${
+                                      checked
+                                        ? 'bg-blue-50 dark:bg-blue-950/60 border-[#155EEF] text-[#155EEF] dark:text-blue-300'
+                                        : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
+                                    }`}
+                                  >
+                                    {preset === 'iso'
+                                      ? 'Isometric'
+                                      : preset === 'top'
+                                      ? 'Trên xuống'
+                                      : preset === 'front'
+                                      ? 'Trực diện'
+                                      : 'Bên hông'}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Live Preview Card before Exporting */}
+                  <div
+                    data-testid="export-preview-card"
+                    className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/60 overflow-hidden"
                   >
-                    <Download className="w-3.5 h-3.5" />
-                    <span>{isExportingPackage ? 'Đang đóng gói...' : 'Xuất Gói dự án (.hachihi.json)'}</span>
-                  </button>
-                </div>
+                    <div className="px-3.5 py-2 border-b border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2 bg-white dark:bg-slate-900/70">
+                      <span className="text-[11px] font-bold text-slate-700 dark:text-slate-200">
+                        Xem trước trước khi xuất · {selectedFloorSummary}
+                      </span>
+                      <span className="text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400">
+                        {allAssets.length} TB · {project.cables.length} Cáp · {project.rooms.length} Phòng
+                      </span>
+                    </div>
+                    {contentScope === '3d' ? (
+                      <div className="p-4 flex items-center gap-3 text-[11px] text-slate-600 dark:text-slate-300">
+                        <Cuboid className="w-5 h-5 text-[#155EEF] shrink-0" />
+                        <span>
+                          Chế độ 3D sẽ chụp trực tiếp từ WebGL Three.js ({background3D === 'light' ? 'nền sáng chuẩn in' : 'nền tối Studio'}) hoặc đóng gói cảnh 3D xoay 360° tương tác vào HTML Độc Lập.
+                        </span>
+                      </div>
+                    ) : previewSvgDataUrl ? (
+                      <div className="p-3 bg-white dark:bg-slate-950 flex items-center justify-center">
+                        <img
+                          data-testid="export-preview-img"
+                          src={previewSvgDataUrl}
+                          referrerPolicy="no-referrer"
+                          alt={`Xem trước bản vẽ ${selectedFloorSummary}`}
+                          className="w-full max-h-44 object-contain rounded border border-slate-100 dark:border-slate-800"
+                        />
+                      </div>
+                    ) : (
+                      <div className="p-4 text-center text-xs text-slate-400">
+                        Chưa có đối tượng để hiển thị xem trước trên bản vẽ hiện tại.
+                      </div>
+                    )}
+                  </div>
 
-                <div className="flex items-center gap-2">
-                  <label className="px-3 py-2 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-700 rounded-md font-semibold flex items-center gap-1.5 cursor-pointer transition-colors">
-                    <Upload className="w-3.5 h-3.5" />
-                    <span>Nhập Gói / JSON (.hachihi.json)</span>
-                    <input
-                      type="file"
-                      accept=".hachihi.json,.json"
-                      onChange={handleImportJson}
-                      className="hidden"
-                    />
-                  </label>
+                  {/* Drawing Export Format Grid */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+                    {/* PNG */}
+                    <button
+                      type="button"
+                      onClick={() => void handleExportPng()}
+                      disabled={isExportingPng || isCapturing3D}
+                      className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 hover:border-blue-500 bg-slate-50/50 hover:bg-blue-50/30 dark:bg-slate-800/30 transition-all cursor-pointer flex items-start gap-3 text-left disabled:opacity-50 disabled:cursor-wait"
+                    >
+                      <div className="w-10 h-10 rounded-lg bg-blue-100 dark:bg-blue-900/40 text-blue-600 flex items-center justify-center shrink-0">
+                        {isExportingPng ? <Loader2 className="w-5 h-5 animate-spin" /> : <Image className="w-5 h-5" />}
+                      </div>
+                      <div>
+                        <div className="font-bold text-sm text-slate-900 dark:text-white">
+                          {contentScope === '3d'
+                            ? 'Ảnh PNG Mô Hình 3D Nét Cao'
+                            : contentScope === 'both'
+                            ? 'Ảnh PNG (2D CAD + Mô Hình 3D)'
+                            : 'Ảnh PNG Toàn Cảnh Nét Cao'}
+                        </div>
+                        <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
+                          {contentScope === '3d'
+                            ? `Kết xuất trực tiếp từ Three.js WebGL (${background3D === 'light' ? 'nền trắng chuẩn in' : 'nền tối Studio'})`
+                            : contentScope === 'both'
+                            ? 'Tải cả ảnh vector 2D 2x và ảnh chụp WebGL 3D hiện tại'
+                            : `Kết xuất vector thuần độ phân giải 2x (${selectedFloorSummary})`}
+                        </div>
+                        <div className="text-[10px] text-blue-600 font-semibold mt-1.5">
+                          {isExportingPng ? 'Đang kết xuất PNG...' : 'Tải file PNG →'}
+                        </div>
+                      </div>
+                    </button>
+
+                    {/* Vector SVG */}
+                    <button
+                      type="button"
+                      disabled={contentScope === '3d'}
+                      onClick={handleExportSvg}
+                      title={contentScope === '3d' ? 'Vector SVG chỉ hỗ trợ bản vẽ 2D CAD' : 'Tải Vector SVG chuẩn CAD'}
+                      className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 hover:border-blue-500 bg-slate-50/50 hover:bg-blue-50/30 dark:bg-slate-800/30 transition-all cursor-pointer flex items-start gap-3 text-left disabled:opacity-35 disabled:cursor-not-allowed disabled:hover:border-slate-200"
+                    >
+                      <div className="w-10 h-10 rounded-lg bg-sky-100 dark:bg-sky-900/40 text-sky-600 flex items-center justify-center shrink-0">
+                        <FileCode className="w-5 h-5" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-bold text-sm text-slate-900 dark:text-white">Vector SVG Chuẩn CAD</span>
+                          {contentScope === '3d' && (
+                            <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300 shrink-0">
+                              Chỉ 2D
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
+                          Định dạng vector sắc nét vô hạn, tương thích Visio, Corel, Illustrator
+                        </div>
+                        <div className="text-[10px] text-sky-600 font-semibold mt-1.5">
+                          {contentScope === '3d' ? 'Không áp dụng cho phạm vi 3D' : 'Tải file SVG →'}
+                        </div>
+                      </div>
+                    </button>
+
+                    {/* AutoCAD DXF */}
+                    <button
+                      type="button"
+                      disabled={contentScope === '3d'}
+                      onClick={handleExportDxf}
+                      title={contentScope === '3d' ? 'AutoCAD DXF chỉ hỗ trợ bản vẽ 2D CAD' : 'Tải AutoCAD DXF đa lớp'}
+                      className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 hover:border-indigo-500 bg-slate-50/50 hover:bg-indigo-50/30 dark:bg-slate-800/30 transition-all cursor-pointer flex items-start gap-3 text-left disabled:opacity-35 disabled:cursor-not-allowed disabled:hover:border-slate-200"
+                    >
+                      <div className="w-10 h-10 rounded-lg bg-indigo-100 dark:bg-indigo-900/40 text-indigo-600 flex items-center justify-center shrink-0">
+                        <Compass className="w-5 h-5" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-bold text-sm text-slate-900 dark:text-white">AutoCAD DXF Đa Lớp (.dxf)</span>
+                          {contentScope === '3d' && (
+                            <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300 shrink-0">
+                              Chỉ 2D
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
+                          Xuất tệp CAD R12 tách lớp riêng ROOMS, RACKS, DEVICES, CABLES &amp; LABELS
+                        </div>
+                        <div className="text-[10px] text-indigo-600 font-semibold mt-1.5">
+                          {contentScope === '3d' ? 'Không áp dụng cho phạm vi 3D' : 'Tải file AutoCAD DXF →'}
+                        </div>
+                      </div>
+                    </button>
+
+                    {/* Standalone Interactive HTML Viewer */}
+                    <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 hover:border-teal-500 bg-slate-50/50 hover:bg-teal-50/30 dark:bg-slate-800/30 transition-all flex items-start gap-3">
+                      <div className="w-10 h-10 rounded-lg bg-teal-100 dark:bg-teal-900/40 text-teal-600 flex items-center justify-center shrink-0">
+                        <Globe className="w-5 h-5" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-bold text-sm text-slate-900 dark:text-white">Trình Xem HTML Độc Lập (.html)</span>
+                          <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-teal-100 dark:bg-teal-900/50 text-teal-700 dark:text-teal-300 shrink-0">
+                            {contentScope === '3d' ? '3D Xoay 360°' : '2D + 3D WebGL'}
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
+                          {contentScope === '3d'
+                            ? 'Mô hình 3D WebGL xoay ngang dọc 360°, thanh chọn tầng tương tác & kiểm tra thiết bị offline'
+                            : 'Giữ nguyên bố cục 2D CAD + Mô hình 3D WebGL, thanh chuyển tầng tương tác & Dark Mode'}
+                        </div>
+                        <div className="flex flex-wrap items-center justify-between gap-2 mt-2.5">
+                          <div
+                            role="group"
+                            aria-label="Giao diện mặc định khi mở HTML"
+                            className="inline-flex rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-0.5 gap-0.5"
+                          >
+                            <button
+                              type="button"
+                              onClick={() => setBackground3D('light')}
+                              aria-pressed={background3D === 'light'}
+                              className={`px-2 py-0.5 rounded text-[10px] font-semibold transition-colors ${
+                                background3D === 'light'
+                                  ? 'bg-teal-600 text-white'
+                                  : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
+                              }`}
+                            >
+                              Mặc định Sáng
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setBackground3D('dark')}
+                              aria-pressed={background3D === 'dark'}
+                              className={`px-2 py-0.5 rounded text-[10px] font-semibold transition-colors ${
+                                background3D === 'dark'
+                                  ? 'bg-slate-800 text-amber-300 dark:bg-teal-600 dark:text-white'
+                                  : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
+                              }`}
+                            >
+                              Mặc định Tối
+                            </button>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={handleExportHtmlViewer}
+                            aria-label={
+                              contentScope === '3d'
+                                ? 'Trình Xem HTML Độc Lập 3D'
+                                : 'Trình Xem HTML Độc Lập 2D và 3D'
+                            }
+                            title={
+                              contentScope === '3d'
+                                ? 'Tải trình xem HTML 3D tương tác: xoay ngang dọc 360°, thanh chọn tầng & xem thông số thiết bị offline'
+                                : 'Tải trình xem HTML độc lập gồm mô hình 3D WebGL xoay 360° + sơ đồ 2D CAD đa tầng & bảng BOM'
+                            }
+                            className="px-2.5 py-1 rounded-md bg-teal-600 hover:bg-teal-700 text-white text-[11px] font-semibold transition-colors cursor-pointer"
+                          >
+                            {contentScope === '3d' ? 'Tải HTML 3D →' : 'Tải file HTML →'}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {activeCategoryTab === 'bom' && (
+                <div className="space-y-4">
+                  {/* Live BOM Summary Preview */}
+                  <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-800/40 flex flex-wrap items-start justify-between gap-3">
+                    <div className="flex items-start gap-3 min-w-0 flex-1">
+                      <div className="w-10 h-10 rounded-lg bg-blue-100 dark:bg-blue-900/50 text-[#155EEF] dark:text-blue-300 flex items-center justify-center shrink-0">
+                        <ClipboardList className="w-5 h-5" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="font-bold text-sm text-slate-900 dark:text-white">
+                            Bảng Kê Vật Tư &amp; Dự Toán (BOM)
+                          </span>
+                          <span className="text-xs font-mono tabular-nums text-slate-600 dark:text-slate-300">
+                            {allAssets.length} thiết bị · {bomCableSummary.totalMeters}m cáp · {bomRackComponentCount} thành phần Rack
+                          </span>
+                        </div>
+                        <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                          Xem bảng tổng hợp trực quan theo tầng/nhóm trước khi xuất, sao chép sang Excel hoặc tải tệp CSV chuẩn UTF-8 BOM.
+                        </p>
+                        <div className="flex flex-wrap items-center gap-2 mt-2.5">
+                          {onOpenBomModal && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                onClose();
+                                onOpenBomModal();
+                              }}
+                              className="px-3 py-1.5 rounded-lg bg-[#155EEF] hover:bg-[#124CC7] text-white font-semibold text-xs flex items-center gap-1.5 transition-colors"
+                            >
+                              <ClipboardList className="w-3.5 h-3.5" />
+                              <span>Xem Thống kê Vật tư (BOM)</span>
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={handleExportBomCsv}
+                            aria-label="Export BOM CSV summarizing assets, cable lengths, and rack components"
+                            className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-100 font-semibold text-xs flex items-center gap-1.5 transition-colors"
+                          >
+                            <Download className="w-3.5 h-3.5" />
+                            <span>Tải CSV BOM (.csv)</span>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Excel Workbooks & Router Tree */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+                    <div
+                      onClick={async () => {
+                        try {
+                          setStatusBanner({ type: 'info', text: 'Đang nạp bộ xuất Excel & đóng gói 6 sheet...' });
+                          const { exportProjectToExcel } = await import('../../utils/excelService');
+                          await exportProjectToExcel(project);
+                          setStatusBanner({ type: 'success', text: 'Đã xuất Workbook Excel 6 sheet thành công!' });
+                        } catch (err: unknown) {
+                          setStatusBanner({ type: 'error', text: `Lỗi xuất Excel: ${err instanceof Error ? err.message : String(err)}` });
+                        }
+                      }}
+                      className="p-4 rounded-xl border-2 border-emerald-500/80 hover:border-emerald-600 bg-emerald-50/30 hover:bg-emerald-50/60 dark:bg-emerald-950/20 dark:hover:bg-emerald-950/40 transition-all cursor-pointer flex items-start gap-3 shadow-xs md:col-span-2"
+                    >
+                      <div className="w-10 h-10 rounded-lg bg-emerald-600 text-white flex items-center justify-center shrink-0 shadow-xs">
+                        <FileSpreadsheet className="w-5 h-5" />
+                      </div>
+                      <div>
+                        <div className="font-bold text-sm text-slate-900 dark:text-white">
+                          Xuất Excel Kỹ Thuật (.xlsx – 6 Sheet)
+                        </div>
+                        <div className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                          Gồm: Tổng Quan, BOM Vật Tư, Thiết Bị, Danh Bạ Cáp, Chi Tiết Tủ Rack (Trước/Sau) &amp; Theo Khu Vực
+                        </div>
+                        <div className="text-xs text-emerald-700 dark:text-emerald-400 font-bold mt-1.5">
+                          Tải Workbook Excel (.xlsx) &rarr;
+                        </div>
+                      </div>
+                    </div>
+
+                    <div
+                      onClick={async () => {
+                        try {
+                          setStatusBanner({ type: 'info', text: 'Đang trích xuất cây Router Cha–Con ra Excel...' });
+                          const { exportProjectRouterTreeToExcel } = await import('../../utils/excelTreeImporter');
+                          await exportProjectRouterTreeToExcel(project);
+                          setStatusBanner({ type: 'success', text: 'Đã xuất Cây Router Cha–Con (.xlsx) thành công!' });
+                          onAfterExportRouterTree?.();
+                        } catch (err: unknown) {
+                          setStatusBanner({
+                            type: 'error',
+                            text: `Lỗi xuất cây Router: ${err instanceof Error ? err.message : String(err)}`
+                          });
+                        }
+                      }}
+                      className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 hover:border-emerald-500 bg-slate-50/50 hover:bg-emerald-50/20 dark:bg-slate-800/30 transition-all cursor-pointer flex items-start gap-3"
+                    >
+                      <div className="w-10 h-10 rounded-lg bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 flex items-center justify-center shrink-0">
+                        <GitFork className="w-5 h-5" />
+                      </div>
+                      <div>
+                        <div className="font-bold text-sm text-slate-900 dark:text-white">
+                          Xuất Cây Router Cha–Con (.xlsx)
+                        </div>
+                        <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
+                          Xuất cấu trúc phân cấp thiết bị, Router Cha (Uplink), IP/VLAN, Cổng &amp; Loại cáp tương thích nhập ngược lại
+                        </div>
+                        <div className="text-[10px] text-emerald-600 font-semibold mt-1.5">
+                          Tải file Cây Router (.xlsx) &rarr;
+                        </div>
+                      </div>
+                    </div>
+
+                    <div
+                      onClick={async () => {
+                        try {
+                          const { downloadExcelTemplate } = await import('../../utils/excelService');
+                          await downloadExcelTemplate();
+                          setStatusBanner({ type: 'success', text: 'Đã tải xuống tệp Excel mẫu!' });
+                        } catch (err: unknown) {
+                          setStatusBanner({ type: 'error', text: `Lỗi tải mẫu: ${err instanceof Error ? err.message : String(err)}` });
+                        }
+                      }}
+                      className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 hover:border-emerald-500 bg-slate-50/50 hover:bg-emerald-50/20 dark:bg-slate-800/30 transition-all cursor-pointer flex items-start gap-3"
+                    >
+                      <div className="w-10 h-10 rounded-lg bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 flex items-center justify-center shrink-0">
+                        <Table className="w-5 h-5" />
+                      </div>
+                      <div>
+                        <div className="font-bold text-sm text-slate-900 dark:text-white">Tải Mẫu Excel Nhập Liệu</div>
+                        <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
+                          Chuẩn cột Ultimate: Mã tài sản, Model, IP, VLAN, Tủ Rack, Vị trí U, Số U &amp; Mặt tủ (Trước/Sau)
+                        </div>
+                        <div className="text-[10px] text-emerald-600 font-semibold mt-1.5">
+                          Tải file mẫu Excel (.xlsx) &rarr;
+                        </div>
+                      </div>
+                    </div>
+                  </div>
                 </div>
-              </div>
+              )}
+
+              {activeCategoryTab === 'report' && (
+                <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/30 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <div className="w-8 h-8 rounded-lg bg-[#155EEF] text-white flex items-center justify-center shrink-0">
+                        <FileText className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <h3 className="font-bold text-sm text-slate-900 dark:text-white">
+                          Báo Cáo &amp; Bản Vẽ PDF Kỹ Thuật ({paperSize})
+                        </h3>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400 font-mono tabular-nums">
+                          {selectedFloorSummary} · Tỷ lệ {a4ScalePreview.scaleRatioLabel} · Thước {a4ScalePreview.scaleBar.totalMeters}m · Khung {a4ScalePreview.realWorldWidthMeters}×{a4ScalePreview.realWorldHeightMeters}m
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void handleExportTechnicalPdf()}
+                        disabled={isExportingPdf || isCapturing3D}
+                        className="px-3.5 py-2 bg-[#155EEF] hover:bg-[#124CC7] disabled:opacity-60 text-white rounded-lg font-semibold flex items-center gap-1.5 shadow-sm transition-colors whitespace-nowrap"
+                      >
+                        {isExportingPdf ? (
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                        ) : (
+                          <FileDown className="w-4 h-4" />
+                        )}
+                        <span>
+                          {isExportingPdf
+                            ? `Đang tạo PDF ${paperSize}...`
+                            : contentScope === '3d'
+                            ? `Tải PDF 3D (${paperSize})`
+                            : contentScope === 'both'
+                            ? `Tải PDF 2D + 3D (${paperSize})`
+                            : `Tải PDF ${paperSize} (Chuẩn CAD)`}
+                        </span>
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={contentScope === '3d'}
+                        onClick={handleStartPdfPrint}
+                        title={
+                          contentScope === '3d'
+                            ? 'In trình duyệt chỉ áp dụng cho bản vẽ 2D CAD. Hãy chọn Tải PDF 3D ở bên cạnh.'
+                            : `Mở hộp thoại in trình duyệt khổ ${paperSize}`
+                        }
+                        className="px-3 py-2 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 rounded-lg font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap disabled:opacity-35 disabled:cursor-not-allowed"
+                      >
+                        <Printer className="w-4 h-4" />
+                        <span>In trình duyệt ({paperSize})</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1">
+                    <div>
+                      <label className="block text-[10px] font-bold uppercase text-slate-500 dark:text-slate-400 mb-1">
+                        Khổ giấy (Paper Size)
+                      </label>
+                      <div className="grid grid-cols-4 gap-1">
+                        {(['A4', 'A3', 'A2', 'A1'] as PaperSize[]).map(sz => (
+                          <button
+                            key={sz}
+                            onClick={() => setPaperSize(sz)}
+                            className={`py-1.5 rounded border font-bold text-[11px] transition-colors ${
+                              paperSize === sz
+                                ? 'bg-blue-600 text-white border-blue-600'
+                                : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 hover:border-blue-400'
+                            }`}
+                          >
+                            {sz}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-[10px] font-bold uppercase text-slate-500 dark:text-slate-400 mb-1">
+                        Hướng giấy (Orientation)
+                      </label>
+                      <div className="grid grid-cols-2 gap-1">
+                        <button
+                          onClick={() => setOrientation('landscape')}
+                          className={`py-1.5 rounded border font-semibold text-[11px] ${
+                            orientation === 'landscape'
+                              ? 'bg-blue-600 text-white border-blue-600'
+                              : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700'
+                          }`}
+                        >
+                          Ngang (Landscape)
+                        </button>
+                        <button
+                          onClick={() => setOrientation('portrait')}
+                          className={`py-1.5 rounded border font-semibold text-[11px] ${
+                            orientation === 'portrait'
+                              ? 'bg-blue-600 text-white border-blue-600'
+                              : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700'
+                          }`}
+                        >
+                          Dọc (Portrait)
+                        </button>
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-[10px] font-bold uppercase text-slate-500 dark:text-slate-400 mb-1">
+                        Tỉ lệ trang bản vẽ
+                      </label>
+                      <div className="grid grid-cols-2 gap-1">
+                        <button
+                          onClick={() => setScaleMode('fit')}
+                          className={`py-1.5 rounded border font-semibold text-[11px] ${
+                            scaleMode === 'fit'
+                              ? 'bg-blue-600 text-white border-blue-600'
+                              : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700'
+                          }`}
+                        >
+                          Vừa 1 Trang
+                        </button>
+                        <button
+                          onClick={() => setScaleMode('tile2x2')}
+                          className={`py-1.5 rounded border font-semibold text-[11px] ${
+                            scaleMode === 'tile2x2'
+                              ? 'bg-blue-600 text-white border-blue-600'
+                              : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700'
+                          }`}
+                        >
+                          Chia 4 Mảnh (2×2)
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                    <div>
+                      <label className="block text-[10px] font-bold uppercase text-slate-500 dark:text-slate-400 mb-1">
+                        Số hiệu bản vẽ (Khung tên)
+                      </label>
+                      <input
+                        type="text"
+                        value={drawingCode}
+                        onChange={e => setDrawingCode(e.target.value)}
+                        className="w-full px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 font-mono text-[11px]"
+                        placeholder="NET-ELV-01"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-bold uppercase text-slate-500 dark:text-slate-400 mb-1">
+                        Tỷ lệ bản vẽ (Scale)
+                      </label>
+                      <input
+                        type="text"
+                        value={drawingScale}
+                        onChange={e => setDrawingScale(e.target.value)}
+                        className="w-full px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 font-mono text-[11px]"
+                        placeholder="1:100 / NTS"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-4 pt-1 text-[11px]">
+                    <label className="flex items-center gap-1.5 cursor-pointer font-medium">
+                      <input
+                        type="checkbox"
+                        checked={includeDiagram}
+                        onChange={e => setIncludeDiagram(e.target.checked)}
+                        className="rounded text-[#155EEF]"
+                      />
+                      <span>Bản vẽ sơ đồ hạ tầng</span>
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer font-medium">
+                      <input
+                        type="checkbox"
+                        checked={includeLegendPanel}
+                        onChange={e => setIncludeLegendPanel(e.target.checked)}
+                        className="rounded text-[#155EEF]"
+                      />
+                      <span>Bảng Chú giải &amp; Thước tỷ lệ A4</span>
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer font-medium">
+                      <input
+                        type="checkbox"
+                        checked={includeRackElevation}
+                        onChange={e => setIncludeRackElevation(e.target.checked)}
+                        className="rounded text-[#155EEF]"
+                      />
+                      <span>Hồ sơ Tủ Rack (Mặt Trước &amp; Sau)</span>
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer font-medium">
+                      <input
+                        type="checkbox"
+                        checked={includeTables}
+                        onChange={e => setIncludeTables(e.target.checked)}
+                        className="rounded text-[#155EEF]"
+                      />
+                      <span>Bảng tổng hợp thiết bị &amp; Cáp ({allAssets.length} TB / {project.cables.length} Cáp)</span>
+                    </label>
+                  </div>
+                </div>
+              )}
+
+              {activeCategoryTab === 'handover' && (
+                <div className="space-y-4">
+                  {/* 1-Click Unified Handover Bundle Banner */}
+                  <div className="p-4 rounded-xl border border-blue-200 dark:border-blue-800 bg-blue-50/70 dark:bg-blue-950/30 flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex items-start gap-3 min-w-0">
+                      <div className="w-10 h-10 rounded-lg bg-[#155EEF] text-white flex items-center justify-center shrink-0">
+                        <Archive className="w-5 h-5" />
+                      </div>
+                      <div className="min-w-0">
+                        <h3 className="font-bold text-sm text-slate-900 dark:text-white">
+                          Gói Bàn Giao 1 Nút (.zip)
+                        </h3>
+                        <p className="text-[11px] text-slate-600 dark:text-slate-300 mt-0.5">
+                          {contentScope === '2d'
+                            ? `Đóng gói đồng bộ (${selectedFloorSummary}): PDF kỹ thuật + Workbook Excel 6 sheet + AutoCAD DXF + SVG + Trình xem HTML đa tầng + Bảng cáp CSV + JSON sao lưu.`
+                            : `Đóng gói đồng bộ (${selectedFloorSummary}): PDF (kèm ảnh 3D đa góc nhìn) + Ảnh PNG 3D + Workbook Excel 6 sheet + AutoCAD DXF + SVG + Trình xem HTML đa tầng + JSON sao lưu.`}
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void handleExportHandoverBundle()}
+                      disabled={isExportingBundle || isCapturing3D}
+                      aria-label="Tải gói bàn giao hồ sơ ZIP tổng hợp"
+                      className="px-4 py-2 bg-[#155EEF] hover:bg-[#124CC7] disabled:opacity-60 text-white rounded-lg font-semibold flex items-center gap-2 whitespace-nowrap shrink-0 transition-colors"
+                    >
+                      {isExportingBundle ? <Loader2 className="w-4 h-4 animate-spin" /> : <Archive className="w-4 h-4" />}
+                      <span>{isExportingBundle ? 'Đang nén gói ZIP...' : 'Tải Gói Bàn Giao (.zip)'}</span>
+                    </button>
+                  </div>
+
+                  {/* Portable Project Package (.hachihi.json) & Excel Import */}
+                  <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/40 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                      <span className="font-semibold text-slate-700 dark:text-slate-200">
+                        Gói dự án di động (.hachihi.json · tự nhúng ảnh, thiết bị đang dùng &amp; SHA-256)
+                      </span>
+                      <div className="flex flex-wrap items-center gap-4">
+                        <label className="flex items-center gap-1.5 cursor-pointer text-slate-700 dark:text-slate-300">
+                          <input
+                            type="checkbox"
+                            checked={pkgIncludeRevisions}
+                            onChange={e => setPkgIncludeRevisions(e.target.checked)}
+                            className="rounded accent-[#155EEF]"
+                          />
+                          <span>Kèm lịch sử phiên bản</span>
+                        </label>
+                        <label className="flex items-center gap-1.5 cursor-pointer text-slate-700 dark:text-slate-300">
+                          <input
+                            type="checkbox"
+                            checked={pkgIncludeCustomLibrary}
+                            onChange={e => setPkgIncludeCustomLibrary(e.target.checked)}
+                            className="rounded accent-[#155EEF]"
+                          />
+                          <span>Kèm thư viện thiết bị tùy chỉnh</span>
+                        </label>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <label className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-md font-semibold flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors">
+                          <Upload className="w-3.5 h-3.5" />
+                          <span>Nhập từ File Excel (.xlsx / .csv)</span>
+                          <input
+                            type="file"
+                            accept=".xlsx,.xls,.csv"
+                            onChange={handleExcelFileUpload}
+                            className="hidden"
+                          />
+                        </label>
+
+                        <button
+                          type="button"
+                          disabled={isExportingPackage}
+                          onClick={() => void handleExportPackage()}
+                          className="px-3.5 py-2 bg-[#155EEF] hover:bg-[#124CC7] disabled:opacity-60 text-white rounded-md font-semibold flex items-center gap-1.5 transition-colors"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>{isExportingPackage ? 'Đang đóng gói...' : 'Xuất Gói dự án (.hachihi.json)'}</span>
+                        </button>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <label className="px-3 py-2 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-700 rounded-md font-semibold flex items-center gap-1.5 cursor-pointer transition-colors">
+                          <Upload className="w-3.5 h-3.5" />
+                          <span>Nhập Gói / JSON (.hachihi.json)</span>
+                          <input
+                            type="file"
+                            accept=".hachihi.json,.json"
+                            onChange={handleImportJson}
+                            className="hidden"
+                          />
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </div>

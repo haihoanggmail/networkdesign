@@ -12,25 +12,28 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { CableEdge, DiagramNode, ProjectState, SelectionState } from '../../types/infrastructure';
 import type { CanvasTool } from '../../store/useProjectStore';
 import {
-  canAddDevicesInScene,
   canDragNodeIn3DScene,
   getHiddenLayerSet,
   isNodeEffectivelyLocked,
   isNodePositionLocked,
   resolveNodeLayer
 } from '../../utils/layerPolicy';
-import { DEVICE_CATALOG, loadCustomDevicePresets } from '../../data/deviceCatalog';
 import type {
   CameraPresetId,
   Network3DSceneHandle,
+  RenderQualityLevel,
   View3DDisplayOptions
 } from '../../contexts/ViewportContext';
 import {
+  applyGlobalShadowMapping,
+  applySceneWireframeMode,
   detectSoftwareGl,
   createContactShadowTexture,
   createLockBadgeTexture,
   createWorldAxesHelper,
+  getPixelRatioForQuality,
   setupStudioEnvironment,
+  StudioRenderQuality,
   StudioRigCleanup
 } from './three/studioEnvironment';
 import {
@@ -49,20 +52,22 @@ import {
   WORLD_SCALE,
   build3DCableCurve,
   build3DCableGeometry,
-  canvasToWorldXZ,
-  getFloorElevationY,
   populateInfrastructure3DWorld,
   disposeObjectTree,
-  worldXZToCanvas,
   Populated3DCableEntry,
   World3DBounds,
   WorldCoordinateOrigin
 } from './three/proceduralDevices';
-import { isRackMountedTopologyShadowNode } from '../../utils/rackGeometry';
+import { ThreeResourceRegistry } from './three/resourceRegistry';
+import { isRackMountedTopologyShadowNode, getAssetUHeight } from '../../utils/rackGeometry';
+import { computeRackThermalOverlayData, getSubDeviceThermalReading, ThermalRiskLevel } from '../../utils/rackAirflow';
+import { RackSubDeviceTooltip, HoveredRackSubDeviceInfo } from './RackSubDeviceTooltip';
 import {
   Box,
   Compass,
+  Gauge,
   GitBranch,
+  Grid3x3,
   GripHorizontal,
   GripVertical,
   Layers,
@@ -70,7 +75,10 @@ import {
   Maximize2,
   Minimize2,
   Move,
+  SlidersHorizontal,
   Spline,
+  Sun,
+  Thermometer,
   Trash2,
   ChevronDown,
   ChevronUp,
@@ -87,7 +95,6 @@ interface Network3DSceneProps {
   onChangeView3DOptions?: React.Dispatch<React.SetStateAction<View3DDisplayOptions>>;
   onContextLostChange?: (lost: boolean) => void;
   onSelect: (type: SelectionState['type'], id?: string) => void;
-  onToggleNodeSelection?: (nodeId: string) => void;
   onSetTool?: (tool: CanvasTool) => void;
   onToggleNodeLock?: (nodeIds: string[]) => void;
   onUpdateNode?: (nodeId: string, partial: Partial<DiagramNode>) => void;
@@ -111,8 +118,6 @@ interface Network3DSceneProps {
   onSnapNodesAndCommitDrag?: (nodeIds: string[], options?: { snapX?: boolean; snapY?: boolean }) => void;
   onOpenDeepInspect: (rackId: string) => void;
   onExit3D: () => void;
-  draggedPresetName?: string | null;
-  onDropDevice?: (presetName: string, x: number, y: number, customPresetId?: string) => void;
 }
 
 type DockEdge = DockSideOrFree;
@@ -198,7 +203,6 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
   onChangeView3DOptions,
   onContextLostChange,
   onSelect,
-  onToggleNodeSelection,
   onSetTool,
   onToggleNodeLock,
   onUpdateNode,
@@ -211,9 +215,7 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
   onMoveNodesTransient,
   onSnapNodesAndCommitDrag,
   onOpenDeepInspect,
-  onExit3D,
-  draggedPresetName = null,
-  onDropDevice
+  onExit3D
 }, ref) => {
   const rootRef = useRef<HTMLDivElement>(null);
   const mountRef = useRef<HTMLDivElement>(null);
@@ -245,6 +247,11 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
     storageKey: 'hachihi:3d-xyz-panel',
     defaultCollapsed: false
   });
+  const renderControlsPanel = useFloatingPanel({
+    containerRef: rootRef,
+    storageKey: 'hachihi:3d-render-panel',
+    defaultCollapsed: false
+  });
 
   const canMultiFloorCutaway =
     project.floors.length > 1 &&
@@ -255,7 +262,11 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
     showAxes: true,
     explodeSpread: 0,
     viewAllFloors: project.floors.length > 1,
-    activePreset: 'iso'
+    activePreset: 'iso',
+    wireframeMode: false,
+    renderQuality: 'high',
+    shadowsEnabled: true,
+    showThermalHeatmap: true
   }));
   const effectiveViewOptions = externalViewOptions ?? internalViewOptions;
   const updateViewOptions = useCallback(
@@ -273,6 +284,11 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
   const explodeSpread = effectiveViewOptions.explodeSpread;
   const viewAllFloors = effectiveViewOptions.viewAllFloors;
   const activePreset = effectiveViewOptions.activePreset;
+  const wireframeMode = effectiveViewOptions.wireframeMode;
+  const renderQuality = effectiveViewOptions.renderQuality;
+  const shadowsEnabled = effectiveViewOptions.shadowsEnabled;
+  const showThermalHeatmap = effectiveViewOptions.showThermalHeatmap ?? true;
+
   const setViewAllFloors = useCallback(
     (updater: boolean | ((prev: boolean) => boolean)) => {
       updateViewOptions(prev => ({
@@ -288,6 +304,45 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
     },
     [updateViewOptions]
   );
+  const toggleWireframeMode = useCallback(() => {
+    updateViewOptions(prev => ({ ...prev, wireframeMode: !prev.wireframeMode }));
+  }, [updateViewOptions]);
+  const setRenderQuality = useCallback(
+    (quality: RenderQualityLevel) => {
+      updateViewOptions(prev => (prev.renderQuality === quality ? prev : { ...prev, renderQuality: quality }));
+    },
+    [updateViewOptions]
+  );
+  const toggleShadowsEnabled = useCallback(() => {
+    updateViewOptions(prev => ({ ...prev, shadowsEnabled: !prev.shadowsEnabled }));
+  }, [updateViewOptions]);
+  const toggleShowThermalHeatmap = useCallback(() => {
+    updateViewOptions(prev => ({
+      ...prev,
+      showThermalHeatmap: !(prev.showThermalHeatmap ?? true)
+    }));
+  }, [updateViewOptions]);
+
+  const [hoveredRackSubDevice, setHoveredRackSubDevice] = useState<HoveredRackSubDeviceInfo | null>(null);
+  const rackTooltipTimerRef = useRef<number | null>(null);
+  const clearRackTooltipTimer = useCallback(() => {
+    if (rackTooltipTimerRef.current !== null) {
+      window.clearTimeout(rackTooltipTimerRef.current);
+      rackTooltipTimerRef.current = null;
+    }
+  }, []);
+  const scheduleHideRackTooltip = useCallback(() => {
+    clearRackTooltipTimer();
+    rackTooltipTimerRef.current = window.setTimeout(() => {
+      setHoveredRackSubDevice(null);
+      rackTooltipTimerRef.current = null;
+    }, 150);
+  }, [clearRackTooltipTimer]);
+  useEffect(() => {
+    return () => {
+      clearRackTooltipTimer();
+    };
+  }, [clearRackTooltipTimer]);
 
   const [dockDrawer, setDockDrawer] = useState<'none' | 'routing'>('none');
   const [dockCollapsed, setDockCollapsed] = useState<boolean>(loadSavedDockCollapsed);
@@ -303,7 +358,7 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
   const [connectSourceId, setConnectSourceId] = useState<string | null>(null);
   const [preferredRouting, setPreferredRouting] = useState<CableEdge['routingType']>('orthogonal');
   const [rebuildNonce, setRebuildNonce] = useState(0);
-  const [dropPromptState, setDropPromptState] = useState<'idle' | 'ready' | 'locked'>('idle');
+  const [rendererEpoch, setRendererEpoch] = useState(0);
 
   const autoFrameNextBuildRef = useRef(true);
   const prevProjectIdRef = useRef(project.id);
@@ -326,14 +381,16 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
   preferredRoutingRef.current = preferredRouting;
   const explodeSpreadRef = useRef(explodeSpread);
   explodeSpreadRef.current = explodeSpread;
-  const viewAllFloorsRef = useRef(viewAllFloors);
-  viewAllFloorsRef.current = viewAllFloors;
-  const canMultiFloorCutawayRef = useRef(canMultiFloorCutaway);
-  canMultiFloorCutawayRef.current = canMultiFloorCutaway;
+  const wireframeModeRef = useRef(wireframeMode);
+  wireframeModeRef.current = wireframeMode;
+  const renderQualityRef = useRef(renderQuality);
+  renderQualityRef.current = renderQuality;
+  const shadowsEnabledRef = useRef(shadowsEnabled);
+  shadowsEnabledRef.current = shadowsEnabled;
+  const updateViewOptionsRef = useRef(updateViewOptions);
+  updateViewOptionsRef.current = updateViewOptions;
   const onSelectRef = useRef(onSelect);
   onSelectRef.current = onSelect;
-  const onToggleNodeSelectionRef = useRef(onToggleNodeSelection);
-  onToggleNodeSelectionRef.current = onToggleNodeSelection;
   const onAddCableRef = useRef(onAddCable);
   onAddCableRef.current = onAddCable;
   const onBeginDragSnapshotRef = useRef(onBeginDragSnapshot);
@@ -355,9 +412,8 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
     worldRoot: THREE.Group;
     axesGroup: THREE.Group;
     connectPreviewLine: THREE.Line;
-    dropPreviewGroup: THREE.Group;
-    dropPreviewFootprint: THREE.Group;
     studioRig: StudioRigCleanup;
+    resourceRegistry: ThreeResourceRegistry;
     shadowTex: THREE.Texture;
     lockBadgeTex: THREE.Texture;
     isSoftwareGl: boolean;
@@ -367,7 +423,6 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
     worldBounds: World3DBounds;
     nodeGroups: Map<string, { group: THREE.Group; node: DiagramNode; floorY: number }>;
     cableEntries: Populated3DCableEntry[];
-    shadowToRackNodeId: Map<string, string>;
   } | null>(null);
 
   // Resolve currently selected 3D device or rack for floating Lock/Unlock action UI
@@ -678,86 +733,6 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
   const activePresetRef = useRef(activePreset);
   activePresetRef.current = activePreset;
 
-  const raycastDropToFloorCanvas = useCallback(
-    (
-      clientX: number,
-      clientY: number,
-      footprint?: { width: number; height: number; isRack?: boolean }
-    ) => {
-      const refs = sceneRefs.current;
-      if (!refs) return null;
-      const rect = refs.renderer.domElement.getBoundingClientRect();
-      if (
-        rect.width <= 0 ||
-        rect.height <= 0 ||
-        clientX < rect.left ||
-        clientX > rect.right ||
-        clientY < rect.top ||
-        clientY > rect.bottom
-      ) {
-        return null;
-      }
-
-      const currProj = projectRef.current;
-      const activeFloorY = getFloorElevationY(
-        currProj,
-        currProj.activeFloorId,
-        explodeSpreadRef.current,
-        canMultiFloorCutawayRef.current && viewAllFloorsRef.current
-      );
-
-      _pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
-      _pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
-      _raycaster.setFromCamera(_pointer, refs.camera);
-
-      const dropPlane = new THREE.Plane(_planeNormal, -activeFloorY);
-      const hit = _raycaster.ray.intersectPlane(dropPlane, _dragHitPoint);
-
-      let hitX = refs.controls.target.x;
-      let hitZ = refs.controls.target.z;
-      const maxSpanX = Math.max(24, (refs.worldBounds.maxX - refs.worldBounds.minX) * 0.75 + 16);
-      const maxSpanZ = Math.max(24, (refs.worldBounds.maxZ - refs.worldBounds.minZ) * 0.75 + 16);
-      if (
-        hit &&
-        Number.isFinite(hit.x) &&
-        Number.isFinite(hit.z) &&
-        Math.abs(_raycaster.ray.direction.y) >= 0.03
-      ) {
-        hitX = Math.max(
-          refs.worldBounds.centerX - maxSpanX,
-          Math.min(refs.worldBounds.centerX + maxSpanX, hit.x)
-        );
-        hitZ = Math.max(
-          refs.worldBounds.centerZ - maxSpanZ,
-          Math.min(refs.worldBounds.centerZ + maxSpanZ, hit.z)
-        );
-      }
-
-      const canvasPt = worldXZToCanvas(hitX, hitZ, refs.origin);
-      const nodeW = footprint?.isRack ? 300 : footprint?.width || 150;
-      const nodeH = footprint?.isRack ? 180 : footprint?.height || 56;
-      const snap = currProj.settings.snapToGrid ? Math.max(1, currProj.settings.gridSize) : 1;
-      const rawX = Math.max(10, Math.round(canvasPt.x - nodeW / 2));
-      const rawY = Math.max(10, Math.round(canvasPt.y - nodeH / 2));
-      const dropX = Math.max(10, Math.round(rawX / snap) * snap);
-      const dropY = Math.max(10, Math.round(rawY / snap) * snap);
-      const snappedWorld = canvasToWorldXZ(dropX + nodeW / 2, dropY + nodeH / 2, refs.origin);
-      const activeFloorObj = currProj.floors.find(f => f.id === currProj.activeFloorId);
-
-      return {
-        x: dropX,
-        y: dropY,
-        worldX: snappedWorld.x,
-        worldY: activeFloorY,
-        worldZ: snappedWorld.z,
-        worldW: nodeW * WORLD_SCALE,
-        worldD: nodeH * WORLD_SCALE,
-        floorName: activeFloorObj?.name || 'Mặt bằng hiện tại'
-      };
-    },
-    []
-  );
-
   useImperativeHandle(
     ref,
     () => ({
@@ -802,116 +777,6 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
         } catch {
           return true;
         }
-      },
-      getCenterCanvasCoords: () => {
-        const refs = sceneRefs.current;
-        if (!refs) return null;
-        const pt = worldXZToCanvas(refs.controls.target.x, refs.controls.target.z, refs.origin);
-        return {
-          x: Math.max(10, Math.round(pt.x - 75)),
-          y: Math.max(10, Math.round(pt.y - 28))
-        };
-      },
-      previewLibraryDrop: (clientX, clientY, footprint) => {
-        const refs = sceneRefs.current;
-        if (!refs) return null;
-        if (
-          !canAddDevicesInScene({
-            isReadOnlyMode: isReadOnlyRef.current,
-            is3DView: true,
-            is3DDragLocked: isSceneDragLockedRef.current
-          })
-        ) {
-          if (refs.dropPreviewGroup.visible) {
-            refs.dropPreviewGroup.visible = false;
-            refs.requestRender();
-          }
-          return null;
-        }
-        const hit = raycastDropToFloorCanvas(clientX, clientY, footprint);
-        if (!hit) {
-          if (refs.dropPreviewGroup.visible) {
-            refs.dropPreviewGroup.visible = false;
-            refs.requestRender();
-          }
-          return null;
-        }
-        refs.dropPreviewGroup.position.set(hit.worldX, hit.worldY + 0.04, hit.worldZ);
-        refs.dropPreviewFootprint.scale.set(
-          Math.max(0.6, hit.worldW),
-          1,
-          Math.max(0.6, hit.worldD)
-        );
-        refs.dropPreviewGroup.visible = true;
-        refs.requestRender();
-        return { x: hit.x, y: hit.y, floorName: hit.floorName };
-      },
-      clearLibraryDropPreview: () => {
-        const refs = sceneRefs.current;
-        if (!refs) return;
-        if (refs.dropPreviewGroup.visible) {
-          refs.dropPreviewGroup.visible = false;
-          refs.requestRender();
-        }
-      },
-      focusSelection: (targetType, targetId) => {
-        const refs = sceneRefs.current;
-        if (!refs || !targetId) return false;
-
-        const focusPoint = new THREE.Vector3();
-        let found = false;
-
-        if (targetType === 'edge') {
-          const cableEntry = refs.cableEntries.find(ce => ce.cable.id === targetId);
-          if (cableEntry) {
-            focusPoint.copy(cableEntry.midWorld);
-            found = true;
-          }
-        } else {
-          let targetEntry = refs.nodeGroups.get(targetId);
-          if (!targetEntry && targetType === 'rack') {
-            refs.nodeGroups.forEach(entry => {
-              if (
-                !targetEntry &&
-                entry.node.type === 'rack' &&
-                (entry.node.customData?.rackId === targetId || entry.node.id === targetId)
-              ) {
-                targetEntry = entry;
-              }
-            });
-          }
-          if (!targetEntry && targetType === 'node') {
-            const mappedRackNodeId = refs.shadowToRackNodeId.get(targetId);
-            if (mappedRackNodeId) {
-              targetEntry = refs.nodeGroups.get(mappedRackNodeId);
-            }
-          }
-          if (targetEntry) {
-            focusPoint.set(
-              targetEntry.group.position.x,
-              targetEntry.group.position.y + (targetEntry.node.type === 'rack' ? 1.15 : 0.45),
-              targetEntry.group.position.z
-            );
-            found = true;
-          }
-        }
-
-        if (!found) return false;
-
-        const offset = refs.camera.position.clone().sub(refs.controls.target);
-        const currentDist = offset.length();
-        const maxFocusDist = Math.max(14, refs.worldBounds.size * 0.65);
-        if (currentDist < 1) {
-          offset.set(6, 5.5, 6);
-        } else if (currentDist > maxFocusDist) {
-          offset.normalize().multiplyScalar(maxFocusDist);
-        }
-
-        _targetCtrlTarget.copy(focusPoint);
-        _targetCamPos.copy(focusPoint).add(offset);
-        refs.transitioning = true;
-        refs.requestRender();
-        return true;
       },
       captureImage: async (reqOpts) => {
         const refs = sceneRefs.current;
@@ -963,7 +828,6 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
           refs.transitioning = false;
           refs.axesGroup.visible = false;
           refs.connectPreviewLine.visible = false;
-          refs.dropPreviewGroup.visible = false;
 
           if (background === 'dark') {
             refs.studioRig.updateTheme(true);
@@ -1063,8 +927,11 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
 
     const width = container.clientWidth || 1000;
     const height = container.clientHeight || 640;
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, isSoftwareGl ? 1 : 2));
+    renderer.setPixelRatio(
+      getPixelRatioForQuality(renderQualityRef.current, window.devicePixelRatio || 1, isSoftwareGl)
+    );
     renderer.setSize(width, height);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.domElement.style.display = 'block';
     renderer.domElement.style.width = '100%';
     renderer.domElement.style.height = '100%';
@@ -1085,25 +952,47 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
     controls.target.set(0, 0.4, 0);
     controls.update();
 
+    const resourceRegistry = new ThreeResourceRegistry();
     const studioRig = setupStudioEnvironment(
       scene,
       renderer,
       project.settings.isDarkMode,
-      isSoftwareGl
+      isSoftwareGl,
+      resourceRegistry
+    );
+    if (isSoftwareGl && shadowsEnabledRef.current) {
+      studioRig.setShadowsEnabled(false);
+      updateViewOptionsRef.current(prev =>
+        prev.shadowsEnabled ? { ...prev, shadowsEnabled: false } : prev
+      );
+    } else {
+      studioRig.setShadowsEnabled(shadowsEnabledRef.current);
+    }
+    studioRig.setRenderQuality(
+      renderQualityRef.current as StudioRenderQuality,
+      isSoftwareGl,
+      isSoftwareGl ? false : shadowsEnabledRef.current
     );
     const shadowTex = createContactShadowTexture();
     const lockBadgeTex = createLockBadgeTexture();
+    resourceRegistry.pinTexture(shadowTex);
+    resourceRegistry.pinTexture(lockBadgeTex);
+
     const worldRoot = new THREE.Group();
     worldRoot.name = 'infrastructure_world_root';
     scene.add(worldRoot);
 
     const axesGroup = createWorldAxesHelper(2.6);
+    resourceRegistry.trackObjectTree(axesGroup, 'overlay');
     scene.add(axesGroup);
 
-    const previewGeo = new THREE.BufferGeometry().setFromPoints([
-      new THREE.Vector3(0, 0.3, 0),
-      new THREE.Vector3(0, 0.3, 0)
-    ]);
+    const PREVIEW_MAX_POINTS = 32;
+    const previewPositions = new Float32Array(PREVIEW_MAX_POINTS * 3);
+    const previewPosAttr = new THREE.BufferAttribute(previewPositions, 3);
+    previewPosAttr.setUsage(THREE.DynamicDrawUsage);
+    const previewGeo = new THREE.BufferGeometry();
+    previewGeo.setAttribute('position', previewPosAttr);
+    previewGeo.setDrawRange(0, 2);
     const previewMat = new THREE.LineBasicMaterial({
       color: 0x38bdf8,
       transparent: true,
@@ -1111,53 +1000,11 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
     });
     const connectPreviewLine = new THREE.Line(previewGeo, previewMat);
     connectPreviewLine.visible = false;
+    connectPreviewLine.frustumCulled = false;
     connectPreviewLine.renderOrder = 15;
     connectPreviewLine.name = 'connect_preview_line';
+    resourceRegistry.trackObjectTree(connectPreviewLine, 'overlay');
     scene.add(connectPreviewLine);
-
-    const dropPreviewGroup = new THREE.Group();
-    dropPreviewGroup.name = 'library_drop_preview';
-    dropPreviewGroup.visible = false;
-    dropPreviewGroup.renderOrder = 16;
-
-    const dropPreviewFootprint = new THREE.Group();
-    const dropPlaneGeo = new THREE.PlaneGeometry(1, 1);
-    dropPlaneGeo.rotateX(-Math.PI / 2);
-    const dropPlaneMat = new THREE.MeshBasicMaterial({
-      color: 0x38bdf8,
-      transparent: true,
-      opacity: 0.28,
-      side: THREE.DoubleSide,
-      depthWrite: false
-    });
-    const dropPlaneMesh = new THREE.Mesh(dropPlaneGeo, dropPlaneMat);
-    dropPreviewFootprint.add(dropPlaneMesh);
-
-    const dropBorderGeo = new THREE.BufferGeometry().setFromPoints([
-      new THREE.Vector3(-0.5, 0.01, -0.5),
-      new THREE.Vector3(0.5, 0.01, -0.5),
-      new THREE.Vector3(0.5, 0.01, 0.5),
-      new THREE.Vector3(-0.5, 0.01, 0.5)
-    ]);
-    const dropBorderMat = new THREE.LineBasicMaterial({
-      color: 0x0ea5e9,
-      transparent: true,
-      opacity: 0.95
-    });
-    const dropBorderLoop = new THREE.LineLoop(dropBorderGeo, dropBorderMat);
-    dropPreviewFootprint.add(dropBorderLoop);
-    dropPreviewGroup.add(dropPreviewFootprint);
-
-    const beaconGeo = new THREE.CylinderGeometry(0.03, 0.03, 0.65, 10);
-    const beaconMat = new THREE.MeshBasicMaterial({
-      color: 0x38bdf8,
-      transparent: true,
-      opacity: 0.85
-    });
-    const beaconMesh = new THREE.Mesh(beaconGeo, beaconMat);
-    beaconMesh.position.y = 0.325;
-    dropPreviewGroup.add(beaconMesh);
-    scene.add(dropPreviewGroup);
 
     let rafId = 0;
     let needsRender = true;
@@ -1220,9 +1067,8 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
       worldRoot,
       axesGroup,
       connectPreviewLine,
-      dropPreviewGroup,
-      dropPreviewFootprint,
       studioRig,
+      resourceRegistry,
       shadowTex,
       lockBadgeTex,
       isSoftwareGl,
@@ -1242,8 +1088,7 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
         size: 16
       },
       nodeGroups: new Map(),
-      cableEntries: [],
-      shadowToRackNodeId: new Map()
+      cableEntries: []
     };
 
     const handleControlChange = () => {
@@ -1353,8 +1198,14 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
           : srcEntry.floorY
       );
       const pts = curve.getPoints(28);
-      refs.connectPreviewLine.geometry.dispose();
-      refs.connectPreviewLine.geometry = new THREE.BufferGeometry().setFromPoints(pts);
+      const count = Math.min(PREVIEW_MAX_POINTS, pts.length);
+      for (let i = 0; i < count; i++) {
+        previewPositions[i * 3] = pts[i].x;
+        previewPositions[i * 3 + 1] = pts[i].y;
+        previewPositions[i * 3 + 2] = pts[i].z;
+      }
+      previewPosAttr.needsUpdate = true;
+      previewGeo.setDrawRange(0, count);
       refs.connectPreviewLine.visible = true;
       refs.requestRender();
     };
@@ -1367,6 +1218,8 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
 
       const refs = sceneRefs.current;
       if (!refs) return;
+      clearRackTooltipTimer();
+      setHoveredRackSubDevice(null);
 
       const picked = pickObjectAt(e.clientX, e.clientY);
 
@@ -1613,7 +1466,7 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
             tgtEntry.floorY
           );
           ce.mesh.geometry.dispose();
-          ce.mesh.geometry = nextGeo;
+          ce.mesh.geometry = refs.resourceRegistry.trackGeometry(nextGeo, 'world');
         }
 
         // 3) Sync live delta into store (rebuild effect skips while dragSessionRef is active)
@@ -1669,6 +1522,52 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
       } else {
         renderer.domElement.style.cursor = 'default';
       }
+
+      // Raycast 3D rack sub-device blades for interactive technical specs tooltip
+      setPointerRay(e.clientX, e.clientY);
+      const bladeHits = _raycaster.intersectObjects(refs.worldRoot.children, true);
+      let matchedBladeHit: THREE.Intersection | null = null;
+      for (const hit of bladeHits) {
+        if (hit.object.userData?.subDeviceAssetId) {
+          matchedBladeHit = hit;
+          break;
+        }
+      }
+      if (matchedBladeHit) {
+        const ud = matchedBladeHit.object.userData;
+        const currProj = projectRef.current;
+        const asset = currProj.assets[ud.subDeviceAssetId as string];
+        if (asset) {
+          const rack = currProj.racks.find(r => r.id === ud.subDeviceRackId);
+          const rackNode = currProj.nodes.find(n => n.id === (ud.nodeId as string));
+          const thermalData = computeRackThermalOverlayData(rack, currProj.assets, rackNode);
+          const startU = (ud.subDeviceStartU as number) || 1;
+          const uHeight = (ud.subDeviceUHeight as number) || getAssetUHeight(asset);
+          const subThermal = getSubDeviceThermalReading(thermalData, startU, uHeight);
+          clearRackTooltipTimer();
+          setHoveredRackSubDevice({
+            rackId: rack?.id || (ud.subDeviceRackId as string) || '',
+            rackNodeId: (ud.nodeId as string) || '',
+            rackName: rack?.name || rackNode?.label || 'Tủ Rack',
+            asset,
+            startU,
+            uHeight,
+            side: (ud.subDeviceSide as 'front' | 'rear') || 'front',
+            tempC: typeof ud.subDeviceTempC === 'number' ? ud.subDeviceTempC : subThermal.tempC,
+            zone: (ud.subDeviceZone as ThermalRiskLevel) || subThermal.zone,
+            heatBtuPerHour:
+              typeof ud.subDeviceHeatBtu === 'number'
+                ? ud.subDeviceHeatBtu
+                : Math.round((asset.powerWatts || 0) * 3.41214),
+            clientX: e.clientX,
+            clientY: e.clientY
+          });
+        } else {
+          scheduleHideRackTooltip();
+        }
+      } else {
+        scheduleHideRackTooltip();
+      }
     };
 
     const finishPointerInteraction = (e: PointerEvent, cancelled = false) => {
@@ -1710,19 +1609,11 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
         : 0;
 
       if (drag && moveDist <= 6) {
-        if (e.shiftKey && drag.selectType === 'node' && onToggleNodeSelectionRef.current) {
-          onToggleNodeSelectionRef.current(drag.nodeId || drag.selectId);
-        } else {
-          onSelectRef.current(drag.selectType, drag.selectId);
-        }
+        onSelectRef.current(drag.selectType, drag.selectId);
       } else if (!drag && wasOrbiting) {
         const picked = pickObjectAt(e.clientX, e.clientY);
         if (picked) {
-          if (e.shiftKey && picked.selectType === 'node' && onToggleNodeSelectionRef.current) {
-            onToggleNodeSelectionRef.current(picked.nodeId || picked.selectId);
-          } else {
-            onSelectRef.current(picked.selectType, picked.selectId);
-          }
+          onSelectRef.current(picked.selectType, picked.selectId);
         }
       }
     };
@@ -1766,17 +1657,23 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
     const handleContextLost = (e: Event) => {
       e.preventDefault();
       onContextLostChange?.(true);
-      setWebglError('Kết nối WebGL tạm gián đoạn. Vui lòng chuyển lại chế độ 3D để khôi phục.');
+      setWebglError('Kết nối WebGL tạm gián đoạn. Nhấn "Thử khôi phục 3D" hoặc quay lại sơ đồ 2D CAD.');
     };
     const handleContextRestored = () => {
       onContextLostChange?.(false);
       setWebglError(null);
+      setRebuildNonce(n => n + 1);
       requestRender();
+    };
+
+    const handlePointerLeave = () => {
+      scheduleHideRackTooltip();
     };
 
     renderer.domElement.addEventListener('pointerdown', handlePointerDown);
     renderer.domElement.addEventListener('pointerdown', handleBgPointerDown);
     renderer.domElement.addEventListener('pointermove', handlePointerMove);
+    renderer.domElement.addEventListener('pointerleave', handlePointerLeave);
     renderer.domElement.addEventListener('pointerup', handlePointerUp);
     renderer.domElement.addEventListener('pointerup', handleBgPointerUp);
     renderer.domElement.addEventListener('pointercancel', handlePointerCancel);
@@ -1788,6 +1685,7 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
 
     return () => {
       disposed = true;
+      clearRackTooltipTimer();
       if (rafId) cancelAnimationFrame(rafId);
       resizeObs.disconnect();
       controls.removeEventListener('change', handleControlChange);
@@ -1795,6 +1693,7 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
       renderer.domElement.removeEventListener('pointerdown', handlePointerDown);
       renderer.domElement.removeEventListener('pointerdown', handleBgPointerDown);
       renderer.domElement.removeEventListener('pointermove', handlePointerMove);
+      renderer.domElement.removeEventListener('pointerleave', handlePointerLeave);
       renderer.domElement.removeEventListener('pointerup', handlePointerUp);
       renderer.domElement.removeEventListener('pointerup', handleBgPointerUp);
       renderer.domElement.removeEventListener('pointercancel', handlePointerCancel);
@@ -1803,17 +1702,24 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
       renderer.domElement.removeEventListener('webglcontextrestored', handleContextRestored);
       controls.dispose();
       const keepTextures = new Set<THREE.Texture>([shadowTex, lockBadgeTex]);
+      resourceRegistry.disposeScope('world', renderer);
       disposeObjectTree(worldRoot, keepTextures);
+      worldRoot.clear();
+      resourceRegistry.disposeScope('overlay', renderer);
       disposeObjectTree(axesGroup);
+      axesGroup.clear();
       disposeObjectTree(connectPreviewLine);
-      disposeObjectTree(dropPreviewGroup);
-      shadowTex.dispose();
-      lockBadgeTex.dispose();
       studioRig.dispose();
+      resourceRegistry.disposeAll(renderer);
+      scene.clear();
+      renderer.renderLists?.dispose();
       renderer.dispose();
+      if (renderer.domElement.parentNode === container) {
+        container.removeChild(renderer.domElement);
+      }
       sceneRefs.current = null;
     };
-  }, []);
+  }, [rendererEpoch]);
 
   // Sync theme changes without tearing down WebGL context
   useEffect(() => {
@@ -1830,6 +1736,41 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
     refs.axesGroup.visible = showAxes;
     refs.requestRender();
   }, [showAxes]);
+
+  // Globally toggle Three.js shadow mapping without tearing down WebGL context
+  useEffect(() => {
+    const refs = sceneRefs.current;
+    if (!refs) return;
+    refs.studioRig.setShadowsEnabled(shadowsEnabled);
+    refs.requestRender();
+  }, [shadowsEnabled]);
+
+  // Toggle wireframe rendering across 3D scene meshes cleanly
+  useEffect(() => {
+    const refs = sceneRefs.current;
+    if (!refs) return;
+    applySceneWireframeMode(refs.worldRoot, wireframeMode);
+    refs.requestRender();
+  }, [wireframeMode]);
+
+  // Dynamically adjust pixelRatio, shadow map resolution, and floor texture anisotropy
+  useEffect(() => {
+    const refs = sceneRefs.current;
+    const container = mountRef.current;
+    if (!refs || !container) return;
+    const w = container.clientWidth || 800;
+    const h = container.clientHeight || 500;
+    refs.renderer.setPixelRatio(
+      getPixelRatioForQuality(renderQuality, window.devicePixelRatio || 1, refs.isSoftwareGl)
+    );
+    refs.renderer.setSize(w, h);
+    refs.studioRig.setRenderQuality(
+      renderQuality as StudioRenderQuality,
+      refs.isSoftwareGl,
+      shadowsEnabledRef.current
+    );
+    refs.requestRender();
+  }, [renderQuality]);
 
   // Reset multi-floor cutaway preference when switching projects
   useEffect(() => {
@@ -1848,30 +1789,41 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
     }
   }, [viewAllFloors, project.activeMode]);
 
-  const selectionAdditionalIdsKey = (selection.additionalIds || []).join(',');
-
-  // Rebuild 3D infrastructure entities when project, selection, or toggles change (paused during active 3D drag)
+  // Rebuild 3D infrastructure entities when project or toggles change (paused during active 3D drag)
   useEffect(() => {
     const refs = sceneRefs.current;
     if (!refs || dragSessionRef.current?.hasMoved) return;
 
+    refs.resourceRegistry.disposeScope('world', refs.renderer);
     disposeObjectTree(refs.worldRoot, new Set<THREE.Texture>([refs.shadowTex, refs.lockBadgeTex]));
     refs.worldRoot.clear();
 
-    const populated = populateInfrastructure3DWorld(refs.worldRoot, project, selection, {
+    const populated = populateInfrastructure3DWorld(refs.worldRoot, project, selection.id, {
       showRooms: true,
       showCables: true,
       explodeSpread,
-      castShadow: !refs.isSoftwareGl,
+      castShadow: shadowsEnabledRef.current,
       shadowTex: refs.shadowTex,
       lockBadgeTex: refs.lockBadgeTex,
-      viewAllFloors
+      viewAllFloors,
+      renderQuality: renderQuality as StudioRenderQuality,
+      wireframe: wireframeModeRef.current,
+      showThermalHeatmap,
+      registry: refs.resourceRegistry,
+      registryScope: 'world'
     });
     refs.origin = populated.origin;
     refs.worldBounds = populated.bounds;
     refs.nodeGroups = populated.nodeGroups;
     refs.cableEntries = populated.cableEntries;
-    refs.shadowToRackNodeId = populated.shadowToRackNodeId;
+
+    applyGlobalShadowMapping(refs.renderer, refs.scene, shadowsEnabledRef.current);
+    if (wireframeModeRef.current) {
+      applySceneWireframeMode(refs.worldRoot, true);
+    }
+    if (!refs.isSoftwareGl && typeof refs.renderer.compile === 'function') {
+      refs.renderer.compile(refs.scene, refs.camera);
+    }
 
     // Adapt camera clip planes and orbit bounds for multi-storey buildings
     refs.controls.maxDistance = Math.max(48, populated.bounds.size * 2.8);
@@ -1884,18 +1836,7 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
     } else {
       refs.requestRender();
     }
-  }, [
-    project,
-    selection,
-    selection.type,
-    selection.id,
-    selectionAdditionalIdsKey,
-    explodeSpread,
-    viewAllFloors,
-    rebuildNonce,
-    applyCameraPreset,
-    activePreset
-  ]);
+  }, [project, selection.id, explodeSpread, viewAllFloors, renderQuality, showThermalHeatmap, rebuildNonce, rendererEpoch, applyCameraPreset, activePreset]);
 
   // Persist free dock coordinates & clamp on resize/collapse
   useEffect(() => {
@@ -1933,6 +1874,15 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
     return () => ro.disconnect();
   }, [dockEdge, dockFreePos, dockCollapsed, dockDrawer]);
 
+  const dockDragCleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    return () => {
+      dockDragCleanupRef.current?.();
+      dockDragCleanupRef.current = null;
+    };
+  }, []);
+
   // Drag-and-drop handler for snapping the 3D Control Dock to Bottom, Left, Right OR moving freely anywhere
   const handleDockDragPointerDown = useCallback((e: React.PointerEvent<HTMLButtonElement>) => {
     if (e.button !== 0) return;
@@ -1941,6 +1891,8 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
 
     const container = rootRef.current;
     if (!container) return;
+
+    dockDragCleanupRef.current?.();
 
     const startX = e.clientX;
     const startY = e.clientY;
@@ -1977,10 +1929,17 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
       setDockDragPreview(preview);
     };
 
-    const onUp = () => {
+    const cleanupListeners = () => {
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
       window.removeEventListener('pointercancel', onUp);
+      if (dockDragCleanupRef.current === cleanupListeners) {
+        dockDragCleanupRef.current = null;
+      }
+    };
+
+    const onUp = () => {
+      cleanupListeners();
       if (dragging) {
         setDockEdge(lastPreview.previewEdge);
         if (lastPreview.previewEdge === 'free' && lastPreview.freePos) {
@@ -1992,6 +1951,7 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
       }
     };
 
+    dockDragCleanupRef.current = cleanupListeners;
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
     window.addEventListener('pointercancel', onUp);
@@ -2023,156 +1983,11 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
       ? 'top-12 right-2.5'
       : 'top-[126px] right-2.5';
 
-  useEffect(() => {
-    if (dropPromptState === 'idle') return;
-    const clearDropPrompt = () => setDropPromptState('idle');
-    window.addEventListener('dragend', clearDropPrompt);
-    window.addEventListener('drop', clearDropPrompt);
-    return () => {
-      window.removeEventListener('dragend', clearDropPrompt);
-      window.removeEventListener('drop', clearDropPrompt);
-    };
-  }, [dropPromptState]);
-
-  const handle3DDragOver = useCallback(
-    (e: React.DragEvent<HTMLDivElement>) => {
-      if (e.dataTransfer?.types && Array.from(e.dataTransfer.types).includes('Files')) {
-        return;
-      }
-      const canInsert = canAddDevicesInScene({
-        isReadOnlyMode,
-        is3DView: true,
-        is3DDragLocked: isSceneDragLocked
-      });
-      if (!canInsert || !onDropDevice) {
-        if (!isReadOnlyMode && isSceneDragLocked) {
-          e.preventDefault();
-          e.dataTransfer.dropEffect = 'none';
-          setDropPromptState('locked');
-        }
-        return;
-      }
-      e.preventDefault();
-      e.dataTransfer.dropEffect = 'copy';
-      setDropPromptState('ready');
-      const catalogMatch = draggedPresetName
-        ? DEVICE_CATALOG.find(p => p.name === draggedPresetName)
-        : undefined;
-      const isRack = Boolean(
-        catalogMatch?.category === 'rack' ||
-          draggedPresetName?.toLowerCase().includes('rack')
-      );
-      const hit = raycastDropToFloorCanvas(e.clientX, e.clientY, {
-        width: catalogMatch?.defaultWidth || 150,
-        height: catalogMatch?.defaultHeight || 56,
-        isRack
-      });
-      const refs = sceneRefs.current;
-      if (refs && hit) {
-        refs.dropPreviewGroup.position.set(hit.worldX, hit.worldY + 0.04, hit.worldZ);
-        refs.dropPreviewFootprint.scale.set(
-          Math.max(0.6, hit.worldW),
-          1,
-          Math.max(0.6, hit.worldD)
-        );
-        refs.dropPreviewGroup.visible = true;
-        refs.requestRender();
-      }
-    },
-    [isReadOnlyMode, isSceneDragLocked, onDropDevice, draggedPresetName, raycastDropToFloorCanvas]
-  );
-
-  const handle3DDragLeave = useCallback((e: React.DragEvent<HTMLDivElement>) => {
-    if (rootRef.current && !rootRef.current.contains(e.relatedTarget as Node)) {
-      setDropPromptState('idle');
-      const refs = sceneRefs.current;
-      if (refs && refs.dropPreviewGroup.visible) {
-        refs.dropPreviewGroup.visible = false;
-        refs.requestRender();
-      }
-    }
-  }, []);
-
-  const handle3DDrop = useCallback(
-    (e: React.DragEvent<HTMLDivElement>) => {
-      setDropPromptState('idle');
-      const refs = sceneRefs.current;
-      if (refs && refs.dropPreviewGroup.visible) {
-        refs.dropPreviewGroup.visible = false;
-        refs.requestRender();
-      }
-      if (e.dataTransfer?.types && Array.from(e.dataTransfer.types).includes('Files')) {
-        return;
-      }
-      const canInsert = canAddDevicesInScene({
-        isReadOnlyMode,
-        is3DView: true,
-        is3DDragLocked: isSceneDragLocked
-      });
-      if (!canInsert || !onDropDevice) return;
-
-      e.preventDefault();
-      e.stopPropagation();
-
-      const presetName =
-        e.dataTransfer.getData('presetName') ||
-        e.dataTransfer.getData('text/plain') ||
-        draggedPresetName ||
-        '';
-      const customPresetId = e.dataTransfer.getData('customPresetId') || undefined;
-      if (!presetName) return;
-
-      const customMatch = customPresetId
-        ? loadCustomDevicePresets().find(c => c.id === customPresetId)
-        : undefined;
-      const catalogMatch = customMatch || DEVICE_CATALOG.find(p => p.name === presetName);
-      const isRack = Boolean(
-        catalogMatch?.category === 'rack' || presetName.toLowerCase().includes('rack')
-      );
-      const hit = raycastDropToFloorCanvas(e.clientX, e.clientY, {
-        width: catalogMatch?.defaultWidth || 150,
-        height: catalogMatch?.defaultHeight || 56,
-        isRack
-      });
-
-      onDropDevice(presetName, hit?.x ?? 300, hit?.y ?? 200, customPresetId);
-    },
-    [
-      isReadOnlyMode,
-      isSceneDragLocked,
-      onDropDevice,
-      draggedPresetName,
-      raycastDropToFloorCanvas
-    ]
-  );
-
   // Touch drag session uses DragSessionItem['selectType'] compatibility: allow 'edge' in DragSession
   return (
-    <div
-      ref={rootRef}
-      onDragOver={handle3DDragOver}
-      onDragLeave={handle3DDragLeave}
-      onDrop={handle3DDrop}
-      className="w-full h-full relative overflow-hidden bg-slate-950 select-none"
-    >
+    <div ref={rootRef} className="w-full h-full relative overflow-hidden bg-slate-950 select-none">
       {/* Dedicated WebGL Mount Container */}
       <div ref={mountRef} className="w-full h-full relative" />
-
-      {dropPromptState !== 'idle' && (
-        <div className="pointer-events-none absolute top-14 left-1/2 -translate-x-1/2 z-30">
-          <div
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold shadow-lg border backdrop-blur-xs ${
-              dropPromptState === 'ready'
-                ? 'bg-emerald-600/90 text-white border-emerald-400/60'
-                : 'bg-amber-600/95 text-white border-amber-400/60'
-            }`}
-          >
-            {dropPromptState === 'ready'
-              ? 'Thả để đặt thiết bị vào tầng hiện tại'
-              : 'Đang khóa kéo 3D — Nhấn Mở khóa để thêm/kéo thiết bị'}
-          </div>
-        </div>
-      )}
 
       {webglError && (
         <div className="absolute inset-0 flex items-center justify-center bg-slate-950/90 text-white p-6 z-30">
@@ -2180,12 +1995,27 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
             <Box className="w-8 h-8 text-blue-400 mx-auto" />
             <div className="font-bold text-sm">Không thể khởi tạo WebGL 3D</div>
             <p className="text-xs text-slate-300">{webglError}</p>
-            <button
-              onClick={onExit3D}
-              className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-xs font-semibold text-white"
-            >
-              Quay lại sơ đồ 2D CAD
-            </button>
+            <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
+              <button
+                type="button"
+                data-testid="retry-webgl-3d-btn"
+                onClick={() => {
+                  setWebglError(null);
+                  onContextLostChange?.(false);
+                  setRendererEpoch(n => n + 1);
+                }}
+                className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-xs font-semibold text-white transition-colors"
+              >
+                Thử khôi phục 3D
+              </button>
+              <button
+                type="button"
+                onClick={onExit3D}
+                className="px-4 py-2 rounded-lg border border-slate-600 bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 transition-colors"
+              >
+                Quay lại sơ đồ 2D CAD
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -2912,6 +2742,188 @@ export const Network3DScene = forwardRef<Network3DSceneHandle, Network3DScenePro
           </div>
         )}
       </div>
+
+      {/* On-Screen 3D Performance & Rendering Control Panel (Wireframe, Quality, Global Shadows) */}
+      <div
+        ref={renderControlsPanel.panelRef}
+        data-testid="3d-render-controls-panel"
+        style={
+          renderControlsPanel.position
+            ? { left: `${renderControlsPanel.position.x}px`, top: `${renderControlsPanel.position.y}px` }
+            : undefined
+        }
+        className={`pointer-events-none absolute z-20 ${
+          renderControlsPanel.position ? '' : 'top-14 left-3 md:max-w-[calc(100%-132px)]'
+        } max-w-[calc(100%-120px)]`}
+      >
+        {renderControlsPanel.collapsed ? (
+          <div className="pointer-events-auto flex items-center gap-1 px-1.5 py-1 rounded-xl bg-white/95 dark:bg-slate-900/95 border border-slate-200 dark:border-slate-700 shadow-lg text-xs text-slate-800 dark:text-slate-100">
+            <button
+              type="button"
+              data-testid="3d-render-drag-handle"
+              onPointerDown={renderControlsPanel.handleDragStart}
+              onDoubleClick={renderControlsPanel.resetPosition}
+              title="Kéo để di chuyển bảng hiệu năng 3D · Nhấp đúp về góc mặc định"
+              className="p-0.5 rounded hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 cursor-grab active:cursor-grabbing shrink-0"
+            >
+              <GripVertical className="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
+              data-testid="3d-render-expand-btn"
+              onClick={renderControlsPanel.toggleCollapsed}
+              title="Mở bảng điều chỉnh Wireframe, Chất lượng & Bóng đổ 3D"
+              className="flex items-center gap-1.5 px-2 py-0.5 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 font-semibold whitespace-nowrap"
+            >
+              <SlidersHorizontal className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+              <span>Hiển thị 3D</span>
+              <Maximize2 className="w-3 h-3 text-slate-400" />
+            </button>
+          </div>
+        ) : (
+          <div className="pointer-events-auto flex items-center gap-0.5 px-1.5 h-9 rounded-xl bg-white/95 dark:bg-slate-900/95 border border-slate-200 dark:border-slate-700 shadow-lg text-xs text-slate-800 dark:text-slate-100 overflow-x-auto flex-nowrap">
+            <button
+              type="button"
+              data-testid="3d-render-drag-handle"
+              onPointerDown={renderControlsPanel.handleDragStart}
+              onDoubleClick={renderControlsPanel.resetPosition}
+              title="Kéo để di chuyển bảng hiệu năng 3D · Nhấp đúp về góc mặc định"
+              className="p-1 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 cursor-grab active:cursor-grabbing shrink-0"
+            >
+              <GripVertical className="w-3.5 h-3.5" />
+            </button>
+
+            <button
+              type="button"
+              data-testid="3d-wireframe-toggle-btn"
+              aria-pressed={wireframeMode}
+              onClick={toggleWireframeMode}
+              title="Bật/tắt chế độ khung dây (Wireframe) cho mô hình 3D"
+              className={`flex items-center gap-1 px-1.5 h-7 rounded-lg font-medium whitespace-nowrap shrink-0 transition-colors ${
+                wireframeMode
+                  ? 'bg-indigo-600 text-white'
+                  : 'hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200'
+              }`}
+            >
+              <Grid3x3 className="w-3.5 h-3.5 shrink-0" />
+              <span>Khung dây</span>
+            </button>
+
+            <div className="h-4 w-px bg-slate-200 dark:bg-slate-700 shrink-0 mx-0.5" />
+
+            <div
+              className="flex items-center gap-0.5 shrink-0"
+              role="group"
+              aria-label="Chất lượng kết xuất 3D"
+            >
+              <Gauge className="w-3.5 h-3.5 text-slate-400 mr-0.5 shrink-0 hidden xl:inline" />
+              {(
+                [
+                  { id: 'low', label: 'Thấp', title: 'Chất lượng Thấp: Giảm chi tiết tủ & dây để tối ưu FPS' },
+                  { id: 'medium', label: 'TB', title: 'Chất lượng Trung bình: Cân bằng tốc độ và độ nét' },
+                  { id: 'high', label: 'Cao', title: 'Chất lượng Cao: Chi tiết đầy đủ & độ phân giải tối đa' }
+                ] as const
+              ).map(opt => {
+                const active = renderQuality === opt.id;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    data-testid={`3d-quality-${opt.id}`}
+                    aria-pressed={active}
+                    onClick={() => setRenderQuality(opt.id)}
+                    title={opt.title}
+                    className={`px-1.5 h-7 rounded-lg font-medium whitespace-nowrap shrink-0 transition-colors ${
+                      active
+                        ? 'bg-blue-600 text-white'
+                        : 'hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-300'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="h-4 w-px bg-slate-200 dark:bg-slate-700 shrink-0 mx-0.5" />
+
+            <button
+              id="shadow-toggle-button"
+              type="button"
+              data-testid="shadow-toggle-button"
+              aria-pressed={shadowsEnabled}
+              onClick={toggleShadowsEnabled}
+              title={
+                shadowsEnabled
+                  ? 'Tắt tính toán đổ bóng toàn cục để tăng hiệu năng cho tủ rack phức tạp'
+                  : 'Bật lại tính toán đổ bóng toàn cục trong không gian 3D'
+              }
+              className={`flex items-center gap-1 px-1.5 h-7 rounded-lg font-medium whitespace-nowrap shrink-0 transition-colors ${
+                shadowsEnabled
+                  ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-400/50 hover:bg-amber-500/25'
+                  : 'bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700'
+              }`}
+            >
+              <Sun className="w-3.5 h-3.5 shrink-0" />
+              <span>Bóng đổ: {shadowsEnabled ? 'Bật' : 'Tắt'}</span>
+            </button>
+
+            <button
+              type="button"
+              data-testid="3d-heatmap-toggle-btn"
+              aria-pressed={showThermalHeatmap}
+              onClick={toggleShowThermalHeatmap}
+              title={
+                showThermalHeatmap
+                  ? 'Ẩn lớp phủ bản đồ nhiệt và cảm biến tủ rack 3D'
+                  : 'Hiển thị lớp phủ bản đồ nhiệt và nhiệt độ cảm biến tủ rack 3D'
+              }
+              className={`flex items-center gap-1 px-1.5 h-7 rounded-lg font-medium whitespace-nowrap shrink-0 transition-colors ${
+                showThermalHeatmap
+                  ? 'bg-orange-500/15 text-orange-700 dark:text-orange-300 border border-orange-400/50 hover:bg-orange-500/25'
+                  : 'bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700'
+              }`}
+            >
+              <Thermometer className="w-3.5 h-3.5 shrink-0" />
+              <span>Nhiệt 3D</span>
+            </button>
+
+            <button
+              type="button"
+              data-testid="3d-render-collapse-btn"
+              onClick={renderControlsPanel.toggleCollapsed}
+              title="Thu gọn bảng hiệu năng 3D"
+              className="p-1 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-500 hover:text-slate-800 dark:hover:text-slate-100 shrink-0"
+            >
+              <Minimize2 className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+      </div>
+
+      {hoveredRackSubDevice && !draggingHud && (
+        <RackSubDeviceTooltip
+          info={hoveredRackSubDevice}
+          containerRect={rootRef.current?.getBoundingClientRect() ?? null}
+          onMouseEnter={clearRackTooltipTimer}
+          onMouseLeave={scheduleHideRackTooltip}
+          onOpenDeepInspect={onOpenDeepInspect}
+          onSelectDevice={(assetId, rackId) => {
+            const matchedNode = project.nodes.find(n => n.assetId === assetId && !n.hidden);
+            if (matchedNode) {
+              onSelect('node', matchedNode.id);
+            } else {
+              onSelect('rack', rackId);
+            }
+            clearRackTooltipTimer();
+            setHoveredRackSubDevice(null);
+          }}
+          onClose={() => {
+            clearRackTooltipTimer();
+            setHoveredRackSubDevice(null);
+          }}
+        />
+      )}
     </div>
   );
 });

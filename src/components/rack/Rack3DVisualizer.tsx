@@ -11,7 +11,9 @@ import {
   Eye,
   Fan,
   Flame,
+  Grid3x3,
   RotateCw,
+  Sun,
   Trash2,
   Wind
 } from 'lucide-react';
@@ -26,7 +28,15 @@ import {
   RackAirflowAnalysis,
   RackDoorAirflowType
 } from '../../utils/rackAirflow';
-import { detectSoftwareGl, setupStudioEnvironment } from '../canvas/three/studioEnvironment';
+import {
+  applyGlobalShadowMapping,
+  applySceneWireframeMode,
+  detectSoftwareGl,
+  getPixelRatioForQuality,
+  setupStudioEnvironment,
+  StudioRenderQuality
+} from '../canvas/three/studioEnvironment';
+import { ThreeResourceRegistry } from '../canvas/three/resourceRegistry';
 import {
   buildInteractiveRackScene,
   InteractiveRackSceneHandle
@@ -102,6 +112,9 @@ export const Rack3DVisualizer: React.FC<Rack3DVisualizerProps> = ({
   const controlsRef = useRef<OrbitControls | null>(null);
   const cameraAnimRef = useRef<{ active: boolean }>({ active: false });
   const studioRef = useRef<ReturnType<typeof setupStudioEnvironment> | null>(null);
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const sceneRef = useRef<THREE.Scene | null>(null);
+  const isSoftwareGlRef = useRef<boolean>(false);
   const requestRenderRef = useRef<() => void>(() => {});
 
   const [doorViewMode, setDoorViewMode] = useState<DoorViewMode>('open');
@@ -109,7 +122,12 @@ export const Rack3DVisualizer: React.FC<Rack3DVisualizerProps> = ({
   const [showAirflow, setShowAirflow] = useState<boolean>(true);
   const [showThermal, setShowThermal] = useState<boolean>(true);
   const [autoRotate, setAutoRotate] = useState<boolean>(false);
+  const [wireframeMode, setWireframeMode] = useState<boolean>(false);
+  const [renderQuality, setRenderQuality] = useState<StudioRenderQuality>('high');
+  const [shadowsEnabled, setShadowsEnabled] = useState<boolean>(true);
   const [dockCollapsed, setDockCollapsed] = useState<boolean>(false);
+  const [webglLost, setWebglLost] = useState<boolean>(false);
+  const [rendererEpoch, setRendererEpoch] = useState<number>(0);
   const [dropReadout, setDropReadout] = useState<{
     label: string;
     startU: number;
@@ -218,12 +236,26 @@ export const Rack3DVisualizer: React.FC<Rack3DVisualizerProps> = ({
     if (!container) return;
 
     const isSoftwareGl = detectSoftwareGl();
-    const renderer = new THREE.WebGLRenderer({
-      antialias: !isSoftwareGl,
-      powerPreference: 'high-performance',
-      alpha: false
-    });
-    renderer.setPixelRatio(isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 2));
+    isSoftwareGlRef.current = isSoftwareGl;
+    const initialShadows = isSoftwareGl ? false : shadowsEnabled;
+    if (isSoftwareGl && shadowsEnabled) {
+      setShadowsEnabled(false);
+    }
+    let renderer: THREE.WebGLRenderer;
+    try {
+      renderer = new THREE.WebGLRenderer({
+        antialias: !isSoftwareGl,
+        powerPreference: 'high-performance',
+        alpha: false
+      });
+    } catch {
+      setWebglLost(true);
+      return;
+    }
+    rendererRef.current = renderer;
+    renderer.setPixelRatio(
+      getPixelRatioForQuality(renderQuality, window.devicePixelRatio || 1, isSoftwareGl)
+    );
     renderer.setSize(
       Math.max(100, container.clientWidth),
       Math.max(100, container.clientHeight)
@@ -232,14 +264,19 @@ export const Rack3DVisualizer: React.FC<Rack3DVisualizerProps> = ({
     container.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
-    const studio = setupStudioEnvironment(scene, renderer, isDark, isSoftwareGl);
+    sceneRef.current = scene;
+    const rackRegistry = new ThreeResourceRegistry();
+    const studio = setupStudioEnvironment(scene, renderer, isDark, isSoftwareGl, rackRegistry);
+    studio.setShadowsEnabled(initialShadows);
+    studio.setRenderQuality(renderQuality, isSoftwareGl, initialShadows);
     studioRef.current = studio;
 
     const handle = buildInteractiveRackScene(
       propsRef.current.rack,
       renderer.capabilities.getMaxAnisotropy(),
-      !isSoftwareGl
+      initialShadows
     );
+    rackRegistry.trackObjectTree(handle.root, 'rack_shell');
     scene.add(handle.root);
     sceneHandleRef.current = handle;
 
@@ -398,6 +435,17 @@ export const Rack3DVisualizer: React.FC<Rack3DVisualizerProps> = ({
       rafId = requestAnimationFrame(tick);
     };
 
+    const handleContextLost = (e: Event) => {
+      e.preventDefault();
+      setWebglLost(true);
+    };
+    const handleContextRestored = () => {
+      setWebglLost(false);
+      setRendererEpoch(n => n + 1);
+    };
+    renderer.domElement.addEventListener('webglcontextlost', handleContextLost);
+    renderer.domElement.addEventListener('webglcontextrestored', handleContextRestored);
+
     // Start initial draw
     requestRenderRef.current();
 
@@ -406,11 +454,17 @@ export const Rack3DVisualizer: React.FC<Rack3DVisualizerProps> = ({
       cancelAnimationFrame(rafId);
       clearTimeout(timerId);
       ro.disconnect();
+      renderer.domElement.removeEventListener('webglcontextlost', handleContextLost);
+      renderer.domElement.removeEventListener('webglcontextrestored', handleContextRestored);
       controls.removeEventListener('start', onControlStart);
       controls.removeEventListener('change', onControlChange);
       controls.dispose();
+      rackRegistry.trackObjectTree(handle.root, 'rack_dynamic');
       handle.dispose();
       studio.dispose();
+      rackRegistry.disposeAll(renderer);
+      scene.clear();
+      renderer.renderLists?.dispose();
       renderer.dispose();
       if (renderer.domElement.parentNode === container) {
         container.removeChild(renderer.domElement);
@@ -419,10 +473,12 @@ export const Rack3DVisualizer: React.FC<Rack3DVisualizerProps> = ({
       cameraRef.current = null;
       controlsRef.current = null;
       studioRef.current = null;
+      rendererRef.current = null;
+      sceneRef.current = null;
     };
-    // Rebuild full cabinet geometry only when rack ID or structural rack dimensions change
+    // Rebuild full cabinet geometry only when rack ID, structural dimensions, or recovery epoch change
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rack.id, rack.totalUnits, rack.widthMm, rack.depthMm]);
+  }, [rack.id, rack.totalUnits, rack.widthMm, rack.depthMm, rendererEpoch]);
 
   // Update theme cleanly without destroying WebGL context
   useEffect(() => {
@@ -436,8 +492,14 @@ export const Rack3DVisualizer: React.FC<Rack3DVisualizerProps> = ({
     if (!handle) return;
     handle.rebuildDevices(rack, assets, analysis, selectedAssetId, showThermal);
     handle.rebuildThermalAndAirflow(analysis, showThermal, showAirflow, highlightedGap);
+    if (wireframeMode) {
+      applySceneWireframeMode(handle.root, true);
+    }
+    if (rendererRef.current && sceneRef.current) {
+      applyGlobalShadowMapping(rendererRef.current, sceneRef.current, shadowsEnabled);
+    }
     requestRenderRef.current();
-  }, [rack, assets, analysis, selectedAssetId, showThermal, showAirflow, highlightedGap]);
+  }, [rack, assets, analysis, selectedAssetId, showThermal, showAirflow, highlightedGap, wireframeMode, shadowsEnabled]);
 
   // Sync door & side X-ray state
   useEffect(() => {
@@ -447,6 +509,36 @@ export const Rack3DVisualizer: React.FC<Rack3DVisualizerProps> = ({
     handle.setXRaySides(xraySides);
     requestRenderRef.current();
   }, [doorViewMode, doorType, xraySides]);
+
+  // Toggle wireframe across interactive rack meshes
+  useEffect(() => {
+    const handle = sceneHandleRef.current;
+    if (!handle) return;
+    applySceneWireframeMode(handle.root, wireframeMode);
+    requestRenderRef.current();
+  }, [wireframeMode]);
+
+  // Adjust rendering quality (pixelRatio, shadow map size, anisotropy)
+  useEffect(() => {
+    const renderer = rendererRef.current;
+    const container = mountRef.current;
+    const studio = studioRef.current;
+    if (!renderer || !container || !studio) return;
+    const w = Math.max(100, container.clientWidth);
+    const h = Math.max(100, container.clientHeight);
+    renderer.setPixelRatio(
+      getPixelRatioForQuality(renderQuality, window.devicePixelRatio || 1, isSoftwareGlRef.current)
+    );
+    renderer.setSize(w, h);
+    studio.setRenderQuality(renderQuality, isSoftwareGlRef.current, shadowsEnabled);
+    requestRenderRef.current();
+  }, [renderQuality, shadowsEnabled]);
+
+  // Globally toggle shadow mapping for the rack visualizer scene
+  useEffect(() => {
+    studioRef.current?.setShadowsEnabled(shadowsEnabled);
+    requestRenderRef.current();
+  }, [shadowsEnabled]);
 
   // Sync auto-rotate kickoff
   useEffect(() => {
@@ -741,6 +833,26 @@ export const Rack3DVisualizer: React.FC<Rack3DVisualizerProps> = ({
       onDragLeave={handleHtmlDragLeave}
       onDrop={handleHtmlDrop}
     >
+      {webglLost && (
+        <div className="absolute inset-0 z-30 flex items-center justify-center bg-slate-950/90 text-white p-5">
+          <div className="max-w-sm rounded-xl border border-slate-700 bg-slate-900 p-4 text-center space-y-2.5">
+            <div className="font-bold text-xs">Kết nối WebGL Tủ Rack tạm gián đoạn</div>
+            <p className="text-[11px] text-slate-300">
+              Nhấn khôi phục để dựng lại mô hình 3D tủ rack của bạn.
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                setWebglLost(false);
+                setRendererEpoch(n => n + 1);
+              }}
+              className="px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-xs font-semibold text-white transition-colors"
+            >
+              Thử khôi phục 3D
+            </button>
+          </div>
+        </div>
+      )}
       {/* Isolated WebGL canvas mount point (zero React children inside) */}
       <div
         ref={mountRef}
@@ -1052,6 +1164,44 @@ export const Rack3DVisualizer: React.FC<Rack3DVisualizerProps> = ({
                 title="Hiển thị dải bản đồ nhiệt theo từng U"
               >
                 <Flame className="w-3 h-3" /> Nhiệt Độ U
+              </button>
+              <div className="h-4 w-px bg-slate-700 mx-0.5" />
+              <button
+                type="button"
+                aria-pressed={wireframeMode}
+                onClick={() => setWireframeMode(v => !v)}
+                className={`px-2 py-1 rounded-md font-semibold transition-colors flex items-center gap-1 ${
+                  wireframeMode
+                    ? 'bg-indigo-600 text-white'
+                    : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                }`}
+                title="Bật/tắt chế độ khung dây (Wireframe)"
+              >
+                <Grid3x3 className="w-3 h-3" /> Khung dây
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  setRenderQuality(q => (q === 'high' ? 'medium' : q === 'medium' ? 'low' : 'high'))
+                }
+                className="px-2 py-1 rounded-md font-semibold bg-slate-800 text-slate-200 hover:bg-slate-700 transition-colors"
+                title="Chuyển mức chất lượng kết xuất (Cao / TB / Thấp)"
+              >
+                CL: {renderQuality === 'high' ? 'Cao' : renderQuality === 'medium' ? 'TB' : 'Thấp'}
+              </button>
+              <button
+                id="rack-3d-shadow-toggle"
+                type="button"
+                aria-pressed={shadowsEnabled}
+                onClick={() => setShadowsEnabled(v => !v)}
+                className={`px-2 py-1 rounded-md font-semibold transition-colors flex items-center gap-1 ${
+                  shadowsEnabled
+                    ? 'bg-amber-600 text-white'
+                    : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                }`}
+                title="Bật/tắt tính toán bóng đổ cho tủ rack 3D"
+              >
+                <Sun className="w-3 h-3" /> Bóng: {shadowsEnabled ? 'Bật' : 'Tắt'}
               </button>
             </div>
           </div>

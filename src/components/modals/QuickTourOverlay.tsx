@@ -10,8 +10,9 @@ import {
   X
 } from 'lucide-react';
 import { useFocusTrap } from '../../hooks/useFocusTrap';
+import { QUICK_TOUR_STORAGE_KEY } from '../../config/appInfo';
 
-export const QUICK_TOUR_STORAGE_KEY = 'hachihi_quick_tour_done_v1';
+export { QUICK_TOUR_STORAGE_KEY };
 
 interface QuickTourOverlayProps {
   isOpen: boolean;

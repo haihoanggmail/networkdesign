@@ -16,7 +16,10 @@ import {
   Trash2,
   Unlock,
   Upload,
-  X
+  X,
+  AlertTriangle,
+  CheckCircle2,
+  ShieldAlert
 } from 'lucide-react';
 import { CableEdge, DiagramNode, ProjectState, SelectionState } from '../../types/infrastructure';
 import {
@@ -29,6 +32,7 @@ import {
 import { CABLE_SIGNAL_COLOR_PRESETS, normalizeCableColor } from '../../utils/cableRouting';
 import { validateAndConvertIconImage } from '../../utils/projectStorage';
 import { sanitizeSafeImageUrl } from '../../utils/security';
+import { evaluatePortPairCompatibility, pickBestCompatiblePortPair } from '../../utils/portCompatibility';
 import { CanvasCableGeometry, OpenInlineCableLabelFn } from './canvasTypes';
 
 interface PendingConnectionState {
@@ -744,7 +748,7 @@ export const CanvasSelectionOverlays: React.FC<CanvasSelectionOverlaysProps> = (
         );
       })()}
 
-      {/* Port Picker Popover */}
+      {/* Port Picker Popover (UX #4: Guided Step 1 -> Step 2 with Port Compatibility Validation) */}
       {pendingConnection && (() => {
         const srcNode = nodeMap.get(pendingConnection.sourceNodeId);
         const tgtNode = nodeMap.get(pendingConnection.targetNodeId);
@@ -753,17 +757,22 @@ export const CanvasSelectionOverlays: React.FC<CanvasSelectionOverlaysProps> = (
         const tgtAsset = tgtNode.assetId ? project.assets[tgtNode.assetId] : undefined;
         const srcPorts = srcAsset?.ports || [];
         const tgtPorts = tgtAsset?.ports || [];
+        const srcPort = srcPorts.find(p => p.id === pendingConnection.sourcePortId);
+        const tgtPort = tgtPorts.find(p => p.id === pendingConnection.targetPortId);
+        const compat = evaluatePortPairCompatibility(srcAsset, srcPort, tgtAsset, tgtPort);
+        const hasSuggestedFix = srcPorts.length > 0 && tgtPorts.length > 0 && compat.level !== 'ok';
 
         return (
           <div
             onPointerDown={e => e.stopPropagation()}
             style={{ left: pendingConnection.screenX, top: pendingConnection.screenY }}
-            className="absolute z-40 w-[332px] max-w-[calc(100%-24px)] rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-2xl p-3 text-xs text-slate-800 dark:text-slate-100 no-print"
+            data-testid="port-picker-popover"
+            className="absolute z-40 w-[356px] max-w-[calc(100%-24px)] rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-2xl p-3 text-xs text-slate-800 dark:text-slate-100 no-print"
           >
             <div className="flex items-center justify-between pb-2 border-b border-slate-200 dark:border-slate-800">
               <div className="flex items-center gap-1.5 font-semibold text-slate-900 dark:text-white">
                 <GitBranch className="w-3.5 h-3.5 text-blue-600" />
-                <span>Chọn cổng kết nối (Port Mapping)</span>
+                <span>Kết nối cổng thiết bị (A → B)</span>
               </div>
               <button
                 onClick={() => onSetPendingConnection(null)}
@@ -777,10 +786,12 @@ export const CanvasSelectionOverlays: React.FC<CanvasSelectionOverlaysProps> = (
             <div className="py-2.5 space-y-2.5">
               <div>
                 <div className="text-[11px] font-medium text-slate-500 mb-1 truncate">
-                  Nguồn: <strong className="text-slate-800 dark:text-slate-100">{srcAsset?.name || srcNode.label}</strong>
+                  Bước 1 · Thiết bị A:{' '}
+                  <strong className="text-slate-800 dark:text-slate-100">{srcAsset?.name || srcNode.label}</strong>
                 </div>
                 {srcPorts.length > 0 ? (
                   <select
+                    aria-label="Chọn cổng thiết bị nguồn"
                     value={pendingConnection.sourcePortId || ''}
                     onChange={e =>
                       onSetPendingConnection(prev =>
@@ -791,7 +802,7 @@ export const CanvasSelectionOverlays: React.FC<CanvasSelectionOverlaysProps> = (
                   >
                     {srcPorts.map(pt => (
                       <option key={pt.id} value={pt.id}>
-                        {pt.name} ({pt.speed}
+                        {pt.name} · {pt.type} ({pt.speed}
                         {pt.poe ? ' · PoE' : ''}) — {pt.status === 'up' ? 'Đang nối' : 'Trống'}
                       </option>
                     ))}
@@ -803,10 +814,12 @@ export const CanvasSelectionOverlays: React.FC<CanvasSelectionOverlaysProps> = (
 
               <div>
                 <div className="text-[11px] font-medium text-slate-500 mb-1 truncate">
-                  Đích: <strong className="text-slate-800 dark:text-slate-100">{tgtAsset?.name || tgtNode.label}</strong>
+                  Bước 2 · Thiết bị B:{' '}
+                  <strong className="text-slate-800 dark:text-slate-100">{tgtAsset?.name || tgtNode.label}</strong>
                 </div>
                 {tgtPorts.length > 0 ? (
                   <select
+                    aria-label="Chọn cổng thiết bị đích"
                     value={pendingConnection.targetPortId || ''}
                     onChange={e =>
                       onSetPendingConnection(prev =>
@@ -817,13 +830,69 @@ export const CanvasSelectionOverlays: React.FC<CanvasSelectionOverlaysProps> = (
                   >
                     {tgtPorts.map(pt => (
                       <option key={pt.id} value={pt.id}>
-                        {pt.name} ({pt.speed}
+                        {pt.name} · {pt.type} ({pt.speed}
                         {pt.poe ? ' · PoE' : ''}) — {pt.status === 'up' ? 'Đang nối' : 'Trống'}
                       </option>
                     ))}
                   </select>
                 ) : (
                   <div className="text-[11px] text-slate-400 italic">Thiết bị đích không có danh sách cổng cố định</div>
+                )}
+              </div>
+
+              {/* Port Compatibility Feedback */}
+              <div
+                role="status"
+                className={`p-2 rounded-lg border text-[11px] space-y-1 ${
+                  compat.level === 'error'
+                    ? 'bg-rose-50 dark:bg-rose-950/40 border-rose-200 dark:border-rose-900 text-rose-800 dark:text-rose-200'
+                    : compat.level === 'warning'
+                    ? 'bg-amber-50 dark:bg-amber-950/40 border-amber-200 dark:border-amber-900 text-amber-800 dark:text-amber-200'
+                    : 'bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-900 text-emerald-800 dark:text-emerald-200'
+                }`}
+              >
+                <div className="flex items-start gap-1.5 font-semibold">
+                  {compat.level === 'error' ? (
+                    <ShieldAlert className="w-3.5 h-3.5 shrink-0 mt-0.5 text-rose-600 dark:text-rose-400" />
+                  ) : compat.level === 'warning' ? (
+                    <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-amber-600 dark:text-amber-400" />
+                  ) : (
+                    <CheckCircle2 className="w-3.5 h-3.5 shrink-0 mt-0.5 text-emerald-600 dark:text-emerald-400" />
+                  )}
+                  <div className="min-w-0">
+                    {compat.level === 'ok' ? (
+                      <span>
+                        Cổng tương thích ({compat.suggestedCableType || 'CAT6_UTP'}). Sẵn sàng nối dây.
+                      </span>
+                    ) : (
+                      <span>{compat.reasons[0]}</span>
+                    )}
+                  </div>
+                </div>
+                {compat.reasons.slice(1).map((r, idx) => (
+                  <div key={idx} className="pl-5 text-[10.5px] opacity-90">
+                    {r}
+                  </div>
+                ))}
+                {hasSuggestedFix && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const best = pickBestCompatiblePortPair(srcPorts, tgtPorts);
+                      onSetPendingConnection(prev =>
+                        prev
+                          ? {
+                              ...prev,
+                              sourcePortId: best.sourcePortId,
+                              targetPortId: best.targetPortId
+                            }
+                          : null
+                      );
+                    }}
+                    className="ml-5 text-[11px] font-semibold underline hover:no-underline cursor-pointer"
+                  >
+                    Tự chọn cặp cổng trống tương thích
+                  </button>
                 )}
               </div>
             </div>
@@ -838,6 +907,7 @@ export const CanvasSelectionOverlays: React.FC<CanvasSelectionOverlaysProps> = (
               </button>
               <button
                 type="button"
+                disabled={compat.level === 'error'}
                 onClick={() => {
                   onAddCable(
                     pendingConnection.sourceNodeId,
@@ -847,7 +917,7 @@ export const CanvasSelectionOverlays: React.FC<CanvasSelectionOverlaysProps> = (
                   );
                   onSetPendingConnection(null);
                 }}
-                className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-semibold"
+                className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 dark:disabled:bg-slate-700 disabled:text-slate-500 disabled:cursor-not-allowed text-white font-semibold"
               >
                 Kết nối ngay
               </button>

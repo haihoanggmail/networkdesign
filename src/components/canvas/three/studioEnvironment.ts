@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import type { ThreeResourceRegistry } from './resourceRegistry';
 
 export function detectSoftwareGl(): boolean {
   try {
@@ -160,9 +161,98 @@ export function createLockBadgeTexture(): THREE.CanvasTexture {
   return tex;
 }
 
+export type StudioRenderQuality = 'low' | 'medium' | 'high';
+
+export function getShadowMapSizeForQuality(quality: StudioRenderQuality): number {
+  if (quality === 'low') return 512;
+  if (quality === 'medium') return 1024;
+  return 2048;
+}
+
+export function getPixelRatioForQuality(
+  quality: StudioRenderQuality,
+  devicePixelRatio: number,
+  isSoftwareGl: boolean
+): number {
+  const safeDpr = Number.isFinite(devicePixelRatio) && devicePixelRatio > 0 ? devicePixelRatio : 1;
+  if (isSoftwareGl) {
+    return quality === 'low' ? 0.75 : 1;
+  }
+  if (quality === 'low') return Math.min(safeDpr, 1);
+  if (quality === 'medium') return Math.min(safeDpr, 1.35);
+  return Math.min(safeDpr, 2);
+}
+
+const SHADOW_EXCLUDED_NAMES = new Set([
+  'contact_shadow',
+  'selection_ring',
+  'locked_indicator_ring',
+  'locked_rim_frame',
+  'locked_padlock_sprite'
+]);
+
+export function applyGlobalShadowMapping(
+  renderer: THREE.WebGLRenderer,
+  scene: THREE.Scene,
+  enabled: boolean
+): void {
+  renderer.shadowMap.enabled = enabled;
+  renderer.shadowMap.autoUpdate = enabled;
+  if (enabled) {
+    renderer.shadowMap.needsUpdate = true;
+  }
+
+  scene.traverse(obj => {
+    if (obj instanceof THREE.Light) {
+      if (obj.userData?.supportsShadow) {
+        obj.castShadow = enabled;
+      }
+      return;
+    }
+    if (obj instanceof THREE.Mesh) {
+      if (obj.name === 'studio_floor') {
+        obj.receiveShadow = enabled;
+        obj.castShadow = false;
+      } else if (!SHADOW_EXCLUDED_NAMES.has(obj.name) && !obj.userData?.noShadow) {
+        obj.castShadow = enabled;
+        obj.receiveShadow = enabled;
+      }
+      const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+      for (const m of mats) {
+        if (m) m.needsUpdate = true;
+      }
+    }
+  });
+}
+
+export function applySceneWireframeMode(root: THREE.Object3D, enabled: boolean): void {
+  root.traverse(obj => {
+    if (!(obj instanceof THREE.Mesh)) return;
+    if (SHADOW_EXCLUDED_NAMES.has(obj.name) || obj.userData?.excludeWireframe) return;
+    const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+    for (const mat of mats) {
+      if (!mat || !('wireframe' in mat)) continue;
+      const stdMat = mat as THREE.MeshStandardMaterial;
+      if (stdMat.userData.__origWireframe === undefined) {
+        stdMat.userData.__origWireframe = Boolean(stdMat.wireframe);
+      }
+      const nextWireframe = enabled ? true : Boolean(stdMat.userData.__origWireframe);
+      if (stdMat.wireframe !== nextWireframe) {
+        stdMat.wireframe = nextWireframe;
+      }
+    }
+  });
+}
+
 export interface StudioRigCleanup {
   dispose: () => void;
   updateTheme: (isDark: boolean) => void;
+  setShadowsEnabled: (enabled: boolean) => void;
+  setRenderQuality: (
+    quality: StudioRenderQuality,
+    isSoftwareGl: boolean,
+    shadowsEnabled: boolean
+  ) => void;
 }
 
 function createAxisLabelSprite(text: string, colorHex: string): THREE.Sprite {
@@ -223,16 +313,19 @@ export function setupStudioEnvironment(
   scene: THREE.Scene,
   renderer: THREE.WebGLRenderer,
   isDark: boolean,
-  isSoftwareGl: boolean
+  isSoftwareGl: boolean,
+  registry?: ThreeResourceRegistry
 ): StudioRigCleanup {
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.05;
   renderer.shadowMap.enabled = !isSoftwareGl;
+  renderer.shadowMap.autoUpdate = !isSoftwareGl;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
   const pmrem = new THREE.PMREMGenerator(renderer);
   const roomEnv = new RoomEnvironment();
   const envTarget = pmrem.fromScene(roomEnv, 0.04);
+  registry?.trackRenderTarget(envTarget, 'studio');
   scene.environment = envTarget.texture;
   scene.environmentIntensity = isDark ? 0.7 : 0.85;
   roomEnv.dispose();
@@ -240,18 +333,17 @@ export function setupStudioEnvironment(
 
   const keyLight = new THREE.DirectionalLight(0xfff4e6, 2.0);
   keyLight.position.set(16, 26, 14);
+  keyLight.userData.supportsShadow = true;
   keyLight.castShadow = !isSoftwareGl;
-  if (!isSoftwareGl) {
-    keyLight.shadow.mapSize.set(2048, 2048);
-    keyLight.shadow.camera.left = -22;
-    keyLight.shadow.camera.right = 22;
-    keyLight.shadow.camera.top = 22;
-    keyLight.shadow.camera.bottom = -22;
-    keyLight.shadow.camera.near = 2;
-    keyLight.shadow.camera.far = 78;
-    keyLight.shadow.bias = -0.0004;
-    keyLight.shadow.normalBias = 0.02;
-  }
+  keyLight.shadow.mapSize.set(isSoftwareGl ? 1024 : 2048, isSoftwareGl ? 1024 : 2048);
+  keyLight.shadow.camera.left = -22;
+  keyLight.shadow.camera.right = 22;
+  keyLight.shadow.camera.top = 22;
+  keyLight.shadow.camera.bottom = -22;
+  keyLight.shadow.camera.near = 2;
+  keyLight.shadow.camera.far = 78;
+  keyLight.shadow.bias = -0.0004;
+  keyLight.shadow.normalBias = 0.02;
   scene.add(keyLight);
 
   const hemiLight = new THREE.HemisphereLight(0xcfe4ff, 0x263142, 0.75);
@@ -263,12 +355,15 @@ export function setupStudioEnvironment(
 
   const maxAniso = renderer.capabilities.getMaxAnisotropy();
   let floorTex = createCadFloorTexture(isDark, maxAniso);
+  registry?.trackTexture(floorTex, 'studio');
   const floorMat = new THREE.MeshStandardMaterial({
     map: floorTex,
     roughness: 0.88,
     metalness: 0.05
   });
+  registry?.trackMaterial(floorMat, 'studio');
   const floorGeo = new THREE.PlaneGeometry(140, 140);
+  registry?.trackGeometry(floorGeo, 'studio');
   const floorMesh = new THREE.Mesh(floorGeo, floorMat);
   floorMesh.rotation.x = -Math.PI / 2;
   floorMesh.position.y = 0;
@@ -276,11 +371,16 @@ export function setupStudioEnvironment(
   floorMesh.name = 'studio_floor';
   scene.add(floorMesh);
 
+  let currentDark = isDark;
+  let currentQuality: StudioRenderQuality = isSoftwareGl ? 'medium' : 'high';
+
   const applyThemeColors = (dark: boolean) => {
+    currentDark = dark;
     const horizonColor = dark ? 0x0b1120 : 0xeef4fb;
     scene.background = new THREE.Color(horizonColor);
     scene.fog = new THREE.FogExp2(horizonColor, 0.0085);
-    scene.environmentIntensity = dark ? 0.7 : 0.85;
+    const envFactor = currentQuality === 'low' ? 0.8 : 1;
+    scene.environmentIntensity = (dark ? 0.7 : 0.85) * envFactor;
     hemiLight.intensity = dark ? 0.65 : 0.82;
     keyLight.intensity = dark ? 1.9 : 2.15;
   };
@@ -291,13 +391,57 @@ export function setupStudioEnvironment(
     updateTheme: (dark: boolean) => {
       applyThemeColors(dark);
       const nextTex = createCadFloorTexture(dark, maxAniso);
+      nextTex.anisotropy =
+        currentQuality === 'low'
+          ? 1
+          : currentQuality === 'medium'
+          ? Math.min(4, Math.max(1, maxAniso))
+          : Math.min(8, Math.max(1, maxAniso));
+      nextTex.needsUpdate = true;
       floorMat.map = nextTex;
       floorMat.needsUpdate = true;
       floorTex.dispose();
       floorTex = nextTex;
+      registry?.trackTexture(nextTex, 'studio');
+    },
+    setShadowsEnabled: (enabled: boolean) => {
+      applyGlobalShadowMapping(renderer, scene, enabled);
+    },
+    setRenderQuality: (
+      quality: StudioRenderQuality,
+      _isSoftwareGl: boolean,
+      shadowsEnabled: boolean
+    ) => {
+      currentQuality = quality;
+      const mapSize = getShadowMapSizeForQuality(quality);
+      if (keyLight.shadow.mapSize.width !== mapSize || keyLight.shadow.mapSize.height !== mapSize) {
+        keyLight.shadow.mapSize.set(mapSize, mapSize);
+        if (keyLight.shadow.map) {
+          keyLight.shadow.map.dispose();
+          keyLight.shadow.map = null;
+        }
+      }
+      renderer.shadowMap.type =
+        quality === 'low' ? THREE.BasicShadowMap : THREE.PCFSoftShadowMap;
+      floorTex.anisotropy =
+        quality === 'low'
+          ? 1
+          : quality === 'medium'
+          ? Math.min(4, Math.max(1, maxAniso))
+          : Math.min(8, Math.max(1, maxAniso));
+      floorTex.needsUpdate = true;
+      applyThemeColors(currentDark);
+      applyGlobalShadowMapping(renderer, scene, shadowsEnabled);
     },
     dispose: () => {
+      if (keyLight.shadow.map) {
+        keyLight.shadow.map.dispose();
+        keyLight.shadow.map = null;
+      }
+      scene.remove(keyLight, hemiLight, rimLight, floorMesh);
       scene.environment = null;
+      scene.background = null;
+      scene.fog = null;
       envTarget.dispose();
       floorTex.dispose();
       floorMat.dispose();

@@ -41,7 +41,7 @@ import {
 import { exportProjectBomCsv, formatBomTsvForClipboard } from '../../utils/bomCsvExporter';
 import { useFocusTrap } from '../../hooks/useFocusTrap';
 import { APP_VERSION } from '../../config/appInfo';
-import { listRevisionsFromDB, migrateAndValidateProject } from '../../utils/projectStorage';
+import { listRevisionsFromDB, migrateAndValidateProject, saveRevisionToDB } from '../../utils/projectStorage';
 
 type BomTab = 'devices' | 'cables' | 'accessories' | 'multiview' | 'compare' | 'assumptions';
 type MultiViewMode = 'floors' | 'rooms' | 'systems' | 'racks';
@@ -200,6 +200,38 @@ export const BomStatisticsModal: React.FC<BomStatisticsModalProps> = ({
       onShowToast?.('Không đọc được tệp JSON dự án so sánh.', 'error');
     } finally {
       e.target.value = '';
+    }
+  };
+
+  const handleLockBomSnapshot = async () => {
+    const nowIso = new Date().toISOString();
+    const stampLabel = `Chốt BOM (${new Date().toLocaleDateString('vi-VN')} ${new Date().toLocaleTimeString('vi-VN', {
+      hour: '2-digit',
+      minute: '2-digit'
+    })})`;
+    const snapshot = structuredClone(project);
+    const rev: ProjectRevision = {
+      id: `rev_bom_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      projectId: project.id,
+      label: stampLabel,
+      note: `${bomStats.kpis.deviceCount} TB · ${bomStats.kpis.totalCableWithReserveMeters}m cáp · ${formatVnd(bomStats.kpis.estimatedGrandTotalVnd)}`,
+      createdAt: nowIso,
+      author: project.author || 'Kỹ sư hệ thống',
+      nodeCount: snapshot.nodes.length,
+      assetCount: Object.keys(snapshot.assets).length,
+      rackCount: snapshot.racks.length,
+      cableCount: snapshot.cables.length,
+      snapshot
+    };
+    const ok = await saveRevisionToDB(rev);
+    if (ok) {
+      setRevisions(prev => [rev, ...prev]);
+      setUploadedBaselineProject(null);
+      setUploadedBaselineName('');
+      setSelectedRevisionId(rev.id);
+      onShowToast?.(`Đã chốt mốc "${stampLabel}" để đối chiếu chênh lệch BOM.`, 'success');
+    } else {
+      onShowToast?.('Không thể lưu mốc chốt BOM vào IndexedDB.', 'error');
     }
   };
 
@@ -886,6 +918,14 @@ export const BomStatisticsModal: React.FC<BomStatisticsModalProps> = ({
                     className="hidden"
                     onChange={e => void handleUploadBaselineJson(e)}
                   />
+                  <button
+                    type="button"
+                    onClick={() => void handleLockBomSnapshot()}
+                    className="h-9 px-3 rounded-lg bg-[#155EEF] hover:bg-blue-700 text-white text-xs font-semibold flex items-center gap-1.5"
+                  >
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    <span>Chốt mốc BOM hiện tại</span>
+                  </button>
                   <button
                     type="button"
                     onClick={() => baselineFileRef.current?.click()}

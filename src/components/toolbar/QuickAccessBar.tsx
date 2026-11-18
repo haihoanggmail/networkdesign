@@ -30,7 +30,6 @@ import {
 import { ProjectState } from '../../types/infrastructure';
 import { CanvasTool } from '../../store/useProjectStore';
 import { RecentActionEntry, formatRecentActionAge } from '../../utils/recentActions';
-import { canAddDevicesInScene } from '../../utils/layerPolicy';
 
 interface QuickAccessBarProps {
   project: ProjectState;
@@ -58,9 +57,11 @@ interface QuickAccessBarProps {
   onAutoLayerDevices: () => void;
   onReplayRecentAction: (entry: RecentActionEntry) => void;
   onClearRecentActions: () => void;
+  experienceMode?: 'basic' | 'advanced';
+  onToggleExperienceMode?: (mode: 'basic' | 'advanced') => void;
 }
 
-export const QuickAccessBar: React.FC<QuickAccessBarProps> = ({
+export const QuickAccessBar: React.FC<QuickAccessBarProps> = React.memo(({
   project,
   activeTool,
   canUndo,
@@ -85,8 +86,12 @@ export const QuickAccessBar: React.FC<QuickAccessBarProps> = ({
   onToggleReadOnly,
   onAutoLayerDevices,
   onReplayRecentAction,
-  onClearRecentActions
+  onClearRecentActions,
+  experienceMode,
+  onToggleExperienceMode
 }) => {
+  const resolvedExperienceMode = experienceMode ?? project.settings?.experienceMode ?? 'advanced';
+  const isBasicMode = resolvedExperienceMode === 'basic';
   const [openMenu, setOpenMenu] = useState<'more' | null>(null);
   const [showRecentInMore, setShowRecentInMore] = useState(false);
   const barRef = useRef<HTMLDivElement>(null);
@@ -229,14 +234,12 @@ export const QuickAccessBar: React.FC<QuickAccessBarProps> = ({
         {onAddDeviceFocus && !isReadOnlyMode && (
           <button
             type="button"
-            disabled={!canAddDevicesInScene({ isReadOnlyMode, is3DView, is3DDragLocked })}
+            disabled={is3DView}
             onClick={onAddDeviceFocus}
             className="h-7 px-2.5 rounded-md text-xs font-semibold flex items-center gap-1 whitespace-nowrap shrink-0 bg-[#155EEF]/10 hover:bg-[#155EEF]/15 text-[#155EEF] dark:text-blue-300 border border-[#155EEF]/25 transition-colors disabled:opacity-35 disabled:cursor-not-allowed"
             title={
-              is3DView && is3DDragLocked
-                ? 'Mở khóa kéo 3D để thêm thiết bị từ thư viện'
-                : is3DView
-                ? 'Tìm và thêm thiết bị từ thư viện vào không gian 3D (Ctrl+F)'
+              is3DView
+                ? 'Thêm thiết bị từ thư viện chỉ khả dụng trong chế độ 2D CAD'
                 : 'Tìm và thêm thiết bị từ thư viện bên trái (Ctrl+F)'
             }
           >
@@ -245,114 +248,155 @@ export const QuickAccessBar: React.FC<QuickAccessBarProps> = ({
           </button>
         )}
 
-        <span className="h-4 w-px bg-slate-200 dark:bg-slate-700 mx-0.5 shrink-0" />
+        {/* Adaptive Contextual Action by Active Mode (lean, hidden in Basic Mode) */}
+        {!isBasicMode && (
+          <>
+            <span className="h-4 w-px bg-slate-200 dark:bg-slate-700 mx-0.5 shrink-0" />
 
-        {/* Adaptive Contextual Action by Active Mode (lean, zero duplicates) */}
-        {project.activeMode === 'topology' && (
-          <button
-            type="button"
-            onClick={onAutoAssignIps}
-            disabled={isReadOnlyMode || deviceCount === 0}
-            className={btnGhost}
-            title="Tự động gán địa chỉ IP theo cây kết nối"
-          >
-            <Network className="w-3.5 h-3.5 text-sky-600 shrink-0" />
-            <span>Tự gán IP</span>
-          </button>
+            {project.activeMode === 'topology' && (
+              <button
+                type="button"
+                onClick={onAutoAssignIps}
+                disabled={isReadOnlyMode || deviceCount === 0}
+                className={btnGhost}
+                title="Tự động gán địa chỉ IP theo cây kết nối"
+              >
+                <Network className="w-3.5 h-3.5 text-sky-600 shrink-0" />
+                <span>Tự gán IP</span>
+              </button>
+            )}
+
+            {project.activeMode === 'cctv' && onToggleCoverageOverlay && (
+              <button
+                type="button"
+                disabled={is3DView}
+                onClick={onToggleCoverageOverlay}
+                aria-pressed={!is3DView && project.settings.showCoverageRadius}
+                className={`${btnBase} ${
+                  !is3DView && project.settings.showCoverageRadius
+                    ? 'bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800'
+                    : 'text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800'
+                }`}
+                title={
+                  is3DView
+                    ? 'Lớp vùng phủ FOV 2D chỉ hiển thị trên bản vẽ 2D CAD'
+                    : 'Bật/tắt góc quan sát Camera (FOV)'
+                }
+              >
+                <Video className="w-3.5 h-3.5 shrink-0" />
+                <span>Góc FOV</span>
+              </button>
+            )}
+
+            {project.activeMode === 'wifi' && onToggleCoverageOverlay && (
+              <button
+                type="button"
+                disabled={is3DView}
+                onClick={onToggleCoverageOverlay}
+                aria-pressed={!is3DView && project.settings.showCoverageRadius}
+                className={`${btnBase} ${
+                  !is3DView && project.settings.showCoverageRadius
+                    ? 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800'
+                    : 'text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800'
+                }`}
+                title={
+                  is3DView
+                    ? 'Lớp vùng phủ sóng Wi-Fi 2D chỉ hiển thị trên bản vẽ 2D CAD'
+                    : 'Bật/tắt vùng phủ sóng Wi-Fi'
+                }
+              >
+                <Radio className="w-3.5 h-3.5 shrink-0" />
+                <span>Sóng Wi-Fi</span>
+              </button>
+            )}
+
+            {project.activeMode === 'rack' && onAddRack && (
+              <button
+                type="button"
+                onClick={onAddRack}
+                disabled={isReadOnlyMode}
+                className={btnGhost}
+                title="Thêm tủ Rack 42U mới"
+              >
+                <Box className="w-3.5 h-3.5 text-[#155EEF] shrink-0" />
+                <span>Thêm Rack 42U</span>
+              </button>
+            )}
+
+            {project.activeMode === 'electrical' && onOpenPowerTab && (
+              <button
+                type="button"
+                onClick={onOpenPowerTab}
+                className={btnGhost}
+                title="Mở bảng tính phụ tải PoE, Điện AC & UPS"
+              >
+                <Zap className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                <span>Tính tải PoE/UPS</span>
+              </button>
+            )}
+
+            {/* Single Adaptive Cable Routing Button across modes */}
+            <button
+              type="button"
+              onClick={onAutoRouteAllCables}
+              disabled={isReadOnlyMode || cableCount === 0}
+              className={btnGhost}
+              title={
+                project.activeMode === 'electrical'
+                  ? 'Định tuyến cáp nguồn & tín hiệu tránh vật cản'
+                  : project.activeMode === 'cctv'
+                  ? 'Định tuyến dây Camera tránh tường'
+                  : 'Tự định tuyến toàn bộ tuyến cáp theo chế độ hiện tại'
+              }
+            >
+              <Route className="w-3.5 h-3.5 text-[#155EEF] shrink-0" />
+              <span>Định tuyến cáp</span>
+            </button>
+          </>
         )}
-
-        {project.activeMode === 'cctv' && onToggleCoverageOverlay && (
-          <button
-            type="button"
-            disabled={is3DView}
-            onClick={onToggleCoverageOverlay}
-            aria-pressed={!is3DView && project.settings.showCoverageRadius}
-            className={`${btnBase} ${
-              !is3DView && project.settings.showCoverageRadius
-                ? 'bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800'
-                : 'text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800'
-            }`}
-            title={
-              is3DView
-                ? 'Lớp vùng phủ FOV 2D chỉ hiển thị trên bản vẽ 2D CAD'
-                : 'Bật/tắt góc quan sát Camera (FOV)'
-            }
-          >
-            <Video className="w-3.5 h-3.5 shrink-0" />
-            <span>Góc FOV</span>
-          </button>
-        )}
-
-        {project.activeMode === 'wifi' && onToggleCoverageOverlay && (
-          <button
-            type="button"
-            disabled={is3DView}
-            onClick={onToggleCoverageOverlay}
-            aria-pressed={!is3DView && project.settings.showCoverageRadius}
-            className={`${btnBase} ${
-              !is3DView && project.settings.showCoverageRadius
-                ? 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800'
-                : 'text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800'
-            }`}
-            title={
-              is3DView
-                ? 'Lớp vùng phủ sóng Wi-Fi 2D chỉ hiển thị trên bản vẽ 2D CAD'
-                : 'Bật/tắt vùng phủ sóng Wi-Fi'
-            }
-          >
-            <Radio className="w-3.5 h-3.5 shrink-0" />
-            <span>Sóng Wi-Fi</span>
-          </button>
-        )}
-
-        {project.activeMode === 'rack' && onAddRack && (
-          <button
-            type="button"
-            onClick={onAddRack}
-            disabled={isReadOnlyMode}
-            className={btnGhost}
-            title="Thêm tủ Rack 42U mới"
-          >
-            <Box className="w-3.5 h-3.5 text-[#155EEF] shrink-0" />
-            <span>Thêm Rack 42U</span>
-          </button>
-        )}
-
-        {project.activeMode === 'electrical' && onOpenPowerTab && (
-          <button
-            type="button"
-            onClick={onOpenPowerTab}
-            className={btnGhost}
-            title="Mở bảng tính phụ tải PoE, Điện AC & UPS"
-          >
-            <Zap className="w-3.5 h-3.5 text-amber-600 shrink-0" />
-            <span>Tính tải PoE/UPS</span>
-          </button>
-        )}
-
-        {/* Single Adaptive Cable Routing Button across modes */}
-        <button
-          type="button"
-          onClick={onAutoRouteAllCables}
-          disabled={isReadOnlyMode || cableCount === 0}
-          className={btnGhost}
-          title={
-            project.activeMode === 'electrical'
-              ? 'Định tuyến cáp nguồn & tín hiệu tránh vật cản'
-              : project.activeMode === 'cctv'
-              ? 'Định tuyến dây Camera tránh tường'
-              : 'Tự định tuyến toàn bộ tuyến cáp theo chế độ hiện tại'
-          }
-        >
-          <Route className="w-3.5 h-3.5 text-[#155EEF] shrink-0" />
-          <span>Định tuyến cáp</span>
-        </button>
       </div>
 
-      {/* Right: Nâng cao (Consolidated Engineering Popover; Lớp moved exclusively to ViewportController) */}
-      <div className="flex items-center gap-1 shrink-0 relative">
+      {/* Right: Basic / Advanced Switch + Nâng cao (Consolidated Engineering Popover) */}
+      <div className="flex items-center gap-1.5 shrink-0 relative">
+        {onToggleExperienceMode && (
+          <div
+            role="group"
+            aria-label="Chế độ giao diện làm việc"
+            className="inline-flex items-center rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950/70 p-0.5 gap-0.5 shrink-0"
+          >
+            <button
+              type="button"
+              data-testid="experience-mode-basic"
+              aria-pressed={isBasicMode}
+              onClick={() => onToggleExperienceMode('basic')}
+              title="Chế độ Cơ bản: chỉ giữ công cụ vẽ, nối dây và thông số thiết yếu"
+              className={`h-6 px-2 rounded-md text-[11px] font-semibold whitespace-nowrap transition-colors ${
+                isBasicMode
+                  ? 'bg-[#155EEF] text-white shadow-2xs'
+                  : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
+              }`}
+            >
+              Cơ bản
+            </button>
+            <button
+              type="button"
+              data-testid="experience-mode-advanced"
+              aria-pressed={!isBasicMode}
+              onClick={() => onToggleExperienceMode('advanced')}
+              title="Chế độ Kỹ sư: mở đầy đủ IP/VLAN, PoE/UPS, Tủ Rack & tự động hóa"
+              className={`h-6 px-2 rounded-md text-[11px] font-semibold whitespace-nowrap transition-colors ${
+                !isBasicMode
+                  ? 'bg-[#155EEF] text-white shadow-2xs'
+                  : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
+              }`}
+            >
+              Kỹ sư
+            </button>
+          </div>
+        )}
 
-        {/* Nâng cao Popover — 6 Clear Engineering Groups */}
+        {/* Nâng cao Popover — 6 Clear Engineering Groups (shown in Kỹ sư mode) */}
+        {!isBasicMode && (
         <div className="relative">
           <button
             type="button"
@@ -564,7 +608,8 @@ export const QuickAccessBar: React.FC<QuickAccessBarProps> = ({
             </div>
           )}
         </div>
+        )}
       </div>
     </div>
   );
-};
+});

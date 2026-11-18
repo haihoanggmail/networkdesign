@@ -43,7 +43,6 @@ interface CableInspectorProps {
   onSetCableColor?: (cableId: string, color: string) => void;
   onSetCablesColorByType?: (cableType: CableEdge['cableType'], color: string) => void;
   onReconnectCableEndpoint?: (cableId: string, endpoint: 'source' | 'target', newNodeId: string) => void;
-  onSelectNode?: (nodeId: string) => void;
   onUpdateSettings: (partial: Partial<ProjectState['settings']>) => void;
   onDeleteCable: (cableId: string) => void;
   onAutoRouteCable?: (cableId: string) => void;
@@ -64,7 +63,6 @@ export const CableInspector: React.FC<CableInspectorProps> = ({
   onSetCableColor,
   onSetCablesColorByType,
   onReconnectCableEndpoint,
-  onSelectNode,
   onUpdateSettings,
   onDeleteCable,
   onAutoRouteCable,
@@ -543,19 +541,8 @@ export const CableInspector: React.FC<CableInspectorProps> = ({
             <div className="space-y-3">
               {/* Source */}
               <div className="p-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50 space-y-2">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">
-                    Điểm đầu (Nguồn)
-                  </span>
-                  {onSelectNode && selectedCable.sourceNodeId && (
-                    <button
-                      type="button"
-                      onClick={() => onSelectNode(selectedCable.sourceNodeId)}
-                      className="text-[11px] font-semibold text-[#155EEF] dark:text-blue-400 hover:underline"
-                    >
-                      Chọn thiết bị →
-                    </button>
-                  )}
+                <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">
+                  Điểm đầu (Nguồn)
                 </div>
                 <div>
                   <label className="text-xs text-slate-500 block mb-0.5">Thiết bị nguồn</label>
@@ -628,19 +615,8 @@ export const CableInspector: React.FC<CableInspectorProps> = ({
 
               {/* Target */}
               <div className="p-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50 space-y-2">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">
-                    Điểm cuối (Đích)
-                  </span>
-                  {onSelectNode && selectedCable.targetNodeId && (
-                    <button
-                      type="button"
-                      onClick={() => onSelectNode(selectedCable.targetNodeId)}
-                      className="text-[11px] font-semibold text-[#155EEF] dark:text-blue-400 hover:underline"
-                    >
-                      Chọn thiết bị →
-                    </button>
-                  )}
+                <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">
+                  Điểm cuối (Đích)
                 </div>
                 <div>
                   <label className="text-xs text-slate-500 block mb-0.5">Thiết bị đích</label>

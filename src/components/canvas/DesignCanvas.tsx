@@ -9,76 +9,75 @@ import {
   ServerRack,
   RackSide
 } from '../../types/infrastructure';
-import { CanvasTool } from '../../store/useProjectStore';
-import { Box, Lock, Type } from 'lucide-react';
-import { renderDeviceVisualIcon } from '../../utils/deviceIcons';
+import { CanvasTool, SmartCopyPasteOptions } from '../../store/useProjectStore';
 import {
   computeCablePath,
+  computeBundledCablePath,
   computeCableBundleLayout,
-  resolveCableLabelTransform,
   CableBundleInfo,
-  normalizeCableColor
+  CableBundleLayout,
+  RectBox
 } from '../../utils/cableRouting';
 import {
-  computeGridIntersectionSnap,
-  computeRefined2DDragSnap,
-  DEFAULT_GRID_SNAP_THRESHOLD_PX,
+  computeSmartSnap,
   detectOverlappingNodes,
   AlignRect,
   AlignmentGuideLine
 } from '../../utils/snapGuides';
 import { resolveCanvasAppearance, processCanvasBackgroundImage } from '../../utils/canvasBackgrounds';
+import { pickBestCompatiblePortPair } from '../../utils/portCompatibility';
 import {
   getLockedLayerSet,
   isNodeEffectivelyLocked,
   isRoomEffectivelyLocked,
   resolveNodeLayer
 } from '../../utils/layerPolicy';
-import { DEVICE_CATALOG, getCategoryAccentColor, isStandardCatalogNodeColor, loadCustomDevicePresets } from '../../data/deviceCatalog';
 import {
+  CANVAS_RACK_HEADER_H,
   getAssetUHeight,
+  getEffectiveRackDisplayHeight,
   getPresetUHeight,
   getRackCanvasMetrics,
+  isRackNodeCollapsed,
   pixelYToRackU,
   canPlaceDeviceAtU,
   getSlotSpanRect,
   isRackMountedTopologyShadowNode,
   layoutRackNodesForElevationMode
 } from '../../utils/rackGeometry';
-import { sanitizeSafeImageUrl } from '../../utils/security';
 import {
   CanvasCableGeometry,
   DraggingRackDeviceState,
   DraggingRoomState,
   DraggingWaypointState,
-  RESIZE_HANDLE_DIRS,
   RackDropHit,
   ReconnectingCableState,
   ResizeHandleDir,
   ResizeSessionState
 } from './canvasTypes';
+import {
+  Quadtree,
+  computePolylineBounds,
+  computeWorldViewportRect,
+  computeZoomToPointerPan,
+  cullEntitiesWithQuadtree,
+  hitTestCablePolyline
+} from '../../utils/spatialIndex';
+import {
+  CanvasCableRasterLayer,
+  CanvasCablesLayer,
+  CanvasTraysLayer,
+  filterCableBundlesInViewport,
+  shouldUseRasterCableLayer
+} from './CanvasCablesLayer';
 import { CanvasRackNode } from './CanvasRackNode';
 import { CanvasLegendNode } from './CanvasLegendNode';
+import { CanvasDeviceNode } from './CanvasDeviceNode';
+import { CanvasRoomNode } from './CanvasRoomNode';
 import { CanvasSelectionOverlays } from './CanvasSelectionOverlays';
-import { CanvasHudControls } from './CanvasHudControls';
+import { CanvasHudControls, TouchContextMenuState } from './CanvasHudControls';
 import { CanvasGuideOverlay } from './CanvasGuideOverlay';
-
-export interface Canvas2DDropApi {
-  previewLibraryDrop: (
-    clientX: number,
-    clientY: number,
-    presetName: string,
-    footprint?: { width?: number; height?: number; isRack?: boolean; customPresetId?: string }
-  ) => { x: number; y: number; rackHitName?: string; rackHitU?: number; rackHitValid?: boolean } | null;
-  commitLibraryDrop: (
-    clientX: number,
-    clientY: number,
-    presetName: string,
-    footprint?: { width?: number; height?: number; isRack?: boolean; customPresetId?: string }
-  ) => boolean;
-  clearLibraryDropPreview: () => void;
-  getCursorCanvasPos: () => { x: number; y: number } | null;
-}
+import { RackSubDeviceTooltip, HoveredRackSubDeviceInfo } from './RackSubDeviceTooltip';
 
 interface DesignCanvasProps {
   project: ProjectState;
@@ -104,6 +103,9 @@ interface DesignCanvasProps {
   onUpdateNode?: (nodeId: string, partial: Partial<DiagramNode>) => void;
   onSetNodeIconOrLogo?: (nodeId: string, payload: { customIcon?: string; customImageUrl?: string }) => void;
   onDuplicateNodes?: (nodeIds: string[]) => void;
+  smartClipboardNodeIds?: string[];
+  onSmartCopyPasteNodes?: (nodeIds?: string[], options?: SmartCopyPasteOptions) => void;
+  onCopyNodesToClipboard?: (nodeIds: string[]) => void;
   onToggleNodeLock?: (nodeIds: string[]) => void;
   onToggleNodeVisibility?: (nodeIds: string[], forceHidden?: boolean) => void;
   onAddTextNode?: (x: number, y: number) => void;
@@ -119,7 +121,7 @@ interface DesignCanvasProps {
   onOpenDeepInspect: (id: string) => void;
   onAddRoom: (room: Omit<Room, 'id'>) => void;
   onDeleteSelected: () => void;
-  onDropDevice: (presetName: string, x: number, y: number, customPresetId?: string) => void;
+  onDropDevice: (presetName: string, x: number, y: number) => void;
   onDropDeviceIntoRack?: (presetName: string, rackId: string, preferredU: number, side?: RackSide) => void;
   onAssignDeviceToRackSlot?: (rackId: string, assetId: string, preferredU: number, side?: RackSide) => void;
   onRemoveDeviceFromRackSlot?: (rackId: string, assetIdOrU: string | number, side?: RackSide) => void;
@@ -130,7 +132,6 @@ interface DesignCanvasProps {
   onOpenCommandPalette?: () => void;
   onOpenTemplates?: () => void;
   onAddQuickDevice?: () => void;
-  onAddRackAtCursor?: (x: number, y: number) => void;
   onOpenBuildingGenerator?: () => void;
   onSetActiveFloor?: (floorId: string) => void;
   onCloneFloor?: (floorId: string, newLevel: number, newName: string) => void;
@@ -138,7 +139,6 @@ interface DesignCanvasProps {
   showMinimap?: boolean;
   showBgMenu?: boolean;
   onSetShowBgMenu?: React.Dispatch<React.SetStateAction<boolean>>;
-  onRegister2DDropApi?: (api: Canvas2DDropApi | null) => void;
 }
 
 export const DesignCanvas: React.FC<DesignCanvasProps> = ({
@@ -165,6 +165,9 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
   onUpdateNode,
   onSetNodeIconOrLogo,
   onDuplicateNodes,
+  smartClipboardNodeIds,
+  onSmartCopyPasteNodes,
+  onCopyNodesToClipboard,
   onToggleNodeLock,
   onToggleNodeVisibility,
   onAddTextNode,
@@ -191,15 +194,13 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
   onOpenCommandPalette,
   onOpenTemplates,
   onAddQuickDevice,
-  onAddRackAtCursor,
   onOpenBuildingGenerator,
   onSetActiveFloor,
   onCloneFloor,
   onNudgeNodes,
   showMinimap: controlledShowMinimap,
   showBgMenu: controlledShowBgMenu,
-  onSetShowBgMenu: controlledOnSetShowBgMenu,
-  onRegister2DDropApi
+  onSetShowBgMenu: controlledOnSetShowBgMenu
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const bgFileInputRef = useRef<HTMLInputElement>(null);
@@ -224,22 +225,11 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
   } | null>(null);
   const longPressTimerRef = useRef<number | null>(null);
   const longPressOriginRef = useRef<{ x: number; y: number } | null>(null);
-  const [touchContextMenu, setTouchContextMenu] = useState<{
-    kind: 'node' | 'edge';
-    id: string;
-    x: number;
-    y: number;
-  } | null>(null);
+  const [touchContextMenu, setTouchContextMenu] = useState<TouchContextMenuState | null>(null);
 
   const [draggingNodeIds, setDraggingNodeIds] = useState<string[] | null>(null);
   const [dragStartPos, setDragStartPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [alignmentGuides, setAlignmentGuides] = useState<AlignmentGuideLine[]>([]);
-  const [gridSnapHighlight, setGridSnapHighlight] = useState<{
-    x: number;
-    y: number;
-    distance: number;
-    gridSize: number;
-  } | null>(null);
   const nodeDragSessionRef = useRef<{
     originClientX: number;
     originClientY: number;
@@ -255,6 +245,34 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
   } | null>(null);
   const [draggingRoom, setDraggingRoom] = useState<DraggingRoomState | null>(null);
 
+  const [hoveredRackSubDevice, setHoveredRackSubDevice] = useState<HoveredRackSubDeviceInfo | null>(null);
+  const rackTooltipCloseTimerRef = useRef<number | null>(null);
+  const clearRackTooltipTimer = useCallback(() => {
+    if (rackTooltipCloseTimerRef.current !== null) {
+      window.clearTimeout(rackTooltipCloseTimerRef.current);
+      rackTooltipCloseTimerRef.current = null;
+    }
+  }, []);
+  const handleHoverRackSubDevice = useCallback(
+    (info: HoveredRackSubDeviceInfo | null) => {
+      clearRackTooltipTimer();
+      if (info) {
+        setHoveredRackSubDevice(info);
+      } else {
+        rackTooltipCloseTimerRef.current = window.setTimeout(() => {
+          setHoveredRackSubDevice(null);
+          rackTooltipCloseTimerRef.current = null;
+        }, 140);
+      }
+    },
+    [clearRackTooltipTimer]
+  );
+  useEffect(() => {
+    return () => {
+      clearRackTooltipTimer();
+    };
+  }, [clearRackTooltipTimer]);
+
   const [iconPickerNodeId, setIconPickerNodeId] = useState<string | null>(null);
   const [iconPickerTab, setIconPickerTab] = useState<'icons' | 'isometric' | 'logos' | 'upload'>('icons');
   const [nodeIconUploadError, setNodeIconUploadError] = useState<string | null>(null);
@@ -263,12 +281,6 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
   const [rackSides, setRackSides] = useState<Record<string, RackSide>>({});
   const [draggingRackDevice, setDraggingRackDevice] = useState<DraggingRackDeviceState | null>(null);
   const [rackDropPreview, setRackDropPreview] = useState<RackDropHit | null>(null);
-  const [canvasDropGhost, setCanvasDropGhost] = useState<{
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-  } | null>(null);
 
   const [draggingWaypoint, setDraggingWaypoint] = useState<DraggingWaypointState | null>(null);
   const [reconnectingCable, setReconnectingCable] = useState<ReconnectingCableState | null>(null);
@@ -291,14 +303,6 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
     locked: boolean;
   } | null>(null);
   const [currentMouseCanvas, setCurrentMouseCanvas] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
-  const cursorInsideCanvasRef = useRef(false);
-  const lastCanvasCursorRef = useRef<{ x: number; y: number } | null>(null);
-  const [canvasContextMenu, setCanvasContextMenu] = useState<{
-    screenX: number;
-    screenY: number;
-    canvasX: number;
-    canvasY: number;
-  } | null>(null);
 
   const [pendingConnection, setPendingConnection] = useState<{
     sourceNodeId: string;
@@ -320,8 +324,6 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
       setEditingCableLabel(null);
       setConfirmToolbarDelete(null);
       setDraggingNodeIds(null);
-      setGridSnapHighlight(null);
-      setCanvasContextMenu(null);
       setResizingSession(null);
       setWifiResizeSession(null);
       setDraggingRoom(null);
@@ -354,6 +356,30 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
     longPressOriginRef.current = null;
   }, []);
 
+  const openContextMenuAt = useCallback(
+    (
+      clientX: number,
+      clientY: number,
+      kind: 'node' | 'edge' | 'canvas',
+      id: string,
+      targetNodeIds?: string[]
+    ) => {
+      const rect = containerRef.current?.getBoundingClientRect();
+      const localX = rect ? clientX - rect.left : clientX;
+      const localY = rect ? clientY - rect.top : clientY;
+      setTouchContextMenu({
+        kind,
+        id,
+        x: Math.max(12, Math.min(viewportSize.w - 268, localX - 24)),
+        y: Math.max(12, Math.min(viewportSize.h - 280, localY - 12)),
+        targetNodeIds,
+        canvasX: (localX - pan.x) / zoom,
+        canvasY: (localY - pan.y) / zoom
+      });
+    },
+    [pan.x, pan.y, viewportSize.h, viewportSize.w, zoom]
+  );
+
   const scheduleLongPress = useCallback(
     (clientX: number, clientY: number, kind: 'node' | 'edge', id: string) => {
       clearLongPressTimer();
@@ -365,18 +391,10 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
         nodeDragSessionRef.current = null;
         setAlignmentGuides([]);
         onSelect(kind, id);
-        const rect = containerRef.current?.getBoundingClientRect();
-        const localX = rect ? clientX - rect.left : clientX;
-        const localY = rect ? clientY - rect.top : clientY;
-        setTouchContextMenu({
-          kind,
-          id,
-          x: Math.max(12, Math.min(viewportSize.w - 220, localX - 96)),
-          y: Math.max(12, Math.min(viewportSize.h - 240, localY - 24))
-        });
+        openContextMenuAt(clientX, clientY, kind, id, kind === 'node' ? [id] : undefined);
       }, 480);
     },
-    [clearLongPressTimer, onSelect, viewportSize.h, viewportSize.w]
+    [clearLongPressTimer, onSelect, openContextMenuAt]
   );
 
   useEffect(() => {
@@ -505,7 +523,12 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
     });
   }, [project.cableTrays, project.activeMode, project.activeFloorId, hiddenLayerSet]);
 
+  const lastOverlapReportRef = useRef<ReturnType<typeof detectOverlappingNodes> | null>(null);
+  const isGeometryTransforming = Boolean((draggingNodeIds && draggingNodeIds.length > 0) || resizingSession);
   const overlapReport = useMemo(() => {
+    if (isGeometryTransforming && lastOverlapReportRef.current) {
+      return lastOverlapReportRef.current;
+    }
     const activeRects = [...visibleRackNodes, ...visibleDeviceNodes]
       .filter(n => n.type !== 'text')
       .map(n => ({
@@ -514,43 +537,115 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
         x: n.x,
         y: n.y,
         width: n.width,
-        height: n.height
+        height: n.type === 'rack' ? getEffectiveRackDisplayHeight(n) : n.height
       }));
-    return detectOverlappingNodes(activeRects, 2);
-  }, [visibleRackNodes, visibleDeviceNodes]);
+    const report = detectOverlappingNodes(activeRects, 2);
+    lastOverlapReportRef.current = report;
+    return report;
+  }, [visibleRackNodes, visibleDeviceNodes, isGeometryTransforming]);
+
+  const deviceQuadtree = useMemo(
+    () =>
+      Quadtree.fromItems(visibleDeviceNodes, n => ({
+        x: n.x,
+        y: n.y,
+        width: n.width,
+        height: n.height
+      })),
+    [visibleDeviceNodes]
+  );
+
+  const worldViewportRect = useMemo(
+    () => computeWorldViewportRect(pan, zoom, viewportSize, 350),
+    [pan.x, pan.y, zoom, viewportSize.w, viewportSize.h]
+  );
+
+  const trayQuadtree = useMemo(() => {
+    if (visibleCableTrays.length <= 16) return null;
+    return Quadtree.fromItems(visibleCableTrays, t =>
+      computePolylineBounds(t.points, Math.max(24, (t.widthPx || 16) + 12))
+    );
+  }, [visibleCableTrays]);
+
+  const culledVisibleCableTrays = useMemo(() => {
+    if (!trayQuadtree || visibleCableTrays.length <= 16) return visibleCableTrays;
+    return cullEntitiesWithQuadtree(trayQuadtree, visibleCableTrays, worldViewportRect);
+  }, [trayQuadtree, visibleCableTrays, worldViewportRect]);
 
   const culledDeviceNodes = useMemo(() => {
     if (visibleDeviceNodes.length <= 40) return visibleDeviceNodes;
-    const buffer = 350;
-    const viewMinX = -pan.x / zoom - buffer;
-    const viewMinY = -pan.y / zoom - buffer;
-    const viewMaxX = (viewportSize.w - pan.x) / zoom + buffer;
-    const viewMaxY = (viewportSize.h - pan.y) / zoom + buffer;
-
-    return visibleDeviceNodes.filter(n => {
-      if (
+    return cullEntitiesWithQuadtree(
+      deviceQuadtree,
+      visibleDeviceNodes,
+      worldViewportRect,
+      n =>
         n.type === 'legend' ||
         selectedNodeIdSet.has(n.id) ||
         connectingSource?.nodeId === n.id ||
         hoveredNodeId === n.id
-      ) {
-        return true;
+    );
+  }, [deviceQuadtree, visibleDeviceNodes, worldViewportRect, selectedNodeIdSet, connectingSource, hoveredNodeId]);
+
+  const rackByIdMap = useMemo(() => {
+    const map = new Map<string, ServerRack>();
+    for (const r of project.racks) {
+      map.set(r.id, r);
+    }
+    return map;
+  }, [project.racks]);
+
+  const rackByNameMap = useMemo(() => {
+    const map = new Map<string, ServerRack>();
+    for (const r of project.racks) {
+      if (r.name && !map.has(r.name)) {
+        map.set(r.name, r);
       }
-      return (
-        n.x + n.width >= viewMinX &&
-        n.x <= viewMaxX &&
-        n.y + n.height >= viewMinY &&
-        n.y <= viewMaxY
-      );
-    });
-  }, [visibleDeviceNodes, pan.x, pan.y, zoom, viewportSize.w, viewportSize.h, selectedNodeIdSet, connectingSource, hoveredNodeId]);
+    }
+    return map;
+  }, [project.racks]);
 
   const resolveRackForNode = useCallback((rackNode: DiagramNode): ServerRack | undefined => {
-    const asset = rackNode.assetId ? project.assets[rackNode.assetId] : undefined;
-    return project.racks.find(
-      r => r.id === rackNode.customData?.rackId || r.id === rackNode.id || (asset && r.id === asset.id) || r.name === rackNode.label
-    );
-  }, [project.racks, project.assets]);
+    const customRackId = rackNode.customData?.rackId;
+    if (customRackId) {
+      const byCustom = rackByIdMap.get(customRackId);
+      if (byCustom) return byCustom;
+    }
+    const byNodeId = rackByIdMap.get(rackNode.id);
+    if (byNodeId) return byNodeId;
+    if (rackNode.assetId) {
+      const asset = project.assets[rackNode.assetId];
+      if (asset) {
+        const byAsset = rackByIdMap.get(asset.id);
+        if (byAsset) return byAsset;
+      }
+    }
+    return rackNode.label ? rackByNameMap.get(rackNode.label) : undefined;
+  }, [rackByIdMap, rackByNameMap, project.assets]);
+
+  const visibleNodeMap = useMemo(() => {
+    const map = new Map<string, DiagramNode>();
+    for (const n of visibleNodes) {
+      map.set(n.id, n);
+    }
+    return map;
+  }, [visibleNodes]);
+
+  const rackNodeByRackIdMap = useMemo(() => {
+    const map = new Map<string, DiagramNode>();
+    for (const rn of visibleRackNodes) {
+      const resolved = resolveRackForNode(rn);
+      if (resolved && !map.has(resolved.id)) {
+        map.set(resolved.id, rn);
+      }
+      if (rn.customData?.rackId && !map.has(rn.customData.rackId)) {
+        map.set(rn.customData.rackId, rn);
+      }
+      if (!map.has(rn.id)) {
+        map.set(rn.id, rn);
+      }
+    }
+    return map;
+  }, [visibleRackNodes, resolveRackForNode]);
 
   const visibleRooms = useMemo(() => {
     if (hiddenLayerSet.has('rooms')) return [];
@@ -563,6 +658,75 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
       return true;
     });
   }, [project.rooms, project.activeMode, project.activeFloorId, hiddenLayerSet]);
+
+  const rackQuadtree = useMemo(() => {
+    if (visibleRackNodes.length <= 16) return null;
+    return Quadtree.fromItems(visibleRackNodes, rn => ({
+      x: rn.x,
+      y: rn.y,
+      width: rn.width,
+      height: getEffectiveRackDisplayHeight(rn)
+    }));
+  }, [visibleRackNodes]);
+
+  const culledRackNodes = useMemo(() => {
+    if (!rackQuadtree || visibleRackNodes.length <= 16) return visibleRackNodes;
+    return cullEntitiesWithQuadtree(
+      rackQuadtree,
+      visibleRackNodes,
+      worldViewportRect,
+      rn =>
+        selectedNodeIdSet.has(rn.id) ||
+        (selection.type === 'rack' && resolveRackForNode(rn)?.id === selection.id) ||
+        connectingSource?.nodeId === rn.id ||
+        hoveredNodeId === rn.id ||
+        Boolean(draggingNodeIds?.includes(rn.id)) ||
+        Boolean(resizingSession?.targetKind === 'node' && resizingSession.targetId === rn.id)
+    );
+  }, [
+    rackQuadtree,
+    visibleRackNodes,
+    worldViewportRect,
+    selectedNodeIdSet,
+    selection.type,
+    selection.id,
+    resolveRackForNode,
+    connectingSource,
+    hoveredNodeId,
+    draggingNodeIds,
+    resizingSession
+  ]);
+
+  const roomQuadtree = useMemo(() => {
+    if (visibleRooms.length <= 24) return null;
+    return Quadtree.fromItems(visibleRooms, r => ({
+      x: r.x,
+      y: r.y,
+      width: r.width,
+      height: r.height
+    }));
+  }, [visibleRooms]);
+
+  const culledVisibleRooms = useMemo(() => {
+    if (!roomQuadtree || visibleRooms.length <= 24) return visibleRooms;
+    return cullEntitiesWithQuadtree(
+      roomQuadtree,
+      visibleRooms,
+      worldViewportRect,
+      r =>
+        (selection.type === 'room' && selection.id === r.id) ||
+        draggingRoom?.roomId === r.id ||
+        Boolean(resizingSession?.targetKind === 'room' && resizingSession.targetId === r.id)
+    );
+  }, [
+    roomQuadtree,
+    visibleRooms,
+    worldViewportRect,
+    selection.type,
+    selection.id,
+    draggingRoom,
+    resizingSession
+  ]);
 
   const groupBounds = useMemo(() => {
     const groups = new Map<string, { minX: number; minY: number; maxX: number; maxY: number; count: number }>();
@@ -589,18 +753,31 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
   }, [visibleDeviceNodes]);
 
   const getNodeEffectiveRect = useCallback((nodeId: string): { x: number; y: number; width: number; height: number } | null => {
-    const visibleDirect = visibleNodes.find(n => n.id === nodeId);
+    const visibleDirect = visibleNodeMap.get(nodeId);
     if (visibleDirect) {
-      return { x: visibleDirect.x, y: visibleDirect.y, width: visibleDirect.width, height: visibleDirect.height };
+      return {
+        x: visibleDirect.x,
+        y: visibleDirect.y,
+        width: visibleDirect.width,
+        height: visibleDirect.type === 'rack' ? getEffectiveRackDisplayHeight(visibleDirect) : visibleDirect.height
+      };
     }
 
     const anyNode = nodeMap.get(nodeId);
     if (anyNode?.assetId) {
       const asset = project.assets[anyNode.assetId];
       if (asset?.rackId && asset.rackUnitStart) {
-        const rackNode = visibleRackNodes.find(rn => resolveRackForNode(rn)?.id === asset.rackId);
+        const rackNode = rackNodeByRackIdMap.get(asset.rackId);
         const rack = rackNode ? resolveRackForNode(rackNode) : undefined;
         if (rackNode && rack) {
+          if (isRackNodeCollapsed(rackNode)) {
+            return {
+              x: rackNode.x + 8,
+              y: rackNode.y + CANVAS_RACK_HEADER_H + 6,
+              width: Math.max(40, rackNode.width - 16),
+              height: 24
+            };
+          }
           const metrics = getRackCanvasMetrics(rackNode, rack.totalUnits || 42);
           const uH = getAssetUHeight(asset);
           const spanRect = getSlotSpanRect(asset.rackUnitStart, uH, metrics.units, metrics.slotH);
@@ -614,14 +791,76 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
       }
     }
     return null;
-  }, [visibleNodes, nodeMap, project.assets, visibleRackNodes, resolveRackForNode]);
+  }, [visibleNodeMap, nodeMap, project.assets, rackNodeByRackIdMap, resolveRackForNode]);
+
+  const resizingNodeId = resizingSession?.targetKind === 'node' ? resizingSession.targetId : null;
+  const transformingNodeIdSet = useMemo(() => {
+    const set = new Set<string>(draggingNodeIds || []);
+    if (resizingNodeId) set.add(resizingNodeId);
+    return set;
+  }, [draggingNodeIds, resizingNodeId]);
+  const isTransformingNodes = transformingNodeIdSet.size > 0;
+  const lastVisibleCablesRef = useRef<CableEdge[] | null>(null);
+  const lastCableQuadtreeRef = useRef<{ tree: Quadtree<CableEdge> | null } | null>(null);
 
   const visibleCables = useMemo(() => {
-    if (hiddenLayerSet.has('cables')) return [];
-    return project.cables.filter(c => {
-      return Boolean(getNodeEffectiveRect(c.sourceNodeId) && getNodeEffectiveRect(c.targetNodeId));
-    });
-  }, [project.cables, getNodeEffectiveRect, hiddenLayerSet]);
+    if (isTransformingNodes && lastVisibleCablesRef.current) {
+      return lastVisibleCablesRef.current;
+    }
+    const next = hiddenLayerSet.has('cables')
+      ? []
+      : project.cables.filter(c => Boolean(getNodeEffectiveRect(c.sourceNodeId) && getNodeEffectiveRect(c.targetNodeId)));
+    lastVisibleCablesRef.current = next;
+    return next;
+  }, [isTransformingNodes, project.cables, getNodeEffectiveRect, hiddenLayerSet]);
+
+  const cableQuadtree = useMemo(() => {
+    if (isTransformingNodes && lastCableQuadtreeRef.current) {
+      return lastCableQuadtreeRef.current.tree;
+    }
+    const next =
+      visibleCables.length <= 40
+        ? null
+        : Quadtree.fromItems(visibleCables, c => {
+            const src = getNodeEffectiveRect(c.sourceNodeId);
+            const tgt = getNodeEffectiveRect(c.targetNodeId);
+            if (!src || !tgt) return null;
+            let minX = Math.min(src.x, tgt.x);
+            let minY = Math.min(src.y, tgt.y);
+            let maxX = Math.max(src.x + src.width, tgt.x + tgt.width);
+            let maxY = Math.max(src.y + src.height, tgt.y + tgt.height);
+            if (c.controlPoints) {
+              for (const pt of c.controlPoints) {
+                if (pt.x < minX) minX = pt.x;
+                if (pt.y < minY) minY = pt.y;
+                if (pt.x > maxX) maxX = pt.x;
+                if (pt.y > maxY) maxY = pt.y;
+              }
+            }
+            return {
+              x: minX - 24,
+              y: minY - 24,
+              width: Math.max(48, maxX - minX + 48),
+              height: Math.max(48, maxY - minY + 48)
+            };
+          });
+    lastCableQuadtreeRef.current = { tree: next };
+    return next;
+  }, [isTransformingNodes, visibleCables, getNodeEffectiveRect]);
+
+  const culledVisibleCables = useMemo(() => {
+    if (!cableQuadtree || visibleCables.length <= 40) return visibleCables;
+    return cullEntitiesWithQuadtree(
+      cableQuadtree,
+      visibleCables,
+      worldViewportRect,
+      c =>
+        (selection.type === 'edge' && selection.id === c.id) ||
+        hoveredCableId === c.id ||
+        transformingNodeIdSet.has(c.sourceNodeId) ||
+        transformingNodeIdSet.has(c.targetNodeId)
+    );
+  }, [cableQuadtree, visibleCables, worldViewportRect, selection.type, selection.id, hoveredCableId, transformingNodeIdSet]);
 
   const clientToCanvasCoord = useCallback((clientX: number, clientY: number) => {
     if (!containerRef.current) return { x: 0, y: 0 };
@@ -640,6 +879,7 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
   ): RackDropHit | null => {
     for (let i = visibleRackNodes.length - 1; i >= 0; i--) {
       const rackNode = visibleRackNodes[i];
+      if (isRackNodeCollapsed(rackNode)) continue;
       const rack = resolveRackForNode(rackNode);
       if (!rack) continue;
 
@@ -667,163 +907,6 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
     return null;
   }, [visibleRackNodes, resolveRackForNode, rackSides, project.assets]);
 
-  const resolve2DDropTarget = useCallback(
-    (
-      clientX: number,
-      clientY: number,
-      presetName: string,
-      footprint?: { width?: number; height?: number; isRack?: boolean; customPresetId?: string }
-    ) => {
-      if (isReadOnlyMode || !containerRef.current) return null;
-      const rect = containerRef.current.getBoundingClientRect();
-      if (
-        rect.width <= 0 ||
-        rect.height <= 0 ||
-        clientX < rect.left ||
-        clientX > rect.right ||
-        clientY < rect.top ||
-        clientY > rect.bottom
-      ) {
-        return null;
-      }
-
-      const coord = clientToCanvasCoord(clientX, clientY);
-      const isRack = Boolean(footprint?.isRack || presetName.toLowerCase().includes('rack'));
-      if (!footprint?.customPresetId && !isRack && onDropDeviceIntoRack) {
-        const uHeight = getPresetUHeight(presetName);
-        const rackHit = hitTestRackSlot(coord.x, coord.y, uHeight);
-        if (rackHit) {
-          const rackObj = project.racks.find(r => r.id === rackHit.rackId);
-          return {
-            kind: 'rackSlot' as const,
-            rackHit,
-            rackName: rackObj?.name || 'Tủ Rack',
-            x: Math.round(coord.x),
-            y: Math.round(coord.y)
-          };
-        }
-      }
-
-      const customMatch = footprint?.customPresetId
-        ? loadCustomDevicePresets().find(c => c.id === footprint.customPresetId)
-        : undefined;
-      const catalogMatch = customMatch || DEVICE_CATALOG.find(p => p.name === presetName);
-      const w = isRack ? 300 : footprint?.width || catalogMatch?.defaultWidth || 150;
-      const h = isRack ? 180 : footprint?.height || catalogMatch?.defaultHeight || 56;
-      const snap = project.settings.snapToGrid ? Math.max(1, project.settings.gridSize) : 1;
-      const rawX = Math.max(10, coord.x - w / 2);
-      const rawY = Math.max(10, coord.y - h / 2);
-      const dropX = Math.max(10, Math.round(rawX / snap) * snap);
-      const dropY = Math.max(10, Math.round(rawY / snap) * snap);
-      return { kind: 'canvas' as const, x: dropX, y: dropY, rawX, rawY, width: w, height: h };
-    },
-    [
-      isReadOnlyMode,
-      clientToCanvasCoord,
-      onDropDeviceIntoRack,
-      hitTestRackSlot,
-      project.racks,
-      project.settings.snapToGrid,
-      project.settings.gridSize
-    ]
-  );
-
-  useEffect(() => {
-    if (!onRegister2DDropApi) return;
-    onRegister2DDropApi({
-      previewLibraryDrop: (clientX, clientY, presetName, footprint) => {
-        const target = resolve2DDropTarget(clientX, clientY, presetName, footprint);
-        if (!target) {
-          setRackDropPreview(null);
-          setCanvasDropGhost(null);
-          setGridSnapHighlight(null);
-          return null;
-        }
-        if (target.kind === 'rackSlot') {
-          setRackDropPreview(target.rackHit);
-          setCanvasDropGhost(null);
-          setGridSnapHighlight(null);
-          return {
-            x: target.x,
-            y: target.y,
-            rackHitName: target.rackName,
-            rackHitU: target.rackHit.startU,
-            rackHitValid: target.rackHit.valid
-          };
-        }
-        setRackDropPreview(null);
-        setCanvasDropGhost({ x: target.x, y: target.y, width: target.width, height: target.height });
-        if (project.settings.snapToGrid) {
-          const gridStep = Math.max(5, Math.round(project.settings.gridSize || 20));
-          const gs = computeGridIntersectionSnap(
-            target.rawX,
-            target.rawY,
-            gridStep,
-            DEFAULT_GRID_SNAP_THRESHOLD_PX
-          );
-          setGridSnapHighlight(
-            gs.snapped ? { x: gs.gridX, y: gs.gridY, distance: gs.distance, gridSize: gridStep } : null
-          );
-        } else {
-          setGridSnapHighlight(null);
-        }
-        return { x: target.x, y: target.y };
-      },
-      commitLibraryDrop: (clientX, clientY, presetName, footprint) => {
-        const target = resolve2DDropTarget(clientX, clientY, presetName, footprint);
-        setRackDropPreview(null);
-        setCanvasDropGhost(null);
-        setGridSnapHighlight(null);
-        if (!target) return false;
-        if (target.kind === 'rackSlot' && onDropDeviceIntoRack) {
-          onDropDeviceIntoRack(
-            presetName,
-            target.rackHit.rackId,
-            target.rackHit.startU,
-            target.rackHit.side
-          );
-          return true;
-        }
-        onDropDevice(presetName, target.x, target.y, footprint?.customPresetId);
-        return true;
-      },
-      clearLibraryDropPreview: () => {
-        setRackDropPreview(null);
-        setCanvasDropGhost(null);
-        setGridSnapHighlight(null);
-      },
-      getCursorCanvasPos: () => {
-        const pt = lastCanvasCursorRef.current;
-        if (!pt) return null;
-        if (cursorInsideCanvasRef.current) return pt;
-        const screenX = pt.x * zoom + pan.x;
-        const screenY = pt.y * zoom + pan.y;
-        if (
-          screenX >= 0 &&
-          screenX <= viewportSize.w &&
-          screenY >= 0 &&
-          screenY <= viewportSize.h
-        ) {
-          return pt;
-        }
-        return null;
-      }
-    });
-    return () => onRegister2DDropApi(null);
-  }, [
-    onRegister2DDropApi,
-    resolve2DDropTarget,
-    onDropDeviceIntoRack,
-    onDropDevice,
-    project.settings.snapToGrid,
-    project.settings.gridSize,
-    zoom,
-    pan.x,
-    pan.y,
-    viewportSize.w,
-    viewportSize.h
-  ]);
-
   const handleDragOver = (e: React.DragEvent) => {
     if (isReadOnlyMode) return;
     e.preventDefault();
@@ -842,36 +925,46 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
   const handleDragLeave = (e: React.DragEvent) => {
     if (containerRef.current && !containerRef.current.contains(e.relatedTarget as Node)) {
       setRackDropPreview(null);
-      setCanvasDropGhost(null);
     }
   };
 
   const handleDrop = (e: React.DragEvent) => {
     if (isReadOnlyMode) return;
     e.preventDefault();
+    const coord = clientToCanvasCoord(e.clientX, e.clientY);
     const presetName = e.dataTransfer.getData('presetName') || e.dataTransfer.getData('text/plain') || draggedPresetName;
-    const customPresetId = e.dataTransfer.getData('customPresetId') || undefined;
     setRackDropPreview(null);
-    setCanvasDropGhost(null);
 
     if (!presetName) return;
 
-    const target = resolve2DDropTarget(e.clientX, e.clientY, presetName, { customPresetId });
-    if (!target) return;
-
-    if (target.kind === 'rackSlot' && onDropDeviceIntoRack) {
-      onDropDeviceIntoRack(presetName, target.rackHit.rackId, target.rackHit.startU, target.rackHit.side);
-      return;
+    const isRackPreset = presetName.toLowerCase().includes('rack');
+    if (!isRackPreset && onDropDeviceIntoRack) {
+      const uHeight = getPresetUHeight(presetName);
+      const hit = hitTestRackSlot(coord.x, coord.y, uHeight);
+      if (hit) {
+        onDropDeviceIntoRack(presetName, hit.rackId, hit.startU, hit.side);
+        return;
+      }
     }
 
-    onDropDevice(presetName, target.x, target.y, customPresetId);
+    onDropDevice(presetName, coord.x, coord.y);
   };
 
   const handleWheel = (e: React.WheelEvent) => {
     e.preventDefault();
     if (e.ctrlKey || e.metaKey) {
+      if (e.deltaY === 0) return;
       const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
-      onZoomChange(Math.min(Math.max(0.2, zoom * zoomFactor), 3.0));
+      const nextZoom = Math.min(Math.max(0.2, zoom * zoomFactor), 3.0);
+      if (nextZoom === zoom) return;
+
+      const rect = containerRef.current?.getBoundingClientRect();
+      const pointerX = rect ? e.clientX - rect.left : viewportSize.w / 2;
+      const pointerY = rect ? e.clientY - rect.top : viewportSize.h / 2;
+      const nextPan = computeZoomToPointerPan(pan, zoom, nextZoom, pointerX, pointerY);
+
+      onZoomChange(nextZoom);
+      onPanChange(nextPan);
     } else {
       onPanChange({
         x: pan.x - e.deltaX,
@@ -918,7 +1011,6 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
         setReconnectingCable(null);
         setRackDropPreview(null);
         setAlignmentGuides([]);
-        setGridSnapHighlight(null);
         nodeDragSessionRef.current = null;
         setActiveBundleId(null);
         setShowBgMenu(false);
@@ -926,7 +1018,6 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
         setResizingSession(null);
         setDraggingRoom(null);
         setTouchContextMenu(null);
-        setCanvasContextMenu(null);
         onSelect('none');
       }
     };
@@ -993,10 +1084,6 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
     if (activePointerIdRef.current !== null && e.pointerType === 'touch') return;
     activePointerIdRef.current = e.pointerId;
     setTouchContextMenu(null);
-    setCanvasContextMenu(null);
-    const pointerCoord = clientToCanvasCoord(e.clientX, e.clientY);
-    cursorInsideCanvasRef.current = true;
-    lastCanvasCursorRef.current = pointerCoord;
 
     const isPrimary = e.pointerType !== 'mouse' || e.button === 0;
     if (
@@ -1015,13 +1102,15 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
         setActiveBundleId(null);
         onSelect('canvas');
       }
+      clearRackTooltipTimer();
+      setHoveredRackSubDevice(null);
       setIsPanning(true);
       setPanStart({ x: e.clientX - pan.x, y: e.clientY - pan.y });
       return;
     }
 
     if (isPrimary) {
-      const canvasCoord = pointerCoord;
+      const canvasCoord = clientToCanvasCoord(e.clientX, e.clientY);
 
       if (activeTool === 'measure') {
         setMeasureSession({ start: canvasCoord, current: canvasCoord, locked: false });
@@ -1054,6 +1143,13 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
         if (connectingSource) {
           onSetConnectingSource(null);
           return;
+        }
+        if (rasterCableMode) {
+          const hitCable = findRasterCableAtCoord(canvasCoord.x, canvasCoord.y);
+          if (hitCable) {
+            onSelect('edge', hitCable.id);
+            return;
+          }
         }
         if (activeTool === 'select') {
           setMarqueeStart(canvasCoord);
@@ -1092,10 +1188,11 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
         const nextLocalX = rect ? nextMidX - rect.left : nextMidX;
         const nextLocalY = rect ? nextMidY - rect.top : nextMidY;
 
-        onZoomChange(Number(nextZoom.toFixed(3)));
+        const clampedZoom = Number(nextZoom.toFixed(3));
+        onZoomChange(clampedZoom);
         onPanChange({
-          x: Math.round(nextLocalX - worldMidX * nextZoom),
-          y: Math.round(nextLocalY - worldMidY * nextZoom)
+          x: nextLocalX - worldMidX * clampedZoom,
+          y: nextLocalY - worldMidY * clampedZoom
         });
         return;
       }
@@ -1105,8 +1202,6 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
       return;
     }
     const canvasCoord = clientToCanvasCoord(e.clientX, e.clientY);
-    cursorInsideCanvasRef.current = true;
-    lastCanvasCursorRef.current = canvasCoord;
     setCurrentMouseCanvas(canvasCoord);
 
     if (isPanning) {
@@ -1328,29 +1423,13 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
             g => !g.floorId || !project.activeFloorId || g.floorId === project.activeFloorId
           );
           const snapThreshold = 8 / Math.max(0.5, Math.min(zoom, 1.5));
-          const gridStep = Math.max(5, Math.round(project.settings.gridSize || 20));
-          const snapRes = computeRefined2DDragSnap(
+          const snapRes = computeSmartSnap(
             { x: minX, y: minY, width: maxX - minX, height: maxY - minY },
             targetRects,
-            {
-              smartSnapThreshold: snapThreshold,
-              gridSnapThreshold: DEFAULT_GRID_SNAP_THRESHOLD_PX,
-              gridSize: gridStep,
-              snapToGrid: project.settings.snapToGrid,
-              referenceGuides: activeFloorGuides
-            }
+            snapThreshold,
+            activeFloorGuides
           );
           setAlignmentGuides(snapRes.guides);
-          setGridSnapHighlight(
-            snapRes.gridSnap?.snapped
-              ? {
-                  x: snapRes.gridSnap.gridX,
-                  y: snapRes.gridSnap.gridY,
-                  distance: snapRes.gridSnap.distance,
-                  gridSize: gridStep
-                }
-              : null
-          );
 
           const anchorInit = session.initialPositions.get(anchorId)!;
           const anchorCurr = nodeMap.get(anchorId)!;
@@ -1392,6 +1471,31 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
         if (edgePanX !== 0 || edgePanY !== 0) {
           onPanChange({ x: pan.x + edgePanX, y: pan.y + edgePanY });
         }
+      }
+      return;
+    }
+
+    if (
+      rasterCableMode &&
+      !marqueeStart &&
+      !draggingRoom &&
+      !draggingWaypoint &&
+      !reconnectingCable &&
+      !draggingRackDevice &&
+      !wifiResizeSession &&
+      !isDrawingRoom
+    ) {
+      const targetEl = e.target as HTMLElement | null;
+      const isBackdropHit =
+        e.target === containerRef.current ||
+        targetEl?.tagName === 'svg' ||
+        targetEl?.getAttribute('data-canvas-bg') === 'true';
+      if (isBackdropHit) {
+        const hitCable = findRasterCableAtCoord(canvasCoord.x, canvasCoord.y);
+        setHoveredCableId(prev => {
+          const nextId = hitCable ? hitCable.id : null;
+          return prev === nextId ? prev : nextId;
+        });
       }
     }
   };
@@ -1504,14 +1608,12 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
       }
       const hasVerticalGuide = alignmentGuides.some(g => g.orientation === 'vertical');
       const hasHorizontalGuide = alignmentGuides.some(g => g.orientation === 'horizontal');
-      const hasGridIntersectionSnap = Boolean(gridSnapHighlight);
       onSnapNodesAndCommitDrag?.(draggingNodeIds, {
-        snapX: !hasVerticalGuide && hasGridIntersectionSnap,
-        snapY: !hasHorizontalGuide && hasGridIntersectionSnap
+        snapX: !hasVerticalGuide,
+        snapY: !hasHorizontalGuide
       });
       setDraggingNodeIds(null);
       setAlignmentGuides([]);
-      setGridSnapHighlight(null);
       nodeDragSessionRef.current = null;
       setRackDropPreview(null);
     }
@@ -1557,34 +1659,10 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
     setRackDropPreview(null);
     setDraggingNodeIds(null);
     setAlignmentGuides([]);
-    setGridSnapHighlight(null);
     nodeDragSessionRef.current = null;
     setIsDrawingRoom(false);
     setRoomStartPos(null);
     setMeasureSession(null);
-  };
-
-  const handleCanvasContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (isReadOnlyMode) return;
-    const target = e.target as HTMLElement;
-    const isCanvasBackdrop =
-      e.target === containerRef.current ||
-      target.tagName === 'svg' ||
-      target.getAttribute('data-canvas-bg') === 'true';
-    if (!isCanvasBackdrop) return;
-    e.preventDefault();
-    const canvasCoord = clientToCanvasCoord(e.clientX, e.clientY);
-    cursorInsideCanvasRef.current = true;
-    lastCanvasCursorRef.current = canvasCoord;
-    const rect = containerRef.current?.getBoundingClientRect();
-    const localX = rect ? e.clientX - rect.left : e.clientX;
-    const localY = rect ? e.clientY - rect.top : e.clientY;
-    setCanvasContextMenu({
-      screenX: Math.max(12, Math.min(viewportSize.w - 236, localX)),
-      screenY: Math.max(12, Math.min(viewportSize.h - 120, localY)),
-      canvasX: canvasCoord.x,
-      canvasY: canvasCoord.y
-    });
   };
 
   const initiateConnectionOrOpenPortPicker = useCallback(
@@ -1603,8 +1681,9 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
         return;
       }
 
-      const defaultSrcPort = (srcPorts.find(p => p.status !== 'up') || srcPorts[0])?.id;
-      const defaultTgtPort = (tgtPorts.find(p => p.status !== 'up') || tgtPorts[0])?.id;
+      const bestPair = pickBestCompatiblePortPair(srcPorts, tgtPorts);
+      const defaultSrcPort = bestPair.sourcePortId;
+      const defaultTgtPort = bestPair.targetPortId;
 
       const rect = containerRef.current?.getBoundingClientRect();
       const rawX =
@@ -1625,8 +1704,8 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
         targetNodeId,
         sourcePortId: defaultSrcPort,
         targetPortId: defaultTgtPort,
-        screenX: Math.max(12, Math.min(viewportSize.w - 344, rawX - 150)),
-        screenY: Math.max(12, Math.min(viewportSize.h - 290, rawY + 14))
+        screenX: Math.max(12, Math.min(viewportSize.w - 368, rawX - 160)),
+        screenY: Math.max(12, Math.min(viewportSize.h - 330, rawY + 14))
       });
       onSetConnectingSource(null);
     },
@@ -1753,6 +1832,224 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
     }
   }, [activeTool, connectingSource, isReadOnlyMode, nodeMap, onBeginDragSnapshot, onSelect, project.assets, project.nodes, project.settings, scheduleLongPress, selectedNodeIdSet, selectedNodeIds]);
 
+  const handleNodeContextMenu = useCallback(
+    (e: React.MouseEvent, node: DiagramNode) => {
+      e.preventDefault();
+      e.stopPropagation();
+      clearLongPressTimer();
+      setHoveredRackSubDevice(null);
+
+      let targetIds: string[];
+      if (selectedNodeIdSet.has(node.id) && selectedNodeIds.length > 1) {
+        targetIds = selectedNodeIds;
+      } else if (node.groupId) {
+        const groupMembers = project.nodes.filter(n => n.groupId === node.groupId).map(n => n.id);
+        if (groupMembers.length > 1) {
+          onSelect('node', node.id, groupMembers.filter(id => id !== node.id));
+          targetIds = groupMembers;
+        } else {
+          if (node.type === 'rack' || node.customData?.rackId) {
+            onSelect('rack', node.customData?.rackId || node.id);
+          } else {
+            onSelect('node', node.id);
+          }
+          targetIds = [node.id];
+        }
+      } else {
+        if (node.type === 'rack' || node.customData?.rackId) {
+          onSelect('rack', node.customData?.rackId || node.id);
+        } else {
+          onSelect('node', node.id);
+        }
+        targetIds = [node.id];
+      }
+
+      openContextMenuAt(e.clientX, e.clientY, 'node', node.id, targetIds);
+    },
+    [clearLongPressTimer, onSelect, openContextMenuAt, project.nodes, selectedNodeIdSet, selectedNodeIds]
+  );
+
+  const handleCableContextMenu = useCallback(
+    (e: React.MouseEvent, cable: CableEdge) => {
+      e.preventDefault();
+      e.stopPropagation();
+      clearLongPressTimer();
+      onSelect('edge', cable.id);
+      openContextMenuAt(e.clientX, e.clientY, 'edge', cable.id);
+    },
+    [clearLongPressTimer, onSelect, openContextMenuAt]
+  );
+
+  const lastCableBundleLayoutRef = useRef<CableBundleLayout | null>(null);
+  const cableBundleLayout = useMemo(() => {
+    if (isTransformingNodes && lastCableBundleLayoutRef.current) {
+      return lastCableBundleLayoutRef.current;
+    }
+    const next = computeCableBundleLayout(visibleCables, getNodeEffectiveRect);
+    lastCableBundleLayoutRef.current = next;
+    return next;
+  }, [isTransformingNodes, visibleCables, getNodeEffectiveRect]);
+
+  const activeBundleInfo: CableBundleInfo | undefined = useMemo(
+    () => (activeBundleId ? cableBundleLayout.bundles.find(b => b.bundleId === activeBundleId) : undefined),
+    [activeBundleId, cableBundleLayout.bundles]
+  );
+
+  const getCableGeometry = useCallback((cable: CableEdge): CanvasCableGeometry | null => {
+    const isMovingCable =
+      isTransformingNodes &&
+      (transformingNodeIdSet.has(cable.sourceNodeId) || transformingNodeIdSet.has(cable.targetNodeId));
+    let info = isMovingCable ? undefined : cableBundleLayout.cablePaths.get(cable.id);
+    if (!info) {
+      const src = getNodeEffectiveRect(cable.sourceNodeId);
+      const tgt = getNodeEffectiveRect(cable.targetNodeId);
+      if (!src || !tgt) return null;
+      const offsetPx = cableBundleLayout.cableOffsets.get(cable.id);
+      if (offsetPx) {
+        const bundleId = cableBundleLayout.cableToBundleId.get(cable.id);
+        const bundle = bundleId ? cableBundleLayout.bundles.find(b => b.bundleId === bundleId) : undefined;
+        info = bundle
+          ? computeBundledCablePath(cable, src, tgt, offsetPx, bundle.normal)
+          : computeCablePath(cable, src, tgt);
+      } else {
+        info = computeCablePath(cable, src, tgt);
+      }
+    }
+    if (!info) return null;
+
+    return {
+      pathD: info.d,
+      pts: info.pts,
+      x1: info.x1,
+      y1: info.y1,
+      x2: info.x2,
+      y2: info.y2,
+      midX: info.midPoint.x,
+      midY: info.midPoint.y,
+      midAngleDeg: info.midAngleDeg
+    };
+  }, [isTransformingNodes, transformingNodeIdSet, cableBundleLayout, getNodeEffectiveRect]);
+
+  const lastCulledBundlesRef = useRef<CableBundleInfo[] | null>(null);
+  const culledBundles = useMemo(() => {
+    if (isTransformingNodes && lastCulledBundlesRef.current) {
+      return lastCulledBundlesRef.current;
+    }
+    const next = filterCableBundlesInViewport(
+      cableBundleLayout.bundles,
+      worldViewportRect,
+      getCableGeometry,
+      activeBundleId,
+      selection.type === 'edge' ? selection.id : undefined
+    );
+    lastCulledBundlesRef.current = next;
+    return next;
+  }, [isTransformingNodes, cableBundleLayout.bundles, worldViewportRect, getCableGeometry, activeBundleId, selection.type, selection.id]);
+
+  const lastStaticNodeRectEntriesRef = useRef<Array<[string, RectBox]> | null>(null);
+  const staticNodeRectEntries = useMemo(() => {
+    if (isTransformingNodes && lastStaticNodeRectEntriesRef.current) {
+      return lastStaticNodeRectEntriesRef.current;
+    }
+    const seen = new Set<string>();
+    const entries: Array<[string, RectBox]> = [];
+    for (const cable of culledVisibleCables) {
+      for (const nodeId of [cable.sourceNodeId, cable.targetNodeId]) {
+        if (seen.has(nodeId)) continue;
+        seen.add(nodeId);
+        const rect = getNodeEffectiveRect(nodeId);
+        if (rect) {
+          entries.push([nodeId, { x: rect.x, y: rect.y, width: rect.width, height: rect.height }]);
+        }
+      }
+    }
+    lastStaticNodeRectEntriesRef.current = entries;
+    return entries;
+  }, [isTransformingNodes, culledVisibleCables, getNodeEffectiveRect]);
+
+  const rasterCableMode = useMemo(
+    () => shouldUseRasterCableLayer(culledVisibleCables.length, isPanning, isTransformingNodes),
+    [culledVisibleCables.length, isPanning, isTransformingNodes]
+  );
+
+  const interactiveCableIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (selection.type === 'edge' && selection.id) ids.add(selection.id);
+    if (hoveredCableId) ids.add(hoveredCableId);
+    if (draggingWaypoint?.cableId) ids.add(draggingWaypoint.cableId);
+    if (reconnectingCable?.cableId) ids.add(reconnectingCable.cableId);
+    if (editingCableLabel?.cableId) ids.add(editingCableLabel.cableId);
+    if (activeBundleInfo) {
+      for (const c of activeBundleInfo.cables) ids.add(c.id);
+    }
+    if (draggingNodeIds && draggingNodeIds.length > 0) {
+      const draggedSet = new Set(draggingNodeIds);
+      for (const c of culledVisibleCables) {
+        if (draggedSet.has(c.sourceNodeId) || draggedSet.has(c.targetNodeId)) {
+          ids.add(c.id);
+        }
+      }
+    }
+    if (resizingNodeId) {
+      for (const c of culledVisibleCables) {
+        if (c.sourceNodeId === resizingNodeId || c.targetNodeId === resizingNodeId) {
+          ids.add(c.id);
+        }
+      }
+    }
+    return ids;
+  }, [
+    selection.type,
+    selection.id,
+    hoveredCableId,
+    draggingWaypoint,
+    reconnectingCable,
+    editingCableLabel,
+    activeBundleInfo,
+    draggingNodeIds,
+    resizingNodeId,
+    culledVisibleCables
+  ]);
+
+  const findRasterCableAtCoord = useCallback(
+    (wx: number, wy: number): CableEdge | null => {
+      const tolWorld = Math.max(8, 12 / Math.max(0.25, zoom));
+      const candidates = cableQuadtree
+        ? cableQuadtree.queryRect({ x: wx - tolWorld, y: wy - tolWorld, width: tolWorld * 2, height: tolWorld * 2 })
+        : culledVisibleCables;
+      for (let i = candidates.length - 1; i >= 0; i--) {
+        const c = candidates[i];
+        const bundleId = cableBundleLayout.cableToBundleId.get(c.id);
+        if (bundleId && collapsedBundleIds.has(bundleId)) continue;
+        const geom = getCableGeometry(c);
+        if (!geom) continue;
+        if (hitTestCablePolyline(wx, wy, geom.pts, tolWorld)) {
+          return c;
+        }
+      }
+      return null;
+    },
+    [cableQuadtree, culledVisibleCables, cableBundleLayout.cableToBundleId, collapsedBundleIds, getCableGeometry, zoom]
+  );
+
+  const handleCanvasContextMenu = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      clearLongPressTimer();
+      if (rasterCableMode) {
+        const coord = clientToCanvasCoord(e.clientX, e.clientY);
+        const hitCable = findRasterCableAtCoord(coord.x, coord.y);
+        if (hitCable) {
+          onSelect('edge', hitCable.id);
+          openContextMenuAt(e.clientX, e.clientY, 'edge', hitCable.id);
+          return;
+        }
+      }
+      openContextMenuAt(e.clientX, e.clientY, 'canvas', 'canvas');
+    },
+    [clearLongPressTimer, clientToCanvasCoord, findRasterCableAtCoord, onSelect, openContextMenuAt, rasterCableMode]
+  );
+
   const startNodeResize = useCallback((
     e: React.PointerEvent,
     nodeId: string,
@@ -1778,7 +2075,66 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
       minH,
       currentRect: rect
     });
-  }, [isReadOnlyMode, onBeginDragSnapshot]);
+  }, [isReadOnlyMode, nodeMap, onBeginDragSnapshot, project.assets, project.settings]);
+
+  const handleRoomSelectAndDragStart = useCallback((e: React.PointerEvent, room: Room) => {
+    const isPrimary = e.pointerType !== 'mouse' || e.button === 0;
+    if (!isPrimary) return;
+    onSelect('room', room.id);
+    const roomLocked = isRoomEffectivelyLocked(room, project.settings, isReadOnlyMode);
+    if (!roomLocked && onMoveRoomTransient) {
+      onBeginDragSnapshot?.();
+      setDraggingRoom({
+        roomId: room.id,
+        lastClientX: e.clientX,
+        lastClientY: e.clientY
+      });
+    }
+  }, [isReadOnlyMode, onBeginDragSnapshot, onMoveRoomTransient, onSelect, project.settings]);
+
+  const handleSelectRoom = useCallback((_e: React.MouseEvent, roomId: string) => {
+    onSelect('room', roomId);
+  }, [onSelect]);
+
+  const handleStartRoomResize = useCallback((e: React.PointerEvent, room: Room, dir: ResizeHandleDir) => {
+    e.stopPropagation();
+    if (isRoomEffectivelyLocked(room, project.settings, isReadOnlyMode)) return;
+    onBeginDragSnapshot?.();
+    setResizingSession({
+      targetKind: 'room',
+      targetId: room.id,
+      handle: dir,
+      originClientX: e.clientX,
+      originClientY: e.clientY,
+      initialRect: { x: room.x, y: room.y, width: room.width, height: room.height },
+      rotationDeg: 0,
+      minW: 60,
+      minH: 45,
+      currentRect: { x: room.x, y: room.y, width: room.width, height: room.height }
+    });
+  }, [isReadOnlyMode, onBeginDragSnapshot, project.settings]);
+
+  const handleDoubleClickDeviceNode = useCallback((nodeId: string, assetId?: string) => {
+    onOpenDeepInspect(assetId || nodeId);
+  }, [onOpenDeepInspect]);
+
+  const handleToggleNodeIconPicker = useCallback((nodeId: string) => {
+    setNodeIconUploadError(null);
+    setIconPickerNodeId(prev => (prev === nodeId ? null : nodeId));
+  }, []);
+
+  const handleDevicePortClick = useCallback((e: React.MouseEvent, nodeId: string) => {
+    e.stopPropagation();
+    if (connectingSource) {
+      if (connectingSource.nodeId !== nodeId) {
+        initiateConnectionOrOpenPortPicker(connectingSource.nodeId, nodeId, e.clientX, e.clientY);
+      } else {
+        onSetConnectingSource(null);
+      }
+    } else {
+      onSetConnectingSource({ nodeId });
+    }
+  }, [connectingSource, initiateConnectionOrOpenPortPicker, onSetConnectingSource]);
 
   const getDeviceColor = useCallback((cat?: string) => {
     switch (cat) {
@@ -1797,39 +2153,70 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
     }
   }, []);
 
-  const cableBundleLayout = useMemo(
-    () => computeCableBundleLayout(visibleCables, getNodeEffectiveRect),
-    [visibleCables, getNodeEffectiveRect]
+  const handleToggleRackSide = useCallback((rackId: string, nextSide: RackSide) => {
+    setRackSides(prev => ({ ...prev, [rackId]: nextSide }));
+  }, []);
+
+  const handleToggleRackCollapse = useMemo(
+    () =>
+      onUpdateNode
+        ? (targetRackNode: DiagramNode) => {
+            onUpdateNode(targetRackNode.id, {
+              customData: {
+                ...(targetRackNode.customData || {}),
+                collapsed: !isRackNodeCollapsed(targetRackNode)
+              }
+            });
+          }
+        : undefined,
+    [onUpdateNode]
   );
 
-  const activeBundleInfo: CableBundleInfo | undefined = useMemo(
-    () => (activeBundleId ? cableBundleLayout.bundles.find(b => b.bundleId === activeBundleId) : undefined),
-    [activeBundleId, cableBundleLayout.bundles]
+  const handleToggleRackThermalOverlay = useMemo(
+    () =>
+      onUpdateNode
+        ? (targetRackNode: DiagramNode) => {
+            const currentVisible = targetRackNode.customData?.showThermalOverlay !== false;
+            onUpdateNode(targetRackNode.id, {
+              customData: {
+                ...(targetRackNode.customData || {}),
+                showThermalOverlay: !currentVisible
+              }
+            });
+          }
+        : undefined,
+    [onUpdateNode]
   );
 
-  const getCableGeometry = useCallback((cable: CableEdge): CanvasCableGeometry | null => {
-    const info = cableBundleLayout.cablePaths.get(cable.id) || (() => {
-      const src = getNodeEffectiveRect(cable.sourceNodeId);
-      const tgt = getNodeEffectiveRect(cable.targetNodeId);
-      if (!src || !tgt) return null;
-      return computeCablePath(cable, src, tgt);
-    })();
-    if (!info) return null;
+  const handleToggleActiveBundle = useCallback((bundleId: string) => {
+    setActiveBundleId(prev => (prev === bundleId ? null : bundleId));
+  }, []);
 
-    return {
-      pathD: info.d,
-      pts: info.pts,
-      x1: info.x1,
-      y1: info.y1,
-      x2: info.x2,
-      y2: info.y2,
-      midX: info.midPoint.x,
-      midY: info.midPoint.y,
-      midAngleDeg: info.midAngleDeg
-    };
-  }, [cableBundleLayout.cablePaths, getNodeEffectiveRect]);
+  const handleSelectEdge = useCallback((cableId: string) => {
+    onSelect('edge', cableId);
+  }, [onSelect]);
 
+  const handleHoverCable = useCallback((cableId: string | null) => {
+    setHoveredCableId(cableId);
+  }, []);
+
+  const handleStartWaypointDrag = useCallback((cableId: string, pointIndex: number) => {
+    setDraggingWaypoint({ cableId, pointIndex });
+  }, []);
+
+  const handleStartCableReconnect = useCallback(
+    (cableId: string, endpoint: 'source' | 'target', anchorX: number, anchorY: number) => {
+      setReconnectingCable({ cableId, endpoint, anchorX, anchorY });
+    },
+    []
+  );
+
+  const isTransformingAnyGeometry = isTransformingNodes || Boolean(draggingRoom) || Boolean(resizingSession);
+  const lastMinimapBoundsRef = useRef<{ minX: number; minY: number; width: number; height: number } | null>(null);
   const minimapBounds = useMemo(() => {
+    if (isTransformingAnyGeometry && lastMinimapBoundsRef.current) {
+      return lastMinimapBoundsRef.current;
+    }
     let minX = 0;
     let minY = 0;
     let maxX = 1400;
@@ -1846,13 +2233,15 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
       maxX = Math.max(maxX, r.x + r.width + 80);
       maxY = Math.max(maxY, r.y + r.height + 80);
     });
-    return {
+    const next = {
       minX,
       minY,
       width: Math.max(800, maxX - minX),
       height: Math.max(500, maxY - minY)
     };
-  }, [visibleNodes, visibleRooms]);
+    lastMinimapBoundsRef.current = next;
+    return next;
+  }, [isTransformingAnyGeometry, visibleNodes, visibleRooms]);
 
   const connectingSourceRect = connectingSource ? getNodeEffectiveRect(connectingSource.nodeId) : null;
   const connectingSourceNode = connectingSource ? nodeMap.get(connectingSource.nodeId) : undefined;
@@ -1891,16 +2280,10 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
       onPointerCancelCapture={handlePointerUpCapture}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
-      onPointerEnter={() => {
-        cursorInsideCanvasRef.current = true;
-      }}
-      onPointerLeave={() => {
-        cursorInsideCanvasRef.current = false;
-      }}
       onPointerUp={handlePointerUp}
       onPointerCancel={handlePointerCancel}
-      onContextMenu={handleCanvasContextMenu}
       onWheel={handleWheel}
+      onContextMenu={handleCanvasContextMenu}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
@@ -1944,18 +2327,16 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
         />
       )}
 
-      {/* Main Vector SVG World */}
+      {/* Backdrop World SVG (Grid, Floor Image, Rooms, Trays, Heatmaps) */}
       <svg
-        id="hachihi-main-svg"
-        role="img"
-        aria-label={svgAriaLabel}
+        data-layer="world-backdrop"
+        aria-hidden="true"
         className="w-full h-full absolute inset-0"
         style={{
           transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
           transformOrigin: '0 0'
         }}
       >
-        <title>{svgAriaLabel}</title>
 
         {/* CAD Grid / Pattern */}
         {canvasAppearance.pattern !== 'none' && (
@@ -2015,211 +2396,26 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
         )}
 
         {/* 1. LAYER: ROOMS */}
-        {visibleRooms.map(room => {
-          const isSelected = selection.type === 'room' && selection.id === room.id;
-          const invZ = 1 / Math.max(0.45, Math.min(zoom, 1.8));
-          const handleSize = 8 * invZ;
+        {culledVisibleRooms.map(room => (
+          <CanvasRoomNode
+            key={room.id}
+            room={room}
+            isSelected={selection.type === 'room' && selection.id === room.id}
+            roomLocked={isRoomEffectivelyLocked(room, project.settings, isReadOnlyMode)}
+            zoom={zoom}
+            scale={project.settings.scale}
+            isPointerPassthrough={!isReadOnlyMode && (activeTool === 'connect' || Boolean(connectingSource) || activeTool === 'room')}
+            onSelectAndDragStart={handleRoomSelectAndDragStart}
+            onSelectRoom={handleSelectRoom}
+            onStartResize={handleStartRoomResize}
+          />
+        ))}
 
-          const roomLocked = isRoomEffectivelyLocked(room, project.settings, isReadOnlyMode);
-
-          const startRoomResize = (e: React.PointerEvent, dir: ResizeHandleDir) => {
-            e.stopPropagation();
-            if (roomLocked) return;
-            onBeginDragSnapshot?.();
-            setResizingSession({
-              targetKind: 'room',
-              targetId: room.id,
-              handle: dir,
-              originClientX: e.clientX,
-              originClientY: e.clientY,
-              initialRect: { x: room.x, y: room.y, width: room.width, height: room.height },
-              rotationDeg: 0,
-              minW: 60,
-              minH: 45,
-              currentRect: { x: room.x, y: room.y, width: room.width, height: room.height }
-            });
-          };
-
-          const getRoomHandlePos = (dir: ResizeHandleDir) => {
-            const cx = room.x + room.width / 2;
-            const cy = room.y + room.height / 2;
-            switch (dir) {
-              case 'nw': return { x: room.x, y: room.y };
-              case 'n': return { x: cx, y: room.y };
-              case 'ne': return { x: room.x + room.width, y: room.y };
-              case 'e': return { x: room.x + room.width, y: cy };
-              case 'se': return { x: room.x + room.width, y: room.y + room.height };
-              case 's': return { x: cx, y: room.y + room.height };
-              case 'sw': return { x: room.x, y: room.y + room.height };
-              case 'w': return { x: room.x, y: cy };
-            }
-          };
-
-          return (
-            <g
-              key={room.id}
-              onPointerDown={(e) => {
-                e.stopPropagation();
-                if (!isReadOnlyMode && (activeTool === 'connect' || connectingSource || activeTool === 'room')) return;
-                const isPrimary = e.pointerType !== 'mouse' || e.button === 0;
-                if (!isPrimary) return;
-                onSelect('room', room.id);
-                if (!roomLocked && onMoveRoomTransient) {
-                  onBeginDragSnapshot?.();
-                  setDraggingRoom({
-                    roomId: room.id,
-                    lastClientX: e.clientX,
-                    lastClientY: e.clientY
-                  });
-                }
-              }}
-              onClick={(e) => {
-                e.stopPropagation();
-                onSelect('room', room.id);
-              }}
-              className={roomLocked ? 'cursor-pointer' : 'cursor-move'}
-            >
-              <rect
-                x={room.x}
-                y={room.y}
-                width={room.width}
-                height={room.height}
-                fill={room.color || '#f8fafc'}
-                stroke={isSelected ? '#2563eb' : '#94a3b8'}
-                strokeWidth={isSelected ? 2.5 : room.wallThickness}
-                strokeDasharray={room.type === 'utility_riser' ? '6 4' : 'none'}
-                rx="4"
-              />
-              <rect
-                x={room.x}
-                y={room.y}
-                width={room.width}
-                height={22}
-                fill={isSelected ? '#3b82f6' : '#e2e8f0'}
-                opacity={0.85}
-                rx="4"
-              />
-              <text
-                x={room.x + 8}
-                y={room.y + 15}
-                fill={isSelected ? '#ffffff' : '#334155'}
-                fontSize="10"
-                fontWeight="600"
-                className="pointer-events-none"
-              >
-                {room.name} · {((room.width * room.height) / (project.settings.scale * project.settings.scale)).toFixed(0)}m²
-              </text>
-
-              {isSelected && !roomLocked && (
-                <g>
-                  <rect
-                    x={room.x - 2}
-                    y={room.y - 2}
-                    width={room.width + 4}
-                    height={room.height + 4}
-                    fill="none"
-                    stroke="#3b82f6"
-                    strokeWidth={1.2 * invZ}
-                    strokeDasharray={`${4 * invZ} ${3 * invZ}`}
-                    rx="5"
-                    className="pointer-events-none"
-                  />
-                  {RESIZE_HANDLE_DIRS.map(({ dir, cursorClass }) => {
-                    const pos = getRoomHandlePos(dir);
-                    return (
-                      <rect
-                        key={`rm_h_${dir}`}
-                        x={pos.x - handleSize / 2}
-                        y={pos.y - handleSize / 2}
-                        width={handleSize}
-                        height={handleSize}
-                        rx={1.5 * invZ}
-                        fill="#ffffff"
-                        stroke="#2563eb"
-                        strokeWidth={1.5 * invZ}
-                        className={cursorClass}
-                        onPointerDown={(e) => startRoomResize(e, dir)}
-                      />
-                    );
-                  })}
-                </g>
-              )}
-            </g>
-          );
-        })}
-
-        {/* 1b. LAYER: CABLE TRAYS & CONDUITS */}
-        {visibleCableTrays.map(tray => {
-          const ptsStr = tray.points.map(p => `${p.x},${p.y}`).join(' ');
-          const trayW = Math.max(8, tray.widthPx || 16);
-          const baseColor =
-            tray.color ||
-            (tray.kind === 'power_tray' ? '#e11d48' : tray.kind === 'conduit' ? '#0d9488' : '#0284c7');
-          const midPt = tray.points[Math.floor(tray.points.length / 2)] || tray.points[0];
-          const prevPt = tray.points[Math.max(0, Math.floor(tray.points.length / 2) - 1)] || midPt;
-          const labelX = (prevPt.x + midPt.x) / 2;
-          const labelY = (prevPt.y + midPt.y) / 2;
-
-          return (
-            <g key={tray.id} className="pointer-events-none" opacity={0.85}>
-              <polyline
-                points={ptsStr}
-                fill="none"
-                stroke={baseColor}
-                strokeWidth={trayW}
-                strokeOpacity={0.14}
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-              <polyline
-                points={ptsStr}
-                fill="none"
-                stroke={baseColor}
-                strokeWidth={Math.max(2, trayW * 0.72)}
-                strokeOpacity={0.32}
-                strokeDasharray={tray.kind === 'conduit' ? 'none' : '4 5'}
-                strokeLinecap="butt"
-                strokeLinejoin="round"
-              />
-              <polyline
-                points={ptsStr}
-                fill="none"
-                stroke={baseColor}
-                strokeWidth={1.4}
-                strokeOpacity={0.75}
-                strokeDasharray="6 4"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-              {!hiddenLayerSet.has('labels') && (
-                <g transform={`translate(${labelX}, ${labelY - trayW / 2 - 8})`}>
-                  <rect
-                    x={-Math.min(90, tray.name.length * 3.1 + 8)}
-                    y={-8}
-                    width={Math.min(180, tray.name.length * 6.2 + 16)}
-                    height={14}
-                    rx="3"
-                    fill="#ffffff"
-                    fillOpacity={0.92}
-                    stroke={baseColor}
-                    strokeOpacity={0.6}
-                    strokeWidth="0.9"
-                  />
-                  <text
-                    x={0}
-                    y={2}
-                    textAnchor="middle"
-                    fill={baseColor}
-                    fontSize="8"
-                    fontWeight="700"
-                  >
-                    {tray.name}
-                  </text>
-                </g>
-              )}
-            </g>
-          );
-        })}
+        {/* 1b. LAYER: CULLED CABLE TRAYS & CONDUITS */}
+        <CanvasTraysLayer
+          trays={culledVisibleCableTrays}
+          hideLabels={hiddenLayerSet.has('labels')}
+        />
 
         {/* LOGICAL GROUP FRAMES */}
         {groupBounds.map(([grpId, b]) => (
@@ -2343,433 +2539,69 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
           return null;
         })}
 
+      </svg>
+
+      {/* Independent Hardware-Accelerated 2D Canvas Cable Raster Cache Layer */}
+      <CanvasCableRasterLayer
+        active={rasterCableMode}
+        viewportSize={viewportSize}
+        pan={pan}
+        zoom={zoom}
+        culledCables={culledVisibleCables}
+        culledBundles={culledBundles}
+        cableToBundleId={cableBundleLayout.cableToBundleId}
+        collapsedBundleIds={collapsedBundleIds}
+        interactiveCableIds={interactiveCableIds}
+        staticNodeRectEntries={staticNodeRectEntries}
+        getCableGeometry={getCableGeometry}
+        showCableLabels={!hiddenLayerSet.has('cable_labels') && !hiddenLayerSet.has('labels')}
+        showCableCodes={project.settings.showCableCodes}
+        isPanning={isPanning}
+        isTransformingNodes={isTransformingNodes}
+      />
+
+      {/* Interactive Main Vector SVG Layer (Active Cables, Racks, Devices, Handles) */}
+      <svg
+        id="hachihi-main-svg"
+        role="img"
+        aria-label={svgAriaLabel}
+        className="w-full h-full absolute inset-0 pointer-events-none"
+        style={{
+          transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+          transformOrigin: '0 0'
+        }}
+      >
+        <title>{svgAriaLabel}</title>
+        <g style={{ pointerEvents: 'auto' }}>
         {/* 4. LAYER: CABLE BUNDLE JACKETS + CABLES + LABELS */}
-        {cableBundleLayout.bundles.map(bundle => {
-          const isCollapsed = collapsedBundleIds.has(bundle.bundleId);
-          const isBundleActive = activeBundleId === bundle.bundleId;
-          const angleDeg = (Math.atan2(bundle.tangent.y, bundle.tangent.x) * 180) / Math.PI;
-          const firstCable = bundle.cables[0];
-          const trunkGeom = firstCable ? getCableGeometry(firstCable) : null;
-          const hasSelectedMember = selection.type === 'edge' && bundle.cables.some(c => c.id === selection.id);
-
-          return (
-            <g key={`sheath_${bundle.bundleId}`}>
-              {isCollapsed && trunkGeom && (
-                <g
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setActiveBundleId(prev => (prev === bundle.bundleId ? null : bundle.bundleId));
-                  }}
-                  className="cursor-pointer"
-                >
-                  <path d={trunkGeom.pathD} fill="none" stroke="transparent" strokeWidth={18} />
-                  {(isBundleActive || hasSelectedMember) && (
-                    <path
-                      d={trunkGeom.pathD}
-                      fill="none"
-                      stroke="#3b82f6"
-                      strokeOpacity={0.35}
-                      strokeWidth={Math.min(10, 3.5 + bundle.cables.length * 0.9) + 6}
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    />
-                  )}
-                  <path
-                    d={trunkGeom.pathD}
-                    fill="none"
-                    stroke={bundle.primaryColor}
-                    strokeWidth={Math.min(10, 3.5 + bundle.cables.length * 0.9)}
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    opacity={0.92}
-                  />
-                  <path
-                    d={trunkGeom.pathD}
-                    fill="none"
-                    stroke="#ffffff"
-                    strokeWidth={1.2}
-                    strokeDasharray="4 6"
-                    strokeLinecap="round"
-                    opacity={0.65}
-                  />
-                </g>
-              )}
-
-              <g
-                transform={`translate(${bundle.midPoint.x}, ${bundle.midPoint.y}) rotate(${angleDeg})`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setActiveBundleId(prev => (prev === bundle.bundleId ? null : bundle.bundleId));
-                }}
-                className="cursor-pointer"
-              >
-                <rect
-                  x={-11}
-                  y={-(bundle.spanWidthPx / 2 + 4)}
-                  width={22}
-                  height={bundle.spanWidthPx + 8}
-                  rx="6"
-                  fill={isBundleActive ? '#dbeafe' : '#eff6ff'}
-                  fillOpacity={project.settings.isDarkMode ? 0.2 : 0.85}
-                  stroke={isBundleActive || hasSelectedMember ? '#2563eb' : '#60a5fa'}
-                  strokeWidth={isBundleActive ? 1.8 : 1.1}
-                  strokeDasharray={isCollapsed ? 'none' : '3 2'}
-                />
-                <line
-                  x1={-5}
-                  y1={-(bundle.spanWidthPx / 2 + 2)}
-                  x2={-5}
-                  y2={bundle.spanWidthPx / 2 + 2}
-                  stroke={isBundleActive ? '#1d4ed8' : '#3b82f6'}
-                  strokeWidth="1.5"
-                />
-                <line
-                  x1={5}
-                  y1={-(bundle.spanWidthPx / 2 + 2)}
-                  x2={5}
-                  y2={bundle.spanWidthPx / 2 + 2}
-                  stroke={isBundleActive ? '#1d4ed8' : '#3b82f6'}
-                  strokeWidth="1.5"
-                />
-              </g>
-            </g>
-          );
-        })}
-
-        {visibleCables.map(cable => {
-          const isSelected = selection.type === 'edge' && selection.id === cable.id;
-          const isHovered = hoveredCableId === cable.id;
-          const bundleId = cableBundleLayout.cableToBundleId.get(cable.id);
-          const isBundled = Boolean(bundleId);
-          const isBundleCollapsed = Boolean(bundleId && collapsedBundleIds.has(bundleId));
-
-          if (isBundleCollapsed && !isSelected) {
-            return null;
-          }
-
-          const geom = getCableGeometry(cable);
-          if (!geom) return null;
-
-          const { pathD, pts, x1, y1, x2, y2, midX, midY } = geom;
-          const cableColor = normalizeCableColor(cable.color || '#0284c7');
-
-          return (
-            <g
-              key={cable.id}
-              onPointerDown={(e) => {
-                if (e.pointerType === 'touch') {
-                  scheduleLongPress(e.clientX, e.clientY, 'edge', cable.id);
-                }
-              }}
-              onClick={(e) => {
-                e.stopPropagation();
-                onSelect('edge', cable.id);
-              }}
-              onDoubleClick={(e) => {
-                e.stopPropagation();
-                if (!isReadOnlyMode && midX !== 0) {
-                  openInlineCableLabelEditor(cable, midX, midY);
-                }
-              }}
-              onPointerEnter={() => setHoveredCableId(cable.id)}
-              onPointerLeave={() => setHoveredCableId(prev => (prev === cable.id ? null : prev))}
-              className="cursor-pointer group"
-            >
-              <path d={pathD} fill="none" stroke="transparent" strokeWidth={isBundled ? 9 : 14} />
-
-              {(isSelected || isHovered) && (
-                <path
-                  d={pathD}
-                  fill="none"
-                  stroke={cableColor}
-                  strokeOpacity={isSelected ? 0.3 : 0.18}
-                  strokeWidth={cable.strokeWidth + (isSelected ? 8 : 5)}
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-              )}
-
-              <path
-                d={pathD}
-                fill="none"
-                stroke={cableColor}
-                strokeWidth={isSelected ? cable.strokeWidth + 1.5 : isHovered ? cable.strokeWidth + 0.75 : cable.strokeWidth}
-                strokeDasharray={cable.lineStyle === 'dashed' ? '6 4' : 'none'}
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-
-              {isSelected && !isReadOnlyMode && (
-                <g>
-                  {(cable.controlPoints || []).map((cp, idx) => (
-                    <circle
-                      key={`wp_${idx}`}
-                      cx={cp.x}
-                      cy={cp.y}
-                      r={6}
-                      fill="#f59e0b"
-                      stroke="#ffffff"
-                      strokeWidth="2"
-                      className="cursor-move"
-                      onPointerDown={(e) => {
-                        e.stopPropagation();
-                        onBeginDragSnapshot?.();
-                        setDraggingWaypoint({ cableId: cable.id, pointIndex: idx });
-                      }}
-                      onDoubleClick={(e) => {
-                        e.stopPropagation();
-                        if (onUpdateCable) {
-                          const nextPts = (cable.controlPoints || []).filter((_, i) => i !== idx);
-                          onUpdateCable(cable.id, { controlPoints: nextPts.length ? nextPts : undefined });
-                        }
-                      }}
-                    >
-                      <title>Kéo để chỉnh điểm uốn · Nhấp đúp để xóa điểm uốn</title>
-                    </circle>
-                  ))}
-
-                  {pts.slice(0, -1).map((pA, segIdx) => {
-                    const pB = pts[segIdx + 1];
-                    const sx = (pA.x + pB.x) / 2;
-                    const sy = (pA.y + pB.y) / 2;
-                    return (
-                      <g
-                        key={`add_wp_${segIdx}`}
-                        transform={`translate(${sx}, ${sy})`}
-                        className="cursor-pointer opacity-75 hover:opacity-100"
-                        onPointerDown={(e) => {
-                          e.stopPropagation();
-                          if (onUpdateCableControlPoints) {
-                            onBeginDragSnapshot?.();
-                            const existing = [...(cable.controlPoints || [])];
-                            existing.splice(segIdx, 0, { x: sx, y: sy });
-                            onUpdateCableControlPoints(cable.id, existing);
-                            setDraggingWaypoint({ cableId: cable.id, pointIndex: segIdx });
-                          }
-                        }}
-                      >
-                        <circle r={5} fill="#eff6ff" stroke="#2563eb" strokeWidth="1.5" strokeDasharray="2 1" />
-                        <text x="0" y="3" textAnchor="middle" fill="#1d4ed8" fontSize="9" fontWeight="bold">+</text>
-                        <title>Kéo để thêm điểm uốn mới</title>
-                      </g>
-                    );
-                  })}
-
-                  <circle
-                    cx={x1}
-                    cy={y1}
-                    r={6.5}
-                    fill="#10b981"
-                    stroke="#ffffff"
-                    strokeWidth="2"
-                    className="cursor-crosshair"
-                    onPointerDown={(e) => {
-                      e.stopPropagation();
-                      setReconnectingCable({ cableId: cable.id, endpoint: 'source', anchorX: x2, anchorY: y2 });
-                    }}
-                  >
-                    <title>Kéo đầu cáp nguồn sang thiết bị khác</title>
-                  </circle>
-
-                  <circle
-                    cx={x2}
-                    cy={y2}
-                    r={6.5}
-                    fill="#06b6d4"
-                    stroke="#ffffff"
-                    strokeWidth="2"
-                    className="cursor-crosshair"
-                    onPointerDown={(e) => {
-                      e.stopPropagation();
-                      setReconnectingCable({ cableId: cable.id, endpoint: 'target', anchorX: x1, anchorY: y1 });
-                    }}
-                  >
-                    <title>Kéo đầu cáp đích sang thiết bị khác</title>
-                  </circle>
-                </g>
-              )}
-            </g>
-          );
-        })}
-
-        {!hiddenLayerSet.has('labels') && !hiddenLayerSet.has('cable_labels') && cableBundleLayout.bundles.map(bundle => {
-          const isBundleActive = activeBundleId === bundle.bundleId;
-          const isCollapsed = collapsedBundleIds.has(bundle.bundleId);
-          const colorDots = (bundle.distinctColors || [bundle.primaryColor]).slice(0, 4);
-          const dotsW = colorDots.length * 7 + 4;
-          const badgeW = Math.max(82, bundle.summaryLabel.length * 5.8 + 14 + dotsW);
-          const labelYOffset = -(bundle.spanWidthPx / 2 + 17);
-
-          return (
-            <g
-              key={`badge_${bundle.bundleId}`}
-              transform={`translate(${bundle.midPoint.x}, ${bundle.midPoint.y + labelYOffset})`}
-              onClick={(e) => {
-                e.stopPropagation();
-                setActiveBundleId(prev => (prev === bundle.bundleId ? null : bundle.bundleId));
-              }}
-              className="cursor-pointer"
-            >
-              <rect
-                x={-badgeW / 2}
-                y={-9.5}
-                width={badgeW}
-                height={19}
-                rx="4"
-                fill={isBundleActive ? '#1d4ed8' : isCollapsed ? '#0f172a' : '#ffffff'}
-                stroke={isBundleActive ? '#1e40af' : bundle.primaryColor}
-                strokeWidth="1.3"
-              />
-              {colorDots.map((cColor, idx) => (
-                <circle
-                  key={`bdot_${idx}`}
-                  cx={-badgeW / 2 + 9 + idx * 7}
-                  cy={0}
-                  r="2.6"
-                  fill={cColor}
-                  stroke={isBundleActive || isCollapsed ? '#ffffff' : '#0f172a'}
-                  strokeOpacity="0.25"
-                  strokeWidth="0.6"
-                />
-              ))}
-              <text
-                x={dotsW / 2 - 2}
-                y="3"
-                textAnchor="middle"
-                fill={isBundleActive || isCollapsed ? '#ffffff' : '#1e3a8a'}
-                fontSize="8.5"
-                fontWeight="700"
-                fontFamily="monospace"
-              >
-                {bundle.summaryLabel}
-              </text>
-              <title>Nhấn để xem danh sách cáp trong bó hoặc gộp/tách đường dây</title>
-            </g>
-          );
-        })}
-
-        {!hiddenLayerSet.has('cable_labels') && !hiddenLayerSet.has('labels') && (
-          <g data-layer="cable-labeling">
-            {visibleCables.map(cable => {
-              const isSelected = selection.type === 'edge' && selection.id === cable.id;
-              const isHovered = hoveredCableId === cable.id;
-              const bundleId = cableBundleLayout.cableToBundleId.get(cable.id);
-              const isBundled = Boolean(bundleId);
-              const isBundleCollapsed = Boolean(bundleId && collapsedBundleIds.has(bundleId));
-
-              if (isBundleCollapsed && !isSelected) {
-                return null;
-              }
-
-              const geom = getCableGeometry(cable);
-              if (!geom || geom.midX === 0 || editingCableLabel?.cableId === cable.id) {
-                return null;
-              }
-
-              const cableColor = normalizeCableColor(cable.color || '#0284c7');
-              const hasCustomLabel = Boolean(cable.label && cable.label.trim().length > 0);
-              const showBadge =
-                (project.settings.showCableCodes || hasCustomLabel) &&
-                (!isBundled || isSelected || isHovered || hasCustomLabel);
-
-              const lt = resolveCableLabelTransform(cable, {
-                midPoint: { x: geom.midX, y: geom.midY },
-                midAngleDeg: geom.midAngleDeg
-              });
-
-              if (!showBadge) {
-                if (!isSelected || isBundled || isReadOnlyMode) return null;
-                return (
-                  <g
-                    key={`lbl_add_${cable.id}`}
-                    transform={`translate(${lt.x}, ${lt.y}) rotate(${lt.angleDeg})`}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      openInlineCableLabelEditor(cable, lt.x, lt.y);
-                    }}
-                    className="cursor-text"
-                  >
-                    <rect
-                      x="-38"
-                      y="-10"
-                      width="76"
-                      height="20"
-                      rx="4"
-                      fill="#f8fafc"
-                      stroke={cableColor}
-                      strokeWidth="1.1"
-                      strokeDasharray="3 2"
-                    />
-                    <text
-                      x="0"
-                      y="3"
-                      textAnchor="middle"
-                      fill="#334155"
-                      fontSize="8.5"
-                      fontWeight="600"
-                    >
-                      + Thêm nhãn
-                    </text>
-                  </g>
-                );
-              }
-
-              const halfH = lt.badgeHeight / 2;
-              const badgeLeft = -lt.badgeWidth / 2;
-              const dotR = Math.max(2.4, Math.min(4.2, lt.fontSize * 0.28));
-              const dotCx = badgeLeft + dotR + 5.5;
-              const textOffsetX = dotR * 0.9 + 2;
-
-              return (
-                <g
-                  key={`lbl_${cable.id}`}
-                  transform={`translate(${lt.x}, ${lt.y}) rotate(${lt.angleDeg})`}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onSelect('edge', cable.id);
-                  }}
-                  onDoubleClick={(e) => {
-                    e.stopPropagation();
-                    if (!isReadOnlyMode) {
-                      openInlineCableLabelEditor(cable, lt.x, lt.y);
-                    }
-                  }}
-                  onPointerEnter={() => setHoveredCableId(cable.id)}
-                  onPointerLeave={() => setHoveredCableId(prev => (prev === cable.id ? null : prev))}
-                  className="cursor-pointer"
-                >
-                  <rect
-                    x={badgeLeft}
-                    y={-halfH}
-                    width={lt.badgeWidth}
-                    height={lt.badgeHeight}
-                    rx="4"
-                    fill="#ffffff"
-                    fillOpacity={isSelected ? 0.99 : 0.95}
-                    stroke={cableColor}
-                    strokeWidth={isSelected ? 1.8 : 1.1}
-                    filter={isSelected ? 'drop-shadow(0 2px 5px rgba(37,99,235,0.22))' : 'drop-shadow(0 1px 2px rgba(15,23,42,0.10))'}
-                  />
-                  <circle cx={dotCx} cy="0" r={dotR} fill={cableColor} />
-                  <text
-                    x={textOffsetX}
-                    y={lt.fontSize * 0.35}
-                    textAnchor="middle"
-                    fill="#0f172a"
-                    fontSize={lt.fontSize}
-                    fontWeight={hasCustomLabel ? '700' : '600'}
-                    fontFamily={hasCustomLabel ? 'system-ui, sans-serif' : 'monospace'}
-                  >
-                    {lt.text}
-                  </text>
-                  <title>
-                    {`${lt.text} (${lt.angleDeg}° · ${lt.fontSize}px)${isReadOnlyMode ? '' : ' — Nhấp đúp để sửa nhanh'}`}
-                  </title>
-                </g>
-              );
-            })}
-          </g>
-        )}
+        <CanvasCablesLayer
+          rasterActive={rasterCableMode}
+          culledCables={culledVisibleCables}
+          culledBundles={culledBundles}
+          cableBundleLayout={cableBundleLayout}
+          interactiveCableIds={interactiveCableIds}
+          collapsedBundleIds={collapsedBundleIds}
+          activeBundleId={activeBundleId}
+          selection={selection}
+          hoveredCableId={hoveredCableId}
+          editingCableLabelId={editingCableLabel?.cableId ?? null}
+          isDarkMode={project.settings.isDarkMode}
+          isReadOnlyMode={isReadOnlyMode}
+          hideLabels={hiddenLayerSet.has('labels') || hiddenLayerSet.has('cable_labels')}
+          showCableCodes={project.settings.showCableCodes}
+          getCableGeometry={getCableGeometry}
+          onToggleActiveBundle={handleToggleActiveBundle}
+          onSelectEdge={handleSelectEdge}
+          onScheduleLongPress={scheduleLongPress}
+          onCableContextMenu={handleCableContextMenu}
+          onOpenInlineCableLabelEditor={openInlineCableLabelEditor}
+          onHoverCable={handleHoverCable}
+          onBeginDragSnapshot={onBeginDragSnapshot}
+          onStartWaypointDrag={handleStartWaypointDrag}
+          onUpdateCable={onUpdateCable}
+          onUpdateCableControlPoints={onUpdateCableControlPoints}
+          onStartReconnect={handleStartCableReconnect}
+        />
 
         {reconnectingCable && !isReadOnlyMode && (
           <line
@@ -2798,7 +2630,7 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
         )}
 
         {/* 5. LAYER: INTERACTIVE 19-INCH SERVER RACKS */}
-        {visibleRackNodes.map(rackNode => (
+        {culledRackNodes.map(rackNode => (
           <CanvasRackNode
             key={rackNode.id}
             rackNode={rackNode}
@@ -2820,12 +2652,15 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
             onNodeClick={handleNodeClick}
             onSelect={onSelect}
             onOpenDeepInspect={onOpenDeepInspect}
-            onToggleRackSide={(rackId, nextSide) =>
-              setRackSides(prev => ({ ...prev, [rackId]: nextSide }))
-            }
+            onToggleRackSide={handleToggleRackSide}
             onStartDraggingRackDevice={setDraggingRackDevice}
             onRemoveDeviceFromRackSlot={onRemoveDeviceFromRackSlot}
+            onToggleRackCollapse={handleToggleRackCollapse}
+            hoveredSubDeviceAssetId={hoveredRackSubDevice?.asset.id ?? null}
+            onHoverSubDevice={handleHoverRackSubDevice}
+            onToggleRackThermalOverlay={handleToggleRackThermalOverlay}
             onStartResize={startNodeResize}
+            onNodeContextMenu={handleNodeContextMenu}
           />
         ))}
 
@@ -2833,62 +2668,12 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
         {culledDeviceNodes.map(node => {
           const isSelected = selectedNodeIdSet.has(node.id);
           const isSingleSelected = isSelected && selectedNodeIds.length === 1;
-          const isConnectingFromThis = connectingSource?.nodeId === node.id;
-          const isTargetCandidate =
-            !isReadOnlyMode &&
-            ((connectingSource && connectingSource.nodeId !== node.id) ||
-              (reconnectingCable && hoveredNodeId === node.id));
-          const asset = node.assetId ? project.assets[node.assetId] : undefined;
-
-          const resolvedCustomIcon = node.customIcon || asset?.customIcon;
-          const resolvedCustomImage = sanitizeSafeImageUrl(node.customImageUrl || asset?.customImageUrl);
-          const isBrandLogo = Boolean(resolvedCustomIcon && resolvedCustomIcon.startsWith('logo_'));
-          const shapeRx =
-            node.style.shape === 'circle'
-              ? Math.max(node.width, node.height) / 2
-              : node.style.shape === 'rect'
-              ? 2
-              : 8;
-
-          const minDim = Math.min(node.width, node.height);
-          const isExpandedLayout = node.height >= 72 || (node.width <= 96 && node.height >= 56);
-          const iconBoxPx = isExpandedLayout
-            ? Math.min(58, Math.max(24, Math.round(minDim * 0.44)))
-            : Math.min(40, Math.max(22, Math.round(node.height * 0.54)));
-          const iconInnerPx = Math.max(14, Math.round(iconBoxPx * (resolvedCustomImage || isBrandLogo ? 0.88 : 0.62)));
-          const showIpPill = Boolean(
-            project.settings.showIpAddresses &&
-            !hiddenLayerSet.has('labels') &&
-            (asset?.ipAddress || asset?.vlan) &&
-            node.height >= 46
-          );
-
-          const invZ = 1 / Math.max(0.45, Math.min(zoom, 1.8));
-          const handleSize = 7.5 * invZ;
-          const framePad = 5 * invZ;
-
-          const getNodeResizeHandlePos = (dir: ResizeHandleDir) => {
-            const left = -framePad;
-            const right = node.width + framePad;
-            const top = -framePad;
-            const bottom = node.height + framePad;
-            const cx = node.width / 2;
-            const cy = node.height / 2;
-            switch (dir) {
-              case 'nw': return { x: left, y: top };
-              case 'n': return { x: cx, y: top };
-              case 'ne': return { x: right, y: top };
-              case 'e': return { x: right, y: cy };
-              case 'se': return { x: right, y: bottom };
-              case 's': return { x: cx, y: bottom };
-              case 'sw': return { x: left, y: bottom };
-              case 'w': return { x: left, y: cy };
-            }
-          };
-
           const isOverlapping = overlapReport.overlappingNodeIds.has(node.id);
 
           if (node.type === 'legend') {
+            const invZ = 1 / Math.max(0.45, Math.min(zoom, 1.8));
+            const handleSize = 7.5 * invZ;
+            const framePad = 5 * invZ;
             return (
               <CanvasLegendNode
                 key={node.id}
@@ -2902,368 +2687,51 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
                 framePad={framePad}
                 handleSize={handleSize}
                 invZ={invZ}
-                getNodeResizeHandlePos={getNodeResizeHandlePos}
                 onNodePointerDown={handleNodePointerDown}
                 onNodeClick={handleNodeClick}
                 onHoverChange={setHoveredNodeId}
                 onResizeLegendToFit={onResizeLegendToFit}
                 onStartResize={startNodeResize}
+                onNodeContextMenu={handleNodeContextMenu}
               />
             );
           }
 
+          const asset = node.assetId ? project.assets[node.assetId] : undefined;
+          const isConnectingFromThis = connectingSource?.nodeId === node.id;
+          const isHovered = hoveredNodeId === node.id;
+          const isTargetCandidate = Boolean(
+            !isReadOnlyMode &&
+            ((connectingSource && connectingSource.nodeId !== node.id) ||
+              (reconnectingCable && isHovered))
+          );
+
           return (
-            <g
+            <CanvasDeviceNode
               key={node.id}
-              transform={`translate(${node.x}, ${node.y}) rotate(${node.rotation || 0}, ${node.width / 2}, ${node.height / 2})`}
-              onPointerDown={(e) => handleNodePointerDown(e, node)}
-              onClick={(e) => handleNodeClick(e, node)}
-              onPointerEnter={() => setHoveredNodeId(node.id)}
-              onPointerLeave={() => setHoveredNodeId(null)}
-              onDoubleClick={(e) => {
-                e.stopPropagation();
-                if (asset) onOpenDeepInspect(asset.id);
-                else onOpenDeepInspect(node.id);
-              }}
-              className={`select-none group ${
-                connectingSource && !isReadOnlyMode
-                  ? 'cursor-pointer'
-                  : isReadOnlyMode
-                  ? 'cursor-pointer'
-                  : node.locked
-                  ? 'cursor-not-allowed'
-                  : 'cursor-move'
-              }`}
-            >
-              {isTargetCandidate && (
-                <rect
-                  x="-4"
-                  y="-4"
-                  width={node.width + 8}
-                  height={node.height + 8}
-                  fill="none"
-                  stroke="#22c55e"
-                  strokeWidth="2.5"
-                  strokeDasharray="4 4"
-                  rx={shapeRx + 4}
-                />
-              )}
-
-              {isOverlapping && (
-                <g className="pointer-events-none">
-                  <rect
-                    x={-4.5}
-                    y={-4.5}
-                    width={node.width + 9}
-                    height={node.height + 9}
-                    fill="none"
-                    stroke="#ef4444"
-                    strokeWidth="2.4"
-                    strokeDasharray="5 3"
-                    rx={shapeRx + 4}
-                  />
-                  <rect x={0} y={-17} width="78" height="14" rx="3" fill="#dc2626" />
-                  <text x="39" y="-7" textAnchor="middle" fill="#ffffff" fontSize="8" fontWeight="700">
-                    ! Chồng lấn
-                  </text>
-                  <title>Cảnh báo: Thiết bị đang chồng lấn vị trí với đối tượng khác</title>
-                </g>
-              )}
-
-              {isSelected && (
-                <rect
-                  x={isSingleSelected && !node.locked && !isReadOnlyMode ? -framePad : -3}
-                  y={isSingleSelected && !node.locked && !isReadOnlyMode ? -framePad : -3}
-                  width={node.width + (isSingleSelected && !node.locked && !isReadOnlyMode ? framePad * 2 : 6)}
-                  height={node.height + (isSingleSelected && !node.locked && !isReadOnlyMode ? framePad * 2 : 6)}
-                  fill="none"
-                  stroke="#3b82f6"
-                  strokeWidth={isSingleSelected ? 1.5 * invZ : 2}
-                  strokeDasharray={isSingleSelected && !node.locked && !isReadOnlyMode ? `${3.5 * invZ} ${2.5 * invZ}` : undefined}
-                  rx={node.style.shape === 'circle' ? shapeRx + 4 : shapeRx + 3}
-                />
-              )}
-
-              {(() => {
-                const isTextNode = node.type === 'text';
-                const isZoneNode = node.type === 'zone';
-                const isWallNode = node.type === 'wall';
-                const isNeutralCatalogCard =
-                  !isTextNode &&
-                  !isZoneNode &&
-                  !isWallNode &&
-                  isStandardCatalogNodeColor(node.style.backgroundColor);
-
-                const cardFill = isTextNode
-                  ? canvasAppearance.isDarkCanvas
-                    ? '#1e293b'
-                    : '#ffffff'
-                  : isNeutralCatalogCard
-                  ? canvasAppearance.isDarkCanvas
-                    ? '#1e293b'
-                    : '#ffffff'
-                  : node.style.backgroundColor || '#155eef';
-
-                const cardStroke = isOverlapping
-                  ? '#dc2626'
-                  : isSelected || isConnectingFromThis
-                  ? '#155eef'
-                  : isNeutralCatalogCard
-                  ? canvasAppearance.isDarkCanvas
-                    ? '#334155'
-                    : '#cbd5e1'
-                  : node.style.borderColor || '#334155';
-
-                const iconAccent = getCategoryAccentColor(asset?.category || node.type);
-
-                if (isTextNode) {
-                  return (
-                    <>
-                      <rect
-                        width={node.width}
-                        height={node.height}
-                        fill={cardFill}
-                        fillOpacity={0.94}
-                        stroke={isOverlapping ? '#dc2626' : isSelected ? '#155eef' : canvasAppearance.isDarkCanvas ? '#475569' : '#cbd5e1'}
-                        strokeWidth={isSelected ? 1.8 : 1}
-                        strokeDasharray={isSelected ? undefined : '4 3'}
-                        rx={shapeRx}
-                      />
-                      <foreignObject x="0" y="0" width={node.width} height={node.height} className="pointer-events-none">
-                        <div
-                          style={{ fontSize: node.style.fontSize || 12 }}
-                          className={`w-full h-full px-2.5 py-1.5 flex items-center font-medium leading-snug break-words ${
-                            canvasAppearance.isDarkCanvas ? 'text-slate-100' : 'text-slate-800'
-                          }`}
-                        >
-                          {node.label}
-                        </div>
-                      </foreignObject>
-                    </>
-                  );
-                }
-
-                if (isZoneNode) {
-                  return (
-                    <>
-                      <rect
-                        width={node.width}
-                        height={node.height}
-                        fill={node.style.backgroundColor || '#EFF6FF'}
-                        fillOpacity={0.42}
-                        stroke={isOverlapping ? '#dc2626' : isSelected ? '#155eef' : node.style.borderColor || '#155EEF'}
-                        strokeWidth={isSelected ? 2 : 1.5}
-                        strokeDasharray="6 4"
-                        rx={shapeRx}
-                      />
-                      <foreignObject x="0" y="0" width={node.width} height={28} className="pointer-events-none">
-                        <div className="px-2.5 py-1 text-[11px] font-bold tracking-tight text-blue-900 dark:text-blue-200 truncate">
-                          {node.label}
-                        </div>
-                      </foreignObject>
-                    </>
-                  );
-                }
-
-                return (
-                  <>
-                    <rect
-                      width={node.width}
-                      height={node.height}
-                      fill={cardFill}
-                      stroke={cardStroke}
-                      strokeWidth={isOverlapping ? 2.4 : isSelected ? 2 : 1.25}
-                      rx={shapeRx}
-                      filter={
-                        isOverlapping
-                          ? 'drop-shadow(0 0 8px rgba(220,38,38,0.45))'
-                          : isSelected
-                          ? 'drop-shadow(0 0 8px rgba(21,94,239,0.35))'
-                          : 'drop-shadow(0 1px 3px rgba(15,23,42,0.08))'
-                      }
-                    />
-
-                    <circle
-                      cx={node.width - (node.style.shape === 'circle' ? Math.max(12, node.width * 0.16) : 9)}
-                      cy={node.style.shape === 'circle' ? Math.max(10, node.height * 0.16) : 9}
-                      r="3"
-                      fill={asset?.status === 'online' ? '#16a34a' : asset?.status === 'standby' ? '#f59e0b' : '#dc2626'}
-                    />
-                    {node.locked && (
-                      <g transform={`translate(${node.width - 21}, 3)`} className="pointer-events-none">
-                        <rect width="10" height="10" rx="2" fill="#0f172a" fillOpacity="0.7" />
-                        <Lock x="2" y="2" width="6" height="6" color="#fbbf24" />
-                      </g>
-                    )}
-
-                    <foreignObject x="0" y="0" width={node.width} height={node.height} className="pointer-events-none">
-                      <div
-                        className={`w-full h-full flex ${
-                          isNeutralCatalogCard
-                            ? canvasAppearance.isDarkCanvas
-                              ? 'text-slate-100'
-                              : 'text-slate-900'
-                            : 'text-white'
-                        } ${
-                          isExpandedLayout
-                            ? 'flex-col items-center justify-center gap-1 p-1.5 text-center'
-                            : 'flex-col justify-between p-1.5'
-                        }`}
-                      >
-                        <div
-                          className={`flex items-center overflow-hidden ${
-                            isExpandedLayout ? 'flex-col justify-center gap-1 w-full' : 'gap-1.5'
-                          }`}
-                        >
-                          <div
-                            onPointerDown={isSingleSelected && !connectingSource && !isReadOnlyMode ? (e) => e.stopPropagation() : undefined}
-                            onClick={
-                              isSingleSelected && !connectingSource && !isReadOnlyMode
-                                ? (e) => {
-                                    e.stopPropagation();
-                                    setNodeIconUploadError(null);
-                                    setIconPickerNodeId(prev => (prev === node.id ? null : node.id));
-                                  }
-                                : undefined
-                            }
-                            style={{
-                              width: iconBoxPx,
-                              height: iconBoxPx,
-                              backgroundColor: isNeutralCatalogCard ? iconAccent : 'rgba(0,0,0,0.24)'
-                            }}
-                            className={`rounded-md flex items-center justify-center text-white shrink-0 overflow-hidden transition-transform ${
-                              isSingleSelected && !connectingSource && !isReadOnlyMode
-                                ? 'pointer-events-auto cursor-pointer ring-1 ring-blue-400/70 hover:ring-2 hover:ring-blue-500 hover:scale-105'
-                                : ''
-                            }`}
-                            title={isSingleSelected && !isReadOnlyMode ? 'Nhấn để đổi Icon / Logo' : undefined}
-                          >
-                            <span
-                              style={{ width: iconInnerPx, height: iconInnerPx }}
-                              className="flex items-center justify-center"
-                            >
-                              {renderDeviceVisualIcon({
-                                customIcon: resolvedCustomIcon,
-                                customImageUrl: resolvedCustomImage,
-                                category: asset?.category || node.type,
-                                className: 'w-full h-full'
-                              })}
-                            </span>
-                          </div>
-                          <div
-                            className={`truncate font-semibold leading-tight ${
-                              isExpandedLayout
-                                ? 'w-full px-1 text-center text-[11px]'
-                                : 'text-[11px] pr-3'
-                            }`}
-                          >
-                            {asset?.name || node.label}
-                          </div>
-                        </div>
-
-                        {showIpPill && (
-                          <div
-                            className={`flex items-center justify-between gap-1 font-mono text-[8.5px] px-1.5 py-0.5 rounded truncate tabular-nums ${
-                              isNeutralCatalogCard
-                                ? canvasAppearance.isDarkCanvas
-                                  ? 'bg-slate-800 text-slate-300'
-                                  : 'bg-slate-100 text-slate-600'
-                                : 'bg-black/25 text-white/95'
-                            } ${isExpandedLayout ? 'max-w-[90%]' : ''}`}
-                          >
-                            <span className="truncate">{asset?.ipAddress || ''}</span>
-                            {asset?.vlan && (
-                              <span
-                                className={`text-[7.5px] shrink-0 ${
-                                  isNeutralCatalogCard ? 'text-blue-600 dark:text-blue-400' : 'text-sky-200'
-                                }`}
-                              >
-                                V{asset.vlan.split(',')[0]}
-                              </span>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    </foreignObject>
-                  </>
-                );
-              })()}
-
-              {!isReadOnlyMode && ['top', 'bottom', 'left', 'right'].map(pos => {
-                let px = node.width / 2;
-                let py = 0;
-                if (pos === 'bottom') py = node.height;
-                if (pos === 'left') { px = 0; py = node.height / 2; }
-                if (pos === 'right') { px = node.width; py = node.height / 2; }
-
-                return (
-                  <circle
-                    key={pos}
-                    cx={px}
-                    cy={py}
-                    r={hoveredNodeId === node.id || connectingSource ? 4.5 : 3.2}
-                    fill="#155eef"
-                    stroke="#ffffff"
-                    strokeWidth="1.5"
-                    className={`transition-all ${
-                      hoveredNodeId === node.id || connectingSource
-                        ? 'opacity-100 hover:scale-125 cursor-crosshair'
-                        : 'opacity-0 group-hover:opacity-100'
-                    }`}
-                    onPointerDown={(e) => e.stopPropagation()}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      if (connectingSource) {
-                        if (connectingSource.nodeId !== node.id) {
-                          initiateConnectionOrOpenPortPicker(connectingSource.nodeId, node.id, e.clientX, e.clientY);
-                        } else {
-                          onSetConnectingSource(null);
-                        }
-                      } else {
-                        onSetConnectingSource({ nodeId: node.id });
-                      }
-                    }}
-                  />
-                );
-              })}
-
-              {isSingleSelected && !node.locked && !connectingSource && !isReadOnlyMode && (
-                <g>
-                  {RESIZE_HANDLE_DIRS.map(({ dir, cursorClass }) => {
-                    const pos = getNodeResizeHandlePos(dir);
-                    return (
-                      <rect
-                        key={`nd_h_${dir}`}
-                        x={pos.x - handleSize / 2}
-                        y={pos.y - handleSize / 2}
-                        width={handleSize}
-                        height={handleSize}
-                        rx={1.5 * invZ}
-                        fill="#ffffff"
-                        stroke="#2563eb"
-                        strokeWidth={1.5 * invZ}
-                        className={cursorClass}
-                        onPointerDown={(e) => {
-                          if (node.locked) return;
-                          startNodeResize(
-                            e,
-                            node.id,
-                            dir,
-                            { x: node.x, y: node.y, width: node.width, height: node.height },
-                            node.rotation || 0,
-                            44,
-                            36
-                          );
-                        }}
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        <title>Kéo để thay đổi kích thước (giữ Shift để giữ tỷ lệ)</title>
-                      </rect>
-                    );
-                  })}
-                </g>
-              )}
-            </g>
+              node={node}
+              asset={asset}
+              isSelected={isSelected}
+              isSingleSelected={isSingleSelected}
+              isHovered={isHovered}
+              isOverlapping={isOverlapping}
+              isConnecting={Boolean(connectingSource)}
+              isConnectingFromThis={isConnectingFromThis}
+              isTargetCandidate={isTargetCandidate}
+              isDarkCanvas={canvasAppearance.isDarkCanvas}
+              showIpAddresses={project.settings.showIpAddresses}
+              hideLabels={hiddenLayerSet.has('labels')}
+              isReadOnlyMode={isReadOnlyMode}
+              zoom={zoom}
+              onNodePointerDown={handleNodePointerDown}
+              onNodeClick={handleNodeClick}
+              onNodeContextMenu={handleNodeContextMenu}
+              onHoverChange={setHoveredNodeId}
+              onDoubleClickNode={handleDoubleClickDeviceNode}
+              onToggleIconPicker={handleToggleNodeIconPicker}
+              onPortClick={handleDevicePortClick}
+              onStartResize={startNodeResize}
+            />
           );
         })}
 
@@ -3316,22 +2784,6 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
           </g>
         )}
 
-        {canvasDropGhost && !isReadOnlyMode && (
-          <rect
-            x={canvasDropGhost.x}
-            y={canvasDropGhost.y}
-            width={canvasDropGhost.width}
-            height={canvasDropGhost.height}
-            rx="8"
-            fill="#155EEF"
-            fillOpacity="0.14"
-            stroke="#155EEF"
-            strokeWidth="2"
-            strokeDasharray="6 4"
-            className="pointer-events-none"
-          />
-        )}
-
         {alignmentGuides.map((g, idx) => {
           const isCenter = g.kind === 'center';
           const guideColor = g.sourceKind === 'guide' ? '#06b6d4' : isCenter ? '#0ea5e9' : '#f43f5e';
@@ -3375,80 +2827,6 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
             </g>
           );
         })}
-
-        {gridSnapHighlight && !isReadOnlyMode && (() => {
-          const invZ = 1 / Math.max(0.35, zoom);
-          const arm = Math.max(18, gridSnapHighlight.gridSize * 1.15);
-          const gx = gridSnapHighlight.x;
-          const gy = gridSnapHighlight.y;
-          const badgeText = `${Math.round(gx)}, ${Math.round(gy)}`;
-          const badgeW = (badgeText.length * 6 + 14) * invZ;
-          const badgeH = 16 * invZ;
-          return (
-            <g data-testid="grid-intersection-snap-highlight" className="pointer-events-none">
-              <line
-                x1={gx - arm}
-                y1={gy}
-                x2={gx + arm}
-                y2={gy}
-                stroke="#10b981"
-                strokeWidth={1.5 * invZ}
-                strokeDasharray={`${3.5 * invZ} ${2.5 * invZ}`}
-                strokeOpacity="0.9"
-              />
-              <line
-                x1={gx}
-                y1={gy - arm}
-                x2={gx}
-                y2={gy + arm}
-                stroke="#10b981"
-                strokeWidth={1.5 * invZ}
-                strokeDasharray={`${3.5 * invZ} ${2.5 * invZ}`}
-                strokeOpacity="0.9"
-              />
-              <circle
-                cx={gx}
-                cy={gy}
-                r={9.5 * invZ}
-                fill="#10b981"
-                fillOpacity="0.16"
-                stroke="#10b981"
-                strokeWidth={1.5 * invZ}
-              />
-              <circle
-                cx={gx}
-                cy={gy}
-                r={3.2 * invZ}
-                fill="#10b981"
-                stroke="#ffffff"
-                strokeWidth={1.2 * invZ}
-              />
-              <g transform={`translate(${gx + 10 * invZ + badgeW / 2}, ${gy - 13 * invZ})`}>
-                <rect
-                  x={-badgeW / 2}
-                  y={-badgeH / 2}
-                  width={badgeW}
-                  height={badgeH}
-                  rx={4 * invZ}
-                  fill="#065f46"
-                  stroke="#34d399"
-                  strokeWidth={1 * invZ}
-                />
-                <text
-                  x={0}
-                  y={3.2 * invZ}
-                  textAnchor="middle"
-                  fill="#ffffff"
-                  fontSize={9 * invZ}
-                  fontWeight="700"
-                  fontFamily="ui-monospace, monospace"
-                >
-                  {badgeText}
-                </text>
-              </g>
-            </g>
-          );
-        })()}
 
         {/* Interactive Wi-Fi Coverage Perimeter Resize Rings & Handles */}
         {project.settings.showCoverageRadius &&
@@ -3674,57 +3052,8 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
             </g>
           );
         })()}
+        </g>
       </svg>
-
-      {canvasContextMenu && !isReadOnlyMode && (
-        <div
-          role="menu"
-          aria-label="Thao tác nhanh tại con trỏ"
-          onPointerDown={e => e.stopPropagation()}
-          style={{ left: canvasContextMenu.screenX, top: canvasContextMenu.screenY }}
-          className="absolute z-40 w-[224px] rounded-xl bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border border-slate-200 dark:border-slate-700 shadow-2xl p-1.5 text-xs text-slate-800 dark:text-slate-100 no-print"
-        >
-          <div className="px-2 py-1 text-[10px] font-mono text-slate-400 border-b border-slate-100 dark:border-slate-800 mb-1 flex items-center justify-between">
-            <span>Vị trí con trỏ</span>
-            <span>
-              {Math.round(canvasContextMenu.canvasX)}, {Math.round(canvasContextMenu.canvasY)}
-            </span>
-          </div>
-          {onAddRackAtCursor && (
-            <button
-              type="button"
-              role="menuitem"
-              onClick={() => {
-                const { canvasX, canvasY } = canvasContextMenu;
-                setCanvasContextMenu(null);
-                onAddRackAtCursor(canvasX, canvasY);
-              }}
-              className="w-full px-2.5 py-2 rounded-lg hover:bg-blue-50 dark:hover:bg-blue-950/60 text-left font-semibold text-slate-800 dark:text-slate-100 flex items-center justify-between gap-2 transition-colors"
-            >
-              <span className="flex items-center gap-2 min-w-0">
-                <Box className="w-3.5 h-3.5 text-[#155EEF] shrink-0" />
-                <span className="truncate">Thêm tủ Rack 42U tại đây</span>
-              </span>
-              <span className="text-[10px] font-mono text-slate-400 shrink-0">Shift+R</span>
-            </button>
-          )}
-          {onAddTextNode && (
-            <button
-              type="button"
-              role="menuitem"
-              onClick={() => {
-                const { canvasX, canvasY } = canvasContextMenu;
-                setCanvasContextMenu(null);
-                onAddTextNode(canvasX, canvasY);
-              }}
-              className="w-full px-2.5 py-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 text-left font-medium text-slate-700 dark:text-slate-200 flex items-center gap-2 transition-colors"
-            >
-              <Type className="w-3.5 h-3.5 text-slate-500 shrink-0" />
-              <span>Thêm ghi chú chữ tại đây</span>
-            </button>
-          )}
-        </div>
-      )}
 
       {/* Extracted HTML Overlays */}
       <CanvasSelectionOverlays
@@ -3827,6 +3156,9 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
         onSetActiveFloor={onSetActiveFloor}
         onCloneFloor={onCloneFloor}
         onDuplicateNodes={onDuplicateNodes}
+        smartClipboardNodeIds={smartClipboardNodeIds}
+        onSmartCopyPasteNodes={onSmartCopyPasteNodes}
+        onCopyNodesToClipboard={onCopyNodesToClipboard}
         onToggleNodeLock={onToggleNodeLock}
         onOpenDeepInspect={onOpenDeepInspect}
         onDeleteSelected={onDeleteSelected}
@@ -3836,6 +3168,31 @@ export const DesignCanvas: React.FC<DesignCanvasProps> = ({
         onOpenInlineCableLabelEditor={openInlineCableLabelEditor}
         onPanChange={onPanChange}
       />
+
+      {hoveredRackSubDevice && !isPanning && !draggingNodeIds && !draggingRackDevice && (
+        <RackSubDeviceTooltip
+          info={hoveredRackSubDevice}
+          containerRect={containerRef.current?.getBoundingClientRect() ?? null}
+          onMouseEnter={clearRackTooltipTimer}
+          onMouseLeave={() => handleHoverRackSubDevice(null)}
+          onOpenDeepInspect={onOpenDeepInspect}
+          onSelectDevice={(assetId, rackId) => {
+            const matchedNode = project.nodes.find(
+              n => n.assetId === assetId && !n.hidden
+            );
+            if (matchedNode) {
+              onSelect('node', matchedNode.id);
+            } else {
+              onSelect('rack', rackId);
+            }
+            setHoveredRackSubDevice(null);
+          }}
+          onClose={() => {
+            clearRackTooltipTimer();
+            setHoveredRackSubDevice(null);
+          }}
+        />
+      )}
     </div>
   );
 };

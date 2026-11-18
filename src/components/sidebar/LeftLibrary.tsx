@@ -11,7 +11,7 @@ import {
 } from '../../data/deviceCatalog';
 import { CUSTOM_DEVICES_UPDATED_EVENT } from '../../utils/projectPackage';
 import { matchesAccentInsensitiveQuery } from '../../utils/helpCatalog';
-import { canAddDevicesInScene } from '../../utils/layerPolicy';
+import { ISOMETRIC_ICON_OPTIONS } from '../../utils/deviceIcons';
 import {
   Search,
   Layers,
@@ -53,18 +53,6 @@ import {
   X
 } from 'lucide-react';
 
-export interface LibraryDragPayload {
-  presetName: string;
-  customPresetId?: string;
-  action: 'device' | 'rack';
-  label: string;
-  category: DeviceCategory;
-  accentColor: string;
-  specLine: string;
-  width: number;
-  height: number;
-}
-
 interface LeftLibraryProps {
   project: ProjectState;
   onAddDevice: (presetName: string, x?: number, y?: number) => void;
@@ -74,11 +62,6 @@ interface LeftLibraryProps {
   onGenerateLegend?: () => void;
   onAddRack: () => void;
   onDragPresetChange?: (presetName: string | null) => void;
-  onStartPointerDrag?: (payload: LibraryDragPayload, clientX: number, clientY: number) => void;
-  onMovePointerDrag?: (clientX: number, clientY: number) => void;
-  onEndPointerDrag?: (clientX: number, clientY: number) => void;
-  onCancelPointerDrag?: () => void;
-  onBlockedInsertAttempt?: () => void;
   canvasCenter?: { x: number; y: number };
   widthPx?: number;
   isOverlayDrawer?: boolean;
@@ -86,7 +69,6 @@ interface LeftLibraryProps {
   isCollapsed?: boolean;
   onToggleCollapse?: (nextCollapsed: boolean) => void;
   is3DView?: boolean;
-  is3DDragLocked?: boolean;
   isReadOnlyMode?: boolean;
 }
 
@@ -170,6 +152,57 @@ const VENDOR_FILTERS = [
   'Dell',
   'APC'
 ] as const;
+
+type QuickCategoryFilterId =
+  | 'all'
+  | 'router'
+  | 'switch'
+  | 'firewall'
+  | 'server'
+  | 'camera'
+  | 'ap'
+  | 'ups';
+
+const QUICK_CATEGORY_FILTERS: Array<{
+  id: QuickCategoryFilterId;
+  label: string;
+  categories: DeviceCategory[];
+}> = [
+  { id: 'all', label: 'Tất cả', categories: [] },
+  { id: 'router', label: 'Router', categories: ['router', 'gateway'] },
+  { id: 'switch', label: 'Switch', categories: ['switch', 'core_switch'] },
+  { id: 'firewall', label: 'Firewall', categories: ['firewall'] },
+  { id: 'server', label: 'Server', categories: ['server', 'storage', 'rack'] },
+  { id: 'camera', label: 'Camera', categories: ['camera', 'nvr'] },
+  { id: 'ap', label: 'AP', categories: ['ap'] },
+  { id: 'ups', label: 'UPS', categories: ['ups', 'pdu', 'electrical_panel'] }
+];
+
+function resolveIsometricImageForCategory(category: DeviceCategory): string | null {
+  switch (category) {
+    case 'router':
+    case 'gateway':
+    case 'firewall':
+      return ISOMETRIC_ICON_OPTIONS.find(o => o.id === 'iso_router_firewall')?.imageSrc || null;
+    case 'switch':
+    case 'core_switch':
+    case 'odf':
+      return ISOMETRIC_ICON_OPTIONS.find(o => o.id === 'iso_switch_network')?.imageSrc || null;
+    case 'patch_panel':
+      return ISOMETRIC_ICON_OPTIONS.find(o => o.id === 'iso_patch_panel')?.imageSrc || null;
+    case 'server':
+    case 'storage':
+    case 'rack':
+    case 'nvr':
+      return ISOMETRIC_ICON_OPTIONS.find(o => o.id === 'iso_server_rack')?.imageSrc || null;
+    case 'ups':
+    case 'pdu':
+    case 'electrical_panel':
+      return ISOMETRIC_ICON_OPTIONS.find(o => o.id === 'iso_ups_unit')?.imageSrc || null;
+    default:
+      return null;
+  }
+}
 
 const FAVORITES_STORAGE_KEY = 'hachihi_favorite_devices_v1';
 const RECENTS_STORAGE_KEY = 'hachihi_recent_devices_v1';
@@ -295,7 +328,7 @@ function buildInitialOpenGroups(mode: DesignMode): Record<CategoryGroupId, boole
   };
 }
 
-export const LeftLibrary: React.FC<LeftLibraryProps> = ({
+export const LeftLibrary: React.FC<LeftLibraryProps> = React.memo(({
   project,
   onAddDevice,
   onAddCustomDevice,
@@ -304,11 +337,6 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
   onGenerateLegend,
   onAddRack,
   onDragPresetChange,
-  onStartPointerDrag,
-  onMovePointerDrag,
-  onEndPointerDrag,
-  onCancelPointerDrag,
-  onBlockedInsertAttempt,
   canvasCenter = { x: 450, y: 250 },
   widthPx = 272,
   isOverlayDrawer = false,
@@ -316,12 +344,12 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
   isCollapsed,
   onToggleCollapse,
   is3DView = false,
-  is3DDragLocked = true,
   isReadOnlyMode = false
 }) => {
   const [activeTab, setActiveTab] = useState<LibraryTab>('catalog');
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedVendor, setSelectedVendor] = useState<string>('Tất cả');
+  const [selectedCategoryFilter, setSelectedCategoryFilter] = useState<QuickCategoryFilterId>('all');
   const [viewMode, setViewMode] = useState<'grid' | 'list'>(() => {
     try {
       return localStorage.getItem(VIEW_MODE_STORAGE_KEY) === 'list' ? 'list' : 'grid';
@@ -341,14 +369,6 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
     [isCollapsed, onToggleCollapse]
   );
   const searchInputRef = useRef<HTMLInputElement>(null);
-  const pointerDragCleanupRef = useRef<(() => void) | null>(null);
-
-  useEffect(() => {
-    return () => {
-      pointerDragCleanupRef.current?.();
-      pointerDragCleanupRef.current = null;
-    };
-  }, []);
 
   const [pinnedGroups, setPinnedGroups] = useState<CategoryGroupId[]>(() => {
     try {
@@ -489,16 +509,8 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
     setOpenGroups(prev => ({ ...prev, [id]: true }));
   };
 
-  const canInsertDevices = canAddDevicesInScene({
-    isReadOnlyMode,
-    is3DView,
-    is3DDragLocked
-  });
-  const isInsertBlocked = !canInsertDevices;
-  const is3DLocked = Boolean(is3DView && is3DDragLocked);
-
   const handleAddPreset = (preset: DevicePreset | CustomDevicePreset) => {
-    if (isInsertBlocked) return;
+    if (isReadOnlyMode || is3DView) return;
     recordRecent(preset.name);
     if ('id' in preset && onAddCustomDevice) {
       onAddCustomDevice(preset, canvasCenter.x, canvasCenter.y);
@@ -508,13 +520,11 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
   };
 
   const handleTriggerSymbol = (action: SymbolBlockItem['action']) => {
-    if (action === 'rack') {
-      if (isInsertBlocked) return;
-      onAddRack();
-      return;
-    }
     if (isReadOnlyMode || is3DView) return;
     switch (action) {
+      case 'rack':
+        onAddRack();
+        break;
       case 'zone':
         onAddShapeNode?.('zone', canvasCenter.x, canvasCenter.y);
         break;
@@ -534,91 +544,6 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
         onGenerateLegend?.();
         break;
     }
-  };
-
-  const buildDragPayload = (preset: DevicePreset | CustomDevicePreset): LibraryDragPayload => {
-    const isCustom = 'id' in preset;
-    const isRack = preset.category === 'rack';
-    return {
-      presetName: preset.name,
-      customPresetId: isCustom ? preset.id : undefined,
-      action: isRack ? 'rack' : 'device',
-      label: preset.name,
-      category: preset.category,
-      accentColor: getCategoryAccentColor(preset.category),
-      specLine: formatCardSpecs(preset),
-      width: isRack ? 300 : preset.defaultWidth || 150,
-      height: isRack ? 180 : preset.defaultHeight || 56
-    };
-  };
-
-  const startCardPointerInteraction = (
-    e: React.PointerEvent<HTMLElement>,
-    payload: LibraryDragPayload,
-    onSingleClick: () => void
-  ) => {
-    if ((e.target as HTMLElement | null)?.closest('[data-no-drag="true"]')) return;
-    if (e.pointerType === 'mouse' && e.button !== 0) return;
-
-    if (isInsertBlocked) {
-      if (!isReadOnlyMode && is3DLocked) {
-        onBlockedInsertAttempt?.();
-      }
-      return;
-    }
-
-    pointerDragCleanupRef.current?.();
-    const startX = e.clientX;
-    const startY = e.clientY;
-    const isTouchLike = e.pointerType !== 'mouse';
-    let hasDragged = false;
-
-    const cleanup = () => {
-      window.removeEventListener('pointermove', handleMove);
-      window.removeEventListener('pointerup', handleUp);
-      window.removeEventListener('pointercancel', handleCancel);
-      pointerDragCleanupRef.current = null;
-    };
-
-    const handleMove = (ev: PointerEvent) => {
-      const dx = ev.clientX - startX;
-      const dy = ev.clientY - startY;
-      if (!hasDragged) {
-        const passedThreshold = isTouchLike
-          ? dx > 10 && Math.abs(dx) > Math.abs(dy) * 1.1
-          : Math.hypot(dx, dy) > 6;
-        if (!passedThreshold) return;
-        hasDragged = true;
-        recordRecent(payload.presetName);
-        onDragPresetChange?.(payload.presetName);
-        onStartPointerDrag?.(payload, ev.clientX, ev.clientY);
-      } else {
-        onMovePointerDrag?.(ev.clientX, ev.clientY);
-      }
-    };
-
-    const handleUp = (ev: PointerEvent) => {
-      cleanup();
-      if (hasDragged) {
-        onEndPointerDrag?.(ev.clientX, ev.clientY);
-        onDragPresetChange?.(null);
-      } else {
-        onSingleClick();
-      }
-    };
-
-    const handleCancel = () => {
-      cleanup();
-      if (hasDragged) {
-        onCancelPointerDrag?.();
-        onDragPresetChange?.(null);
-      }
-    };
-
-    pointerDragCleanupRef.current = cleanup;
-    window.addEventListener('pointermove', handleMove);
-    window.addEventListener('pointerup', handleUp);
-    window.addEventListener('pointercancel', handleCancel);
   };
 
   const handleCreateCustomDevice = (e: React.FormEvent) => {
@@ -670,21 +595,27 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
     [customPresets]
   );
 
-  const isFiltering = Boolean(searchQuery.trim() || selectedVendor !== 'Tất cả');
-
-  const filteredDevices = useMemo(
-    () => searchDeviceCatalog(allPresets, searchQuery, selectedVendor, SHORT_LABELS),
-    [allPresets, searchQuery, selectedVendor]
+  const isFiltering = Boolean(
+    searchQuery.trim() || selectedVendor !== 'Tất cả' || selectedCategoryFilter !== 'all'
   );
 
+  const filteredDevices = useMemo(() => {
+    const base = searchDeviceCatalog(allPresets, searchQuery, selectedVendor, SHORT_LABELS);
+    if (selectedCategoryFilter === 'all') return base;
+    const catMeta = QUICK_CATEGORY_FILTERS.find(f => f.id === selectedCategoryFilter);
+    if (!catMeta || catMeta.categories.length === 0) return base;
+    const allowed = new Set<DeviceCategory>(catMeta.categories);
+    return base.filter(item => allowed.has(item.category));
+  }, [allPresets, searchQuery, selectedVendor, selectedCategoryFilter]);
+
   const filteredSymbols = useMemo(() => {
-    if (selectedVendor !== 'Tất cả') return [];
+    if (selectedVendor !== 'Tất cả' || selectedCategoryFilter !== 'all') return [];
     const q = searchQuery.trim();
     if (!q) return SYMBOL_ITEMS;
     return SYMBOL_ITEMS.filter(sym =>
       matchesAccentInsensitiveQuery(`${sym.label} ${sym.sub} ${sym.keywords}`, q)
     );
-  }, [searchQuery, selectedVendor]);
+  }, [searchQuery, selectedVendor, selectedCategoryFilter]);
 
   const orderedGroups = useMemo(() => {
     const bucket = new Map<CategoryGroupId, Array<DevicePreset | CustomDevicePreset>>();
@@ -792,6 +723,8 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
     return [vendor, portPart, wattPart].filter(Boolean).join(' · ');
   };
 
+  const isInsertBlocked = is3DView || isReadOnlyMode;
+
   const renderDeviceCard = (preset: DevicePreset | CustomDevicePreset) => {
     const isCustom = 'id' in preset;
     const isFav = favorites.includes(preset.name);
@@ -800,52 +733,59 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
       : SHORT_LABELS[preset.name] || preset.name;
     const accent = getCategoryAccentColor(preset.category);
     const specLine = formatCardSpecs(preset);
-    const dragPayload = buildDragPayload(preset);
-    const tooltip = isReadOnlyMode
+    const tooltip = is3DView
+      ? `${preset.name} — Chuyển về 2D CAD để kéo thả hoặc thêm lên bản vẽ`
+      : isReadOnlyMode
       ? `${preset.name} — Đang ở chế độ Chỉ xem`
-      : is3DLocked
-      ? `${preset.name} — Nhấn Mở khóa cạnh nút 2D / 3D để kéo thả hoặc thêm vào không gian 3D`
-      : is3DView
-      ? `${preset.name}\n${preset.vendor} · ${preset.model}\n${preset.defaultPorts.length} cổng · ${preset.powerWatts}W\nNhấn để thêm hoặc giữ chuột kéo thả ra khung hình 3D`
-      : `${preset.name}\n${preset.vendor} · ${preset.model}\n${preset.defaultPorts.length} cổng · ${preset.powerWatts}W\nNhấn để thêm hoặc giữ chuột kéo thả ra bản vẽ`;
-
-    const addBtnTooltip = isReadOnlyMode
-      ? 'Đang ở chế độ Chỉ xem'
-      : is3DLocked
-      ? 'Mở khóa kéo 3D để thêm thiết bị'
-      : is3DView
-      ? 'Thêm vào không gian 3D'
-      : 'Thêm vào giữa bản vẽ';
+      : `${preset.name}\n${preset.vendor} · ${preset.model}\n${preset.defaultPorts.length} cổng · ${preset.powerWatts}W\nKéo thả vào bản vẽ hoặc nhấp đúp`;
 
     if (viewMode === 'list') {
       return (
         <div
           key={isCustom ? preset.id : preset.name}
-          role="button"
-          tabIndex={isInsertBlocked ? -1 : 0}
-          draggable={false}
-          onDragStart={e => e.preventDefault()}
-          onPointerDown={e => startCardPointerInteraction(e, dragPayload, () => handleAddPreset(preset))}
-          onKeyDown={e => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              handleAddPreset(preset);
-            }
-          }}
+          draggable={!isCustom && !isInsertBlocked}
+          onDragStart={
+            !isCustom && !isInsertBlocked
+              ? e => {
+                  e.dataTransfer.setData('text/plain', preset.name);
+                  e.dataTransfer.setData('presetName', preset.name);
+                  e.dataTransfer.effectAllowed = 'copy';
+                  recordRecent(preset.name);
+                  onDragPresetChange?.(preset.name);
+                }
+              : undefined
+          }
+          onDragEnd={() => onDragPresetChange?.(null)}
+          onDoubleClick={() => handleAddPreset(preset)}
           title={tooltip}
-          className={`group flex items-center justify-between gap-2 px-2 py-1.5 rounded-md border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 transition-colors select-none ${
+          className={`group flex items-center justify-between gap-2 px-2 py-1.5 rounded-md border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 transition-colors ${
             isInsertBlocked
               ? 'opacity-45 cursor-not-allowed'
               : 'hover:border-[#155EEF] hover:bg-slate-50/70 dark:hover:bg-slate-800/50 cursor-grab active:cursor-grabbing'
           }`}
         >
           <div className="flex items-center gap-2 min-w-0">
-            <div
-              className="w-7 h-7 rounded-md flex items-center justify-center text-white shrink-0"
-              style={{ backgroundColor: accent }}
-            >
-              {renderIcon(preset.category, 'w-3.5 h-3.5')}
-            </div>
+            {(() => {
+              const isoImg = resolveIsometricImageForCategory(preset.category);
+              if (isoImg) {
+                return (
+                  <img
+                    src={isoImg}
+                    alt={preset.name}
+                    referrerPolicy="no-referrer"
+                    className="w-7 h-7 rounded-md object-contain bg-white border border-slate-200 dark:border-slate-700 p-0.5 shrink-0"
+                  />
+                );
+              }
+              return (
+                <div
+                  className="w-7 h-7 rounded-md flex items-center justify-center text-white shrink-0"
+                  style={{ backgroundColor: accent }}
+                >
+                  {renderIcon(preset.category, 'w-3.5 h-3.5')}
+                </div>
+              );
+            })()}
             <div className="min-w-0">
               <div className="text-xs font-semibold text-slate-800 dark:text-slate-100 truncate">
                 {preset.name}
@@ -858,7 +798,6 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
           <div className="flex items-center gap-0.5 shrink-0">
             <button
               type="button"
-              data-no-drag="true"
               onClick={e => {
                 e.stopPropagation();
                 toggleFavorite(preset.name);
@@ -873,7 +812,6 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
             {isCustom && (
               <button
                 type="button"
-                data-no-drag="true"
                 disabled={isReadOnlyMode}
                 onClick={e => {
                   e.stopPropagation();
@@ -887,15 +825,11 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
             )}
             <button
               type="button"
-              data-no-drag="true"
               disabled={isInsertBlocked}
-              onClick={e => {
-                e.stopPropagation();
-                handleAddPreset(preset);
-              }}
+              onClick={() => handleAddPreset(preset)}
               aria-label={`Thêm ${preset.name}`}
               className="p-1 rounded bg-slate-100 dark:bg-slate-800 hover:bg-[#155EEF] hover:text-white text-slate-600 dark:text-slate-300 transition-colors disabled:opacity-35 disabled:cursor-not-allowed disabled:hover:bg-slate-100 disabled:hover:text-slate-600"
-              title={addBtnTooltip}
+              title={is3DView ? 'Chỉ thêm thiết bị trong chế độ 2D CAD' : 'Thêm vào giữa bản vẽ'}
             >
               <Plus className="w-3.5 h-3.5" />
             </button>
@@ -907,17 +841,20 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
     return (
       <div
         key={isCustom ? preset.id : preset.name}
-        role="button"
-        tabIndex={isInsertBlocked ? -1 : 0}
-        draggable={false}
-        onDragStart={e => e.preventDefault()}
-        onPointerDown={e => startCardPointerInteraction(e, dragPayload, () => handleAddPreset(preset))}
-        onKeyDown={e => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            handleAddPreset(preset);
-          }
-        }}
+        draggable={!isCustom && !isInsertBlocked}
+        onDragStart={
+          !isCustom && !isInsertBlocked
+            ? e => {
+                e.dataTransfer.setData('text/plain', preset.name);
+                e.dataTransfer.setData('presetName', preset.name);
+                e.dataTransfer.effectAllowed = 'copy';
+                recordRecent(preset.name);
+                onDragPresetChange?.(preset.name);
+              }
+            : undefined
+        }
+        onDragEnd={() => onDragPresetChange?.(null)}
+        onDoubleClick={() => handleAddPreset(preset)}
         title={tooltip}
         className={`group relative flex flex-col items-start p-2 rounded-md border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 transition-colors select-none ${
           isInsertBlocked
@@ -926,16 +863,30 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
         }`}
       >
         <div className="w-full flex items-center justify-between gap-1 mb-1.5">
-          <div
-            className="w-7 h-7 rounded-md flex items-center justify-center text-white shrink-0"
-            style={{ backgroundColor: accent }}
-          >
-            {renderIcon(preset.category, 'w-3.5 h-3.5')}
-          </div>
+          {(() => {
+            const isoImg = resolveIsometricImageForCategory(preset.category);
+            if (isoImg) {
+              return (
+                <img
+                  src={isoImg}
+                  alt={preset.name}
+                  referrerPolicy="no-referrer"
+                  className="w-8 h-8 rounded-md object-contain bg-white border border-slate-200 dark:border-slate-700 p-0.5 shrink-0"
+                />
+              );
+            }
+            return (
+              <div
+                className="w-8 h-8 rounded-md flex items-center justify-center text-white shrink-0"
+                style={{ backgroundColor: accent }}
+              >
+                {renderIcon(preset.category, 'w-4 h-4')}
+              </div>
+            );
+          })()}
           <div className="flex items-center gap-0.5">
             <button
               type="button"
-              data-no-drag="true"
               onClick={e => {
                 e.stopPropagation();
                 toggleFavorite(preset.name);
@@ -949,15 +900,14 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
             </button>
             <button
               type="button"
-              data-no-drag="true"
               disabled={isInsertBlocked}
               onClick={e => {
                 e.stopPropagation();
                 handleAddPreset(preset);
               }}
               aria-label={`Thêm ${preset.name}`}
-              className="p-1 rounded bg-slate-100 dark:bg-slate-800 hover:bg-[#155EEF] hover:text-white text-slate-600 dark:text-slate-300 opacity-65 group-hover:opacity-100 transition-all disabled:opacity-0"
-              title={addBtnTooltip}
+              className="p-1 rounded bg-slate-100 dark:bg-slate-800 hover:bg-[#155EEF] hover:text-white text-slate-600 dark:text-slate-300 opacity-0 group-hover:opacity-100 transition-all disabled:opacity-0"
+              title={is3DView ? 'Chỉ thêm thiết bị trong chế độ 2D CAD' : 'Thêm nhanh lên bản vẽ'}
             >
               <Plus className="w-3.5 h-3.5" />
             </button>
@@ -1111,6 +1061,33 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
               </div>
             </div>
 
+            {/* Quick Category Filter Strip (Router, Switch, Firewall, Server, Camera, AP, UPS) */}
+            <div
+              role="group"
+              aria-label="Lọc theo nhóm thiết bị"
+              className="flex items-center gap-1 overflow-x-auto no-scrollbar"
+            >
+              {QUICK_CATEGORY_FILTERS.map(cat => {
+                const active = selectedCategoryFilter === cat.id;
+                return (
+                  <button
+                    key={cat.id}
+                    type="button"
+                    data-testid={`library-cat-filter-${cat.id}`}
+                    aria-pressed={active}
+                    onClick={() => setSelectedCategoryFilter(cat.id)}
+                    className={`px-2 py-1 rounded text-[11px] font-semibold whitespace-nowrap shrink-0 transition-colors ${
+                      active
+                        ? 'bg-[#155EEF] text-white'
+                        : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700'
+                    }`}
+                  >
+                    {cat.label}
+                  </button>
+                );
+              })}
+            </div>
+
             {/* Vendor Filter Strip */}
             <div className="flex items-center gap-0.5 overflow-x-auto no-scrollbar">
               {VENDOR_FILTERS.map(v => {
@@ -1122,7 +1099,7 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
                     onClick={() => setSelectedVendor(v)}
                     className={`px-2 py-1 rounded text-xs font-medium whitespace-nowrap shrink-0 transition-colors ${
                       active
-                        ? 'bg-[#155EEF] text-white'
+                        ? 'bg-slate-800 dark:bg-slate-200 text-white dark:text-slate-900'
                         : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-100'
                     }`}
                   >
@@ -1146,27 +1123,10 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
                     <button
                       key={`rec_${item.name}`}
                       type="button"
-                      draggable={false}
-                      onDragStart={e => e.preventDefault()}
-                      aria-disabled={isInsertBlocked}
-                      onPointerDown={e =>
-                        startCardPointerInteraction(e, buildDragPayload(item), () => handleAddPreset(item))
-                      }
-                      onClick={e => {
-                        if (e.detail === 0) handleAddPreset(item);
-                      }}
-                      className={`px-2 py-1 rounded border border-slate-200 dark:border-slate-700 bg-slate-50/80 dark:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 truncate max-w-[116px] transition-colors ${
-                        isInsertBlocked
-                          ? 'opacity-35 cursor-not-allowed'
-                          : 'hover:border-[#155EEF] cursor-grab active:cursor-grabbing'
-                      }`}
-                      title={
-                        isReadOnlyMode
-                          ? 'Đang ở chế độ Chỉ xem'
-                          : is3DLocked
-                          ? 'Mở khóa kéo 3D để thêm thiết bị'
-                          : `Nhấn để thêm hoặc kéo thả ${item.name}`
-                      }
+                      disabled={isInsertBlocked}
+                      onClick={() => handleAddPreset(item)}
+                      className="px-2 py-1 rounded border border-slate-200 dark:border-slate-700 bg-slate-50/80 dark:bg-slate-800 hover:border-[#155EEF] text-xs font-medium text-slate-700 dark:text-slate-200 truncate max-w-[116px] transition-colors disabled:opacity-35 disabled:cursor-not-allowed"
+                      title={is3DView ? 'Chỉ thêm thiết bị trong chế độ 2D CAD' : `Thêm nhanh ${item.name}`}
                     >
                       + {SHORT_LABELS[item.name] || item.name}
                     </button>
@@ -1184,6 +1144,7 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
                   onClick={() => {
                     setSearchQuery('');
                     setSelectedVendor('Tất cả');
+                    setSelectedCategoryFilter('all');
                   }}
                   className="text-[#155EEF] dark:text-blue-400 font-semibold hover:underline"
                 >
@@ -1248,65 +1209,19 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
                             <div className="grid grid-cols-2 gap-1.5">
                               {filteredSymbols.map(sym => {
                                 const SymIcon = sym.icon;
-                                const isSymbolBlocked =
-                                  sym.action === 'rack' ? isInsertBlocked : is3DView || isReadOnlyMode;
-                                const symbolTooltip = isReadOnlyMode
-                                  ? 'Đang ở chế độ Chỉ xem'
-                                  : sym.action === 'rack' && is3DLocked
-                                  ? 'Mở khóa kéo 3D để thêm Tủ Rack 42U'
-                                  : sym.action !== 'rack' && is3DView
-                                  ? `${sym.label} chỉ khả dụng trong chế độ 2D CAD`
-                                  : sym.sub;
-                                if (sym.action === 'rack') {
-                                  const rackPayload: LibraryDragPayload = {
-                                    presetName: 'Tủ Rack Phân Phối IDF',
-                                    action: 'rack',
-                                    label: 'Tủ Rack Phân Phối IDF',
-                                    category: 'rack',
-                                    accentColor: '#334155',
-                                    specLine: 'Chuẩn 19 inch · 42U',
-                                    width: 300,
-                                    height: 180
-                                  };
-                                  return (
-                                    <button
-                                      key={sym.id}
-                                      type="button"
-                                      draggable={false}
-                                      onDragStart={e => e.preventDefault()}
-                                      aria-disabled={isSymbolBlocked}
-                                      onPointerDown={e =>
-                                        startCardPointerInteraction(e, rackPayload, () =>
-                                          handleTriggerSymbol('rack')
-                                        )
-                                      }
-                                      onClick={e => {
-                                        if (e.detail === 0) handleTriggerSymbol('rack');
-                                      }}
-                                      title={symbolTooltip}
-                                      className={`p-2 rounded-md border border-slate-200 dark:border-slate-800 text-left flex flex-col gap-1 transition-colors select-none ${
-                                        isSymbolBlocked
-                                          ? 'opacity-35 cursor-not-allowed'
-                                          : 'hover:border-[#155EEF] hover:bg-slate-50/70 dark:hover:bg-slate-800/40 cursor-grab active:cursor-grabbing'
-                                      }`}
-                                    >
-                                      <SymIcon className={`w-4 h-4 ${sym.accentClass}`} />
-                                      <span className="text-xs font-semibold text-slate-800 dark:text-slate-100 leading-tight">
-                                        {sym.label}
-                                      </span>
-                                      <span className="text-[11px] text-slate-500 dark:text-slate-400 leading-tight">
-                                        {sym.sub}
-                                      </span>
-                                    </button>
-                                  );
-                                }
                                 return (
                                   <button
                                     key={sym.id}
                                     type="button"
-                                    disabled={isSymbolBlocked}
+                                    disabled={isInsertBlocked}
                                     onClick={() => handleTriggerSymbol(sym.action)}
-                                    title={symbolTooltip}
+                                    title={
+                                      is3DView
+                                        ? `${sym.label} chỉ khả dụng trong chế độ 2D CAD`
+                                        : isReadOnlyMode
+                                        ? 'Đang ở chế độ Chỉ xem'
+                                        : sym.sub
+                                    }
                                     className="p-2 rounded-md border border-slate-200 dark:border-slate-800 hover:border-[#155EEF] hover:bg-slate-50/70 dark:hover:bg-slate-800/40 text-left flex flex-col gap-1 transition-colors disabled:opacity-35 disabled:cursor-not-allowed"
                                   >
                                     <SymIcon className={`w-4 h-4 ${sym.accentClass}`} />
@@ -1444,12 +1359,8 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
                   className="ent-input font-mono tabular-nums"
                 />
               </div>
-              <button
-                type="submit"
-                disabled={isReadOnlyMode}
-                className="ent-btn-primary w-full disabled:opacity-45 disabled:cursor-not-allowed"
-              >
-                {is3DLocked ? 'Lưu mẫu tùy chỉnh' : 'Lưu & Thêm vào bản vẽ'}
+              <button type="submit" className="ent-btn-primary w-full">
+                Lưu &amp; Thêm vào bản vẽ
               </button>
             </form>
           )}
@@ -1467,4 +1378,4 @@ export const LeftLibrary: React.FC<LeftLibraryProps> = ({
       )}
     </aside>
   );
-};
+});

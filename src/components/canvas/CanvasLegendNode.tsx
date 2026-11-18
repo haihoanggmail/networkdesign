@@ -17,12 +17,13 @@ interface CanvasLegendNodeProps {
   framePad: number;
   handleSize: number;
   invZ: number;
-  getNodeResizeHandlePos: (dir: ResizeHandleDir) => { x: number; y: number };
+  getNodeResizeHandlePos?: (dir: ResizeHandleDir) => { x: number; y: number };
   onNodePointerDown: (e: React.PointerEvent, node: DiagramNode) => void;
   onNodeClick: (e: React.MouseEvent | React.PointerEvent, node: DiagramNode) => void;
   onHoverChange: (nodeId: string | null) => void;
   onResizeLegendToFit?: (nodeId: string) => void;
   onStartResize: StartNodeResizeFn;
+  onNodeContextMenu?: (e: React.MouseEvent, node: DiagramNode) => void;
 }
 
 export const CanvasLegendNode: React.FC<CanvasLegendNodeProps> = React.memo(({
@@ -41,8 +42,28 @@ export const CanvasLegendNode: React.FC<CanvasLegendNodeProps> = React.memo(({
   onNodeClick,
   onHoverChange,
   onResizeLegendToFit,
-  onStartResize
+  onStartResize,
+  onNodeContextMenu
 }) => {
+  const resolveResizeHandlePos = (dir: ResizeHandleDir) => {
+    if (getNodeResizeHandlePos) return getNodeResizeHandlePos(dir);
+    const left = -framePad;
+    const right = node.width + framePad;
+    const top = -framePad;
+    const bottom = node.height + framePad;
+    const cx = node.width / 2;
+    const cy = node.height / 2;
+    switch (dir) {
+      case 'nw': return { x: left, y: top };
+      case 'n': return { x: cx, y: top };
+      case 'ne': return { x: right, y: top };
+      case 'e': return { x: right, y: cy };
+      case 'se': return { x: right, y: bottom };
+      case 's': return { x: cx, y: bottom };
+      case 'sw': return { x: left, y: bottom };
+      case 'w': return { x: left, y: cy };
+    }
+  };
   const legendData = buildProjectLegendData(project, {
     scope: node.customData?.legendScope || 'all',
     includeCables: node.customData?.legendIncludeCables ?? true,
@@ -68,6 +89,7 @@ export const CanvasLegendNode: React.FC<CanvasLegendNodeProps> = React.memo(({
       transform={`translate(${node.x}, ${node.y}) rotate(${node.rotation || 0}, ${node.width / 2}, ${node.height / 2})`}
       onPointerDown={(e) => onNodePointerDown(e, node)}
       onClick={(e) => onNodeClick(e, node)}
+      onContextMenu={(e) => onNodeContextMenu?.(e, node)}
       onPointerEnter={() => onHoverChange(node.id)}
       onPointerLeave={() => onHoverChange(null)}
       onDoubleClick={(e) => {
@@ -367,7 +389,7 @@ export const CanvasLegendNode: React.FC<CanvasLegendNodeProps> = React.memo(({
       {isSingleSelected && !node.locked && !isConnecting && !isReadOnlyMode && (
         <g>
           {RESIZE_HANDLE_DIRS.map(({ dir, cursorClass }) => {
-            const pos = getNodeResizeHandlePos(dir);
+            const pos = resolveResizeHandlePos(dir);
             return (
               <rect
                 key={`nd_h_${dir}`}
@@ -405,4 +427,53 @@ export const CanvasLegendNode: React.FC<CanvasLegendNodeProps> = React.memo(({
       )}
     </g>
   );
+}, (prev, next) => {
+  if (
+    prev.node !== next.node ||
+    prev.isSelected !== next.isSelected ||
+    prev.isSingleSelected !== next.isSingleSelected ||
+    prev.isOverlapping !== next.isOverlapping ||
+    prev.isConnecting !== next.isConnecting ||
+    prev.isReadOnlyMode !== next.isReadOnlyMode ||
+    prev.framePad !== next.framePad ||
+    prev.handleSize !== next.handleSize ||
+    prev.invZ !== next.invZ ||
+    prev.onNodePointerDown !== next.onNodePointerDown ||
+    prev.onNodeClick !== next.onNodeClick ||
+    prev.onHoverChange !== next.onHoverChange ||
+    prev.onResizeLegendToFit !== next.onResizeLegendToFit ||
+    prev.onStartResize !== next.onStartResize
+  ) {
+    return false;
+  }
+
+  if (
+    prev.project.activeFloorId !== next.project.activeFloorId ||
+    prev.project.floors !== next.project.floors ||
+    prev.project.assets !== next.project.assets ||
+    prev.project.cables !== next.project.cables
+  ) {
+    return false;
+  }
+
+  if (prev.project.nodes !== next.project.nodes) {
+    if (prev.project.nodes.length !== next.project.nodes.length) return false;
+    for (let i = 0; i < prev.project.nodes.length; i++) {
+      const pn = prev.project.nodes[i];
+      const nn = next.project.nodes[i];
+      if (pn === nn) continue;
+      if (
+        pn.type !== nn.type ||
+        pn.floorId !== nn.floorId ||
+        pn.assetId !== nn.assetId ||
+        pn.customIcon !== nn.customIcon ||
+        pn.customImageUrl !== nn.customImageUrl ||
+        pn.style?.backgroundColor !== nn.style?.backgroundColor
+      ) {
+        return false;
+      }
+    }
+  }
+
+  return true;
 });

@@ -1,9 +1,4 @@
-import React, { useId, useState } from 'react';
-
-const hachihiLogoImg = new URL(
-  '../assets/images/hachihi_network_logo_1794885219674.jpg',
-  import.meta.url
-).href;
+import React, { useId } from 'react';
 
 interface HachihiLogoProps {
   size?: number;
@@ -45,7 +40,6 @@ export const HachihiLogo: React.FC<HachihiLogoProps> = ({
 }) => {
   const uid = useId().replace(/:/g, '');
   const gradientId = `hachihiLogoBg_${uid}`;
-  const [imgFailed, setImgFailed] = useState(false);
 
   const wordmarkTone =
     variant === 'dark'
@@ -54,24 +48,26 @@ export const HachihiLogo: React.FC<HachihiLogoProps> = ({
       ? 'text-slate-900'
       : 'text-slate-900 dark:text-white';
 
-  const frameStrokeOpacity = variant === 'dark' ? '0.55' : '0.42';
+  const ringClass =
+    variant === 'dark'
+      ? 'ring-1 ring-sky-400/35 shadow-xs'
+      : variant === 'light'
+      ? 'ring-1 ring-slate-900/12 shadow-xs'
+      : 'ring-1 ring-slate-900/12 dark:ring-sky-400/35 shadow-xs';
+
+  const gradStart = variant === 'dark' ? '#2563EB' : '#155EEF';
+  const gradEnd = variant === 'dark' ? '#1E293B' : '#0F172A';
+  const frameStroke = variant === 'dark' ? '#7DD3FC' : '#60A5FA';
+  const frameStrokeOpacity = variant === 'dark' ? '0.62' : '0.45';
   const boxClass = resolveSizeClass(size);
 
   return (
     <span className={`inline-flex items-center gap-2 shrink-0 ${className}`}>
-      {!imgFailed ? (
-        <span
-          className={`relative inline-flex items-center justify-center overflow-hidden shrink-0 bg-[#0F172A] ring-1 ring-slate-900/15 dark:ring-white/15 shadow-xs ${boxClass}`}
-        >
-          <img
-            src={hachihiLogoImg}
-            alt="HACHIHI Network Designer"
-            referrerPolicy="no-referrer"
-            onError={() => setImgFailed(true)}
-            className="w-full h-full object-cover scale-[1.24] select-none pointer-events-none"
-          />
-        </span>
-      ) : (
+      <span
+        className={`relative inline-flex items-center justify-center overflow-hidden shrink-0 ${ringClass} ${boxClass}`}
+        role="img"
+        aria-label="HACHIHI Network Designer"
+      >
         <svg
           width={size}
           height={size}
@@ -79,12 +75,12 @@ export const HachihiLogo: React.FC<HachihiLogoProps> = ({
           fill="none"
           xmlns="http://www.w3.org/2000/svg"
           aria-hidden="true"
-          className="shrink-0"
+          className="w-full h-full block shrink-0"
         >
           <defs>
             <linearGradient id={gradientId} x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
-              <stop offset="0%" stopColor="#155EEF" />
-              <stop offset="100%" stopColor="#0F172A" />
+              <stop offset="0%" stopColor={gradStart} />
+              <stop offset="100%" stopColor={gradEnd} />
             </linearGradient>
           </defs>
           <rect width="64" height="64" rx="14" fill={`url(#${gradientId})`} />
@@ -94,7 +90,7 @@ export const HachihiLogo: React.FC<HachihiLogoProps> = ({
             width="52"
             height="52"
             rx="10"
-            stroke="#60A5FA"
+            stroke={frameStroke}
             strokeOpacity={frameStrokeOpacity}
             strokeWidth="1.25"
           />
@@ -108,7 +104,7 @@ export const HachihiLogo: React.FC<HachihiLogoProps> = ({
           <path
             d="M24 20V27L29 32L24 37V44M40 20V27L35 32L40 37V44"
             stroke="#38BDF8"
-            strokeOpacity="0.85"
+            strokeOpacity="0.88"
             strokeWidth="1.6"
             strokeLinecap="round"
             strokeLinejoin="round"
@@ -121,7 +117,7 @@ export const HachihiLogo: React.FC<HachihiLogoProps> = ({
           <circle cx="45" cy="32" r="3.2" fill="#FBBF24" />
           <circle cx="32" cy="32" r="3.4" fill="#38BDF8" />
         </svg>
-      )}
+      </span>
       {showWordmark && (
         <span className={`font-bold tracking-tight text-sm whitespace-nowrap ${wordmarkTone}`}>
           HACHIHI

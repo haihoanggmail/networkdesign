@@ -40,7 +40,6 @@ interface RackInspectorProps {
   onDeleteRack: (rackId: string) => void;
   onOpenDeepInspect: (id: string, rackView?: '2d' | '3d') => void;
   onRemoveDeviceFromRackSlot?: (rackId: string, assetIdOrU: string | number, side?: RackSide) => void;
-  onSelectNode?: (nodeId: string) => void;
   onToggleCollapse?: () => void;
   onClosePanel?: () => void;
 }
@@ -57,7 +56,6 @@ export const RackInspector: React.FC<RackInspectorProps> = ({
   onDeleteRack,
   onOpenDeepInspect,
   onRemoveDeviceFromRackSlot,
-  onSelectNode,
   onToggleCollapse,
   onClosePanel
 }) => {
@@ -294,22 +292,14 @@ export const RackInspector: React.FC<RackInspectorProps> = ({
               {allMounted.map(({ startU, devId, side }) => {
                 const dev = project.assets[devId];
                 const uH = getAssetUHeight(dev);
-                const linkedNode = project.nodes.find(n => n.assetId === devId);
-                const targetSelectId = linkedNode?.id || devId;
                 return (
                   <div
                     key={`${side}_${startU}_${devId}`}
-                    className="flex items-center justify-between px-2.5 py-1.5 bg-slate-50 dark:bg-slate-800 rounded border border-slate-200 dark:border-slate-700 text-xs gap-1.5"
+                    className="flex items-center justify-between px-2.5 py-1.5 bg-slate-50 dark:bg-slate-800 rounded border border-slate-200 dark:border-slate-700 text-xs"
                   >
-                    <button
-                      type="button"
-                      onClick={() => onSelectNode?.(targetSelectId)}
-                      disabled={!onSelectNode}
-                      title={onSelectNode ? `Chọn và xem "${dev?.name || devId}"` : undefined}
-                      className="flex items-center gap-1.5 min-w-0 flex-1 text-left hover:text-[#155EEF] dark:hover:text-blue-400 transition-colors disabled:cursor-default"
-                    >
+                    <div className="flex items-center gap-1.5 min-w-0">
                       <span
-                        className={`text-xs font-bold px-1 rounded shrink-0 ${
+                        className={`text-xs font-bold px-1 rounded ${
                           side === 'rear'
                             ? 'bg-violet-100 text-violet-700 dark:bg-violet-950 dark:text-violet-300'
                             : 'bg-blue-50 text-blue-600 dark:bg-blue-950 dark:text-blue-400'
@@ -317,14 +307,13 @@ export const RackInspector: React.FC<RackInspectorProps> = ({
                       >
                         {side === 'rear' ? 'S' : 'T'}
                       </span>
-                      <span className="font-mono font-bold text-blue-600 dark:text-blue-400 tabular-nums shrink-0">
+                      <span className="font-mono font-bold text-blue-600 dark:text-blue-400 tabular-nums">
                         {uH > 1 ? `U${startU}-${startU + uH - 1}` : `U${startU}`}
                       </span>
                       <span className="truncate font-medium">{dev?.name || devId}</span>
-                    </button>
+                    </div>
                     {!isReadOnlyMode && (
                       <button
-                        type="button"
                         onClick={() => onRemoveDeviceFromRackSlot?.(selectedRack.id, startU, side)}
                         aria-label={`Tháo ${dev?.name || devId} khỏi tủ`}
                         className="text-rose-500 hover:text-rose-700 p-1 shrink-0"

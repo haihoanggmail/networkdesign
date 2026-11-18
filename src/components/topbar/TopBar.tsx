@@ -128,7 +128,7 @@ interface TopBarProps {
   onShowToast?: (message: string, type?: 'info' | 'success' | 'error') => void;
 }
 
-export const TopBar: React.FC<TopBarProps> = ({
+export const TopBar: React.FC<TopBarProps> = React.memo(({
   project,
   hasUnsavedChanges,
   isSaving = false,
@@ -1240,4 +1240,4 @@ export const TopBar: React.FC<TopBarProps> = ({
       </div>
     </header>
   );
-};
+});

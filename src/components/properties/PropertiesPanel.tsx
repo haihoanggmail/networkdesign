@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { Suspense, lazy, useEffect, useMemo, useState } from 'react';
 import { ChevronLeft, ChevronRight, SlidersHorizontal, X, Zap } from 'lucide-react';
 import {
   CableEdge,
@@ -17,17 +17,20 @@ import { AutoAssignIpResult } from '../../utils/ipAutoAssign';
 import { computeProjectPoeSummary } from '../../utils/poeCalculator';
 import { LayoutTier, UIDensity } from '../../hooks/useWorkspaceLayout';
 import { MultiNodeInspector } from './MultiNodeInspector';
-import { RackInspector } from './RackInspector';
 import { FloorInspector, LegendNodeInspector, RoomInspector } from './LegendRoomInspector';
-import { DeviceNodeInspector } from './DeviceNodeInspector';
-import { CableInspector } from './CableInspector';
 import { ProjectSettingsInspector } from './ProjectSettingsInspector';
 import { CableMaterialSummaryPanel } from './CableMaterialSummaryPanel';
 import { PowerEnergyTabPanel } from './PowerEnergyTabPanel';
-import {
-  resolveInspectorTargets,
-  shouldFocusInspectorOnSelectionChange
-} from '../../utils/selectionSync';
+
+const RackInspector = lazy(() =>
+  import('./RackInspector').then(m => ({ default: m.RackInspector }))
+);
+const DeviceNodeInspector = lazy(() =>
+  import('./DeviceNodeInspector').then(m => ({ default: m.DeviceNodeInspector }))
+);
+const CableInspector = lazy(() =>
+  import('./CableInspector').then(m => ({ default: m.CableInspector }))
+);
 
 interface PropertiesPanelProps {
   project: ProjectState;
@@ -87,6 +90,7 @@ interface PropertiesPanelProps {
   onToggleReducedMotion?: () => void;
   onOpenBomModal?: () => void;
   onAutoLayerDevices?: () => void;
+  experienceMode?: 'basic' | 'advanced';
 }
 
 const POWER_RELEVANT_CATEGORIES = new Set([
@@ -104,7 +108,7 @@ const POWER_RELEVANT_CATEGORIES = new Set([
   'nvr'
 ]);
 
-export const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
+export const PropertiesPanel: React.FC<PropertiesPanelProps> = React.memo(({
   project,
   selection,
   auditIssues = [],
@@ -161,35 +165,69 @@ export const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
   onToggleHighContrast,
   onToggleReducedMotion,
   onOpenBomModal,
-  onAutoLayerDevices
+  onAutoLayerDevices,
+  experienceMode
 }) => {
+  const resolvedExperienceMode = experienceMode ?? project.settings?.experienceMode ?? 'advanced';
   const [confirmDeleteKey, setConfirmDeleteKey] = useState<string | null>(null);
   const [activePanelTab, setActivePanelTab] = useState<'inspector' | 'power'>('inspector');
   const [isCableSummaryExpanded, setIsCableSummaryExpanded] = useState(false);
 
   const poeSummary = useMemo(() => computeProjectPoeSummary(project), [project]);
 
-  const prevSelectionRef = useRef<SelectionState>(selection);
-
   useEffect(() => {
     setConfirmDeleteKey(null);
-    if (shouldFocusInspectorOnSelectionChange(prevSelectionRef.current, selection)) {
-      setActivePanelTab('inspector');
-    }
-    prevSelectionRef.current = selection;
-  }, [selection]);
+  }, [selection.type, selection.id]);
 
-  const {
-    selectedRack,
-    selectedNode,
-    selectedAsset,
-    selectedCable,
-    selectedRoom,
-    selectedFloor,
-    selectedNodeIds
-  } = useMemo(() => resolveInspectorTargets(selection, project), [selection, project]);
+  let selectedRack =
+    selection.type === 'rack'
+      ? project.racks.find(r => r.id === selection.id)
+      : undefined;
+
+  const selectedNode =
+    selection.type === 'node'
+      ? project.nodes.find(n => n.id === selection.id)
+      : undefined;
+
+  const selectedAsset = selectedNode?.assetId
+    ? project.assets[selectedNode.assetId]
+    : undefined;
+
+  if (
+    !selectedRack &&
+    (selectedNode?.type === 'rack' ||
+      selectedAsset?.category === 'rack' ||
+      selectedNode?.label?.toLowerCase().includes('rack') ||
+      selectedAsset?.model?.includes('42U'))
+  ) {
+    const rackId = selectedNode?.customData?.rackId || selectedNode?.id || selectedAsset?.id;
+    selectedRack = project.racks.find(
+      r => r.id === rackId || r.name === selectedNode?.label || r.id === selectedAsset?.id
+    );
+  }
+
+  const selectedCable =
+    selection.type === 'edge'
+      ? project.cables.find(c => c.id === selection.id)
+      : undefined;
+
+  const selectedRoom =
+    selection.type === 'room'
+      ? project.rooms.find(r => r.id === selection.id)
+      : undefined;
+
+  const selectedFloor =
+    selection.type === 'floor'
+      ? project.floors.find(f => f.id === selection.id)
+      : undefined;
+
+  const selectedNodeIds =
+    selection.type === 'node' && selection.id
+      ? [selection.id, ...(selection.additionalIds || [])]
+      : [];
 
   const showPowerTab = useMemo(() => {
+    if (resolvedExperienceMode === 'basic') return false;
     if (project.activeMode === 'electrical') return true;
     if (selectedNodeIds.length > 1) return false;
     if (selection.type === 'none' || selection.type === 'canvas') return true;
@@ -198,7 +236,7 @@ export const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
       return POWER_RELEVANT_CATEGORIES.has(selectedAsset.category);
     }
     return false;
-  }, [project.activeMode, selectedNodeIds.length, selection.type, selectedRack, selectedNode, selectedAsset]);
+  }, [resolvedExperienceMode, project.activeMode, selectedNodeIds.length, selection.type, selectedRack, selectedNode, selectedAsset]);
 
   useEffect(() => {
     if (!showPowerTab && activePanelTab === 'power') {
@@ -278,7 +316,6 @@ export const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
         onDeleteRack={onDeleteRack}
         onOpenDeepInspect={onOpenDeepInspect}
         onRemoveDeviceFromRackSlot={onRemoveDeviceFromRackSlot}
-        onSelectNode={onSelectNode}
         onToggleCollapse={onToggleCollapse}
         onClosePanel={onClosePanel}
       />
@@ -321,7 +358,6 @@ export const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
         onDeleteNode={onDeleteNode}
         onDeleteCable={onDeleteCable}
         onSelectCable={onSelectCable}
-        onSelectNode={onSelectNode}
         onAssignDeviceToRackSlot={onAssignDeviceToRackSlot}
         onRemoveDeviceFromRackSlot={onRemoveDeviceFromRackSlot}
         onOpenDeepInspect={onOpenDeepInspect}
@@ -329,6 +365,8 @@ export const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
         onCopyNodeStyle={onCopyNodeStyle}
         onPasteNodeStyle={onPasteNodeStyle}
         onAutoLayerDevices={onAutoLayerDevices}
+        experienceMode={resolvedExperienceMode}
+        onSwitchToAdvanced={() => onUpdateSettings({ experienceMode: 'advanced' })}
         onToggleCollapse={onToggleCollapse}
         onClosePanel={onClosePanel}
       />
@@ -351,7 +389,6 @@ export const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
         onDeleteCable={onDeleteCable}
         onAutoRouteCable={onAutoRouteCable}
         onAutoRouteAllCables={onAutoRouteAllCables}
-        onSelectNode={onSelectNode}
         onToggleCollapse={onToggleCollapse}
         onClosePanel={onClosePanel}
       />
@@ -494,7 +531,15 @@ export const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
       ) : (
         <>
           <div className="flex-1 min-h-0 overflow-hidden">
-            {inspectorContent}
+            <Suspense
+              fallback={
+                <div className="p-4 text-xs text-slate-500 dark:text-slate-400">
+                  Đang tải bảng thuộc tính...
+                </div>
+              }
+            >
+              {inspectorContent}
+            </Suspense>
           </div>
           <CableMaterialSummaryPanel
             cables={project.cables}
@@ -506,4 +551,4 @@ export const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
       )}
     </div>
   );
-};
+});

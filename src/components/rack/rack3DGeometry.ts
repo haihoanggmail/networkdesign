@@ -1117,6 +1117,9 @@ export function buildInteractiveRackScene(
   ) => {
     thermalOverlayGroup.clear();
     airflowGroup.clear();
+    intakeInstanced?.dispose();
+    exhaustInstanced?.dispose();
+    recircInstanced?.dispose();
     disposeTrack(thermalTrack);
     intakeStreams.length = 0;
     exhaustStreams.length = 0;
@@ -1500,6 +1503,16 @@ export function buildInteractiveRackScene(
     setDropPreview,
     updateAnimation,
     dispose: () => {
+      intakeInstanced?.dispose();
+      exhaustInstanced?.dispose();
+      recircInstanced?.dispose();
+      intakeInstanced = null;
+      exhaustInstanced = null;
+      recircInstanced = null;
+      thermalOverlayGroup.clear();
+      airflowGroup.clear();
+      mountedDevicesGroup.clear();
+      root.clear();
       disposeTrack(globalTrack);
       disposeTrack(deviceTrack);
       disposeTrack(thermalTrack);

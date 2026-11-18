@@ -74,11 +74,12 @@ interface DeviceNodeInspectorProps {
   onDeleteNode: (nodeId: string) => void;
   onDeleteCable: (cableId: string) => void;
   onSelectCable?: (cableId: string) => void;
-  onSelectNode?: (nodeId: string) => void;
   onAssignDeviceToRackSlot?: (rackId: string, assetId: string, preferredU: number, side?: RackSide) => void;
   onRemoveDeviceFromRackSlot?: (rackId: string, assetIdOrU: string | number, side?: RackSide) => void;
   onOpenDeepInspect: (id: string) => void;
   onAutoLayerDevices?: () => void;
+  experienceMode?: 'basic' | 'advanced';
+  onSwitchToAdvanced?: () => void;
   onToggleCollapse?: () => void;
   onClosePanel?: () => void;
 }
@@ -104,14 +105,17 @@ export const DeviceNodeInspector: React.FC<DeviceNodeInspectorProps> = ({
   onDeleteNode,
   onDeleteCable,
   onSelectCable,
-  onSelectNode,
   onAssignDeviceToRackSlot,
   onRemoveDeviceFromRackSlot,
   onOpenDeepInspect,
   onAutoLayerDevices,
+  experienceMode: experienceModeProp,
+  onSwitchToAdvanced,
   onToggleCollapse,
   onClosePanel
 }) => {
+  const experienceMode = experienceModeProp ?? project.settings.experienceMode ?? 'advanced';
+  const isBasicMode = experienceMode === 'basic';
   const [deviceTab, setDeviceTab] = useState<DeviceTab>('general');
   const [portFilter, setPortFilter] = useState<'all' | 'used' | 'free'>('all');
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -138,12 +142,50 @@ export const DeviceNodeInspector: React.FC<DeviceNodeInspectorProps> = ({
   const noteText =
     typeof selectedNode.customData?.note === 'string' ? selectedNode.customData.note : '';
 
-  const nodeTabs: Array<{ id: DeviceTab; label: string }> = [
-    { id: 'general', label: 'Chung' },
-    { id: 'network', label: 'Mạng' },
-    { id: 'physical', label: 'Vật lý' },
-    { id: 'notes', label: 'Ghi chú' }
-  ];
+  const categoryContextLabel = (() => {
+    const cat = selectedAsset?.category;
+    switch (cat) {
+      case 'switch':
+      case 'core_switch':
+        return 'Switch · Quản lý cổng, PoE & VLAN';
+      case 'ups':
+        return 'UPS · Công suất tải & Ắc quy dự phòng';
+      case 'router':
+      case 'gateway':
+        return 'Router · Định tuyến IP & Kết nối WAN';
+      case 'firewall':
+        return 'Firewall · Bảo mật & Phân vùng';
+      case 'camera':
+      case 'nvr':
+        return 'Camera / NVR · Góc quét FOV & Hồng ngoại';
+      case 'ap':
+        return 'Wi-Fi AP · Bán kính vùng phủ sóng';
+      case 'server':
+      case 'storage':
+        return 'Máy chủ / Lưu trữ · Vị trí Rack & Nguồn';
+      case 'pdu':
+      case 'electrical_panel':
+        return 'Tủ điện / PDU · Phân phối nguồn AC';
+      default:
+        return selectedAsset ? `Thiết bị · ${selectedAsset.category}` : 'Đối tượng bản vẽ';
+    }
+  })();
+
+  const nodeTabs: Array<{ id: DeviceTab; label: string }> = isBasicMode
+    ? [
+        { id: 'general', label: 'Chung' },
+        { id: 'network', label: 'Kết nối' },
+        { id: 'notes', label: 'Ghi chú' }
+      ]
+    : [
+        { id: 'general', label: 'Chung' },
+        { id: 'network', label: selectedAsset?.category === 'ups' ? 'Cổng nối' : 'Mạng' },
+        { id: 'physical', label: selectedAsset?.category === 'ups' ? 'Điện & Pin' : 'Vật lý' },
+        { id: 'notes', label: 'Ghi chú' }
+      ];
+
+  const effectiveTab: DeviceTab =
+    isBasicMode && deviceTab === 'physical' ? 'general' : deviceTab;
 
   return (
     <div className="h-full flex flex-col bg-white dark:bg-slate-900 border-l border-slate-200 dark:border-slate-800 text-slate-800 dark:text-slate-200 text-xs select-text">
@@ -252,16 +294,21 @@ export const DeviceNodeInspector: React.FC<DeviceNodeInspectorProps> = ({
         </div>
       </div>
 
-      {/* 4 Segmented Tabs: Chung / Mạng / Vật lý / Ghi chú */}
-      <div className="px-3 pt-2 pb-1.5 border-b border-slate-200 dark:border-slate-800 shrink-0">
-        <div className="grid grid-cols-4 gap-1 bg-slate-100 dark:bg-slate-800 p-0.5 rounded-lg">
+      {/* Segmented Tabs (Adaptive by category and Basic/Advanced mode) */}
+      <div className="px-3 pt-2 pb-1.5 border-b border-slate-200 dark:border-slate-800 shrink-0 space-y-1.5">
+        <div className="text-[11px] font-medium text-slate-500 dark:text-slate-400 truncate">
+          {categoryContextLabel}
+        </div>
+        <div
+          className={`grid ${isBasicMode ? 'grid-cols-3' : 'grid-cols-4'} gap-1 bg-slate-100 dark:bg-slate-800 p-0.5 rounded-lg`}
+        >
           {nodeTabs.map(t => (
             <button
               key={t.id}
               type="button"
               onClick={() => setDeviceTab(t.id)}
               className={`py-1.5 px-1 rounded-md text-xs font-semibold whitespace-nowrap truncate transition-colors ${
-                deviceTab === t.id
+                effectiveTab === t.id
                   ? 'bg-white dark:bg-slate-900 text-[#155EEF] dark:text-blue-400 shadow-2xs'
                   : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
               }`}
@@ -299,7 +346,7 @@ export const DeviceNodeInspector: React.FC<DeviceNodeInspectorProps> = ({
         )}
 
         {/* TAB 1: CHUNG */}
-        {deviceTab === 'general' && (
+        {effectiveTab === 'general' && (
           <div className="space-y-3">
             {selectedAsset ? (
               <>
@@ -317,18 +364,20 @@ export const DeviceNodeInspector: React.FC<DeviceNodeInspectorProps> = ({
                   </div>
 
                   <div className="grid grid-cols-2 gap-2">
-                    <div>
-                      <label className="text-slate-600 dark:text-slate-400 text-xs font-medium block mb-1">
-                        Mã tài sản
-                      </label>
-                      <input
-                        type="text"
-                        value={selectedAsset.assetTag}
-                        onChange={e => onUpdateAsset(selectedAsset.id, { assetTag: e.target.value })}
-                        className="w-full px-2 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 font-mono text-xs disabled:opacity-70"
-                      />
-                    </div>
-                    <div>
+                    {!isBasicMode && (
+                      <div>
+                        <label className="text-slate-600 dark:text-slate-400 text-xs font-medium block mb-1">
+                          Mã tài sản
+                        </label>
+                        <input
+                          type="text"
+                          value={selectedAsset.assetTag}
+                          onChange={e => onUpdateAsset(selectedAsset.id, { assetTag: e.target.value })}
+                          className="w-full px-2 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 font-mono text-xs disabled:opacity-70"
+                        />
+                      </div>
+                    )}
+                    <div className={isBasicMode ? 'col-span-2' : ''}>
                       <label className="text-slate-600 dark:text-slate-400 text-xs font-medium block mb-1">
                         Trạng thái
                       </label>
@@ -373,29 +422,80 @@ export const DeviceNodeInspector: React.FC<DeviceNodeInspectorProps> = ({
                   </div>
                 </fieldset>
 
-                <div className="grid grid-cols-2 divide-x divide-slate-200 dark:divide-slate-800 border border-slate-200 dark:border-slate-800 rounded-md bg-slate-50/50 dark:bg-slate-800/30">
-                  <div className="px-3 py-2">
-                    <div className="text-xs text-slate-500 dark:text-slate-400">Số cổng</div>
-                    <div className="font-semibold font-mono tabular-nums text-slate-900 dark:text-white mt-0.5">
-                      {assetPorts.length} cổng
+                {/* Smart Context Card tailored to Device Category */}
+                {selectedAsset.category === 'ups' ? (() => {
+                  const specs = selectedAsset.upsSpecs || {
+                    batteryAh: 9,
+                    batteryVoltageV: 12,
+                    batteryCount: 8,
+                    inverterEfficiency: 0.85,
+                    dodFactor: 0.8
+                  };
+                  const usableWh = Math.round(
+                    specs.batteryAh *
+                      specs.batteryVoltageV *
+                      specs.batteryCount *
+                      (specs.inverterEfficiency ?? 0.85) *
+                      (specs.dodFactor ?? 0.8)
+                  );
+                  return (
+                    <div className="grid grid-cols-2 divide-x divide-slate-200 dark:divide-slate-800 border border-rose-200 dark:border-rose-900/60 rounded-md bg-rose-50/40 dark:bg-rose-950/20">
+                      <div className="px-3 py-2">
+                        <div className="text-xs text-slate-500 dark:text-slate-400">Công suất UPS</div>
+                        <div className="font-semibold font-mono tabular-nums text-slate-900 dark:text-white mt-0.5">
+                          {selectedAsset.powerWatts || 0} W
+                        </div>
+                      </div>
+                      <div className="px-3 py-2">
+                        <div className="text-xs text-slate-500 dark:text-slate-400">Ắc quy ({specs.batteryCount} bình)</div>
+                        <div className="font-semibold font-mono tabular-nums text-rose-700 dark:text-rose-300 mt-0.5">
+                          {usableWh} Wh
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })() : (
+                  <div className="grid grid-cols-2 divide-x divide-slate-200 dark:divide-slate-800 border border-slate-200 dark:border-slate-800 rounded-md bg-slate-50/50 dark:bg-slate-800/30">
+                    <div className="px-3 py-2">
+                      <div className="text-xs text-slate-500 dark:text-slate-400">
+                        {isPseDevice(selectedAsset) ? 'Ngân sách PoE' : 'Số cổng'}
+                      </div>
+                      <div className="font-semibold font-mono tabular-nums text-slate-900 dark:text-white mt-0.5">
+                        {isPseDevice(selectedAsset)
+                          ? `${resolvePseBudgetWatts(selectedAsset)}W (${assetPorts.length}P)`
+                          : `${assetPorts.length} cổng`}
+                      </div>
+                    </div>
+                    <div className="px-3 py-2">
+                      <div className="text-xs text-slate-500 dark:text-slate-400">Dây nối</div>
+                      <div className="font-semibold font-mono tabular-nums text-[#155EEF] dark:text-blue-400 mt-0.5">
+                        {connectedCables.length} tuyến
+                      </div>
                     </div>
                   </div>
-                  <div className="px-3 py-2">
-                    <div className="text-xs text-slate-500 dark:text-slate-400">Dây nối</div>
-                    <div className="font-semibold font-mono tabular-nums text-[#155EEF] dark:text-blue-400 mt-0.5">
-                      {connectedCables.length} tuyến
-                    </div>
-                  </div>
-                </div>
+                )}
 
-                <button
-                  type="button"
-                  onClick={() => onOpenDeepInspect(selectedAsset.id)}
-                  className="w-full py-2 px-3 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-100 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors border border-slate-200 dark:border-slate-700"
-                >
-                  <Settings2 className="w-3.5 h-3.5 text-[#155EEF]" />
-                  <span>Cấu hình chuyên sâu</span>
-                </button>
+                {isBasicMode ? (
+                  onSwitchToAdvanced && (
+                    <button
+                      type="button"
+                      onClick={onSwitchToAdvanced}
+                      className="w-full py-2 px-3 bg-blue-50/70 hover:bg-blue-100/70 dark:bg-blue-950/30 dark:hover:bg-blue-950/50 text-[#155EEF] dark:text-blue-300 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors border border-blue-200 dark:border-blue-900/60"
+                    >
+                      <Settings2 className="w-3.5 h-3.5" />
+                      <span>Bật Chế độ Kỹ sư (IP/VLAN, Rack, PoE)</span>
+                    </button>
+                  )
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => onOpenDeepInspect(selectedAsset.id)}
+                    className="w-full py-2 px-3 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-100 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors border border-slate-200 dark:border-slate-700"
+                  >
+                    <Settings2 className="w-3.5 h-3.5 text-[#155EEF]" />
+                    <span>Cấu hình chuyên sâu</span>
+                  </button>
+                )}
               </>
             ) : (
               <fieldset disabled={isReadOnlyMode} className="contents">
@@ -472,13 +572,13 @@ export const DeviceNodeInspector: React.FC<DeviceNodeInspectorProps> = ({
           </div>
         )}
 
-        {/* TAB 2: MẠNG (IP, VLAN, Cổng & Kết nối) */}
-        {deviceTab === 'network' && (
+        {/* TAB 2: MẠNG / KẾT NỐI */}
+        {effectiveTab === 'network' && (
           <div className="space-y-3">
-            {selectedAsset && (
+            {selectedAsset && selectedAsset.category !== 'ups' && (
               <fieldset disabled={isReadOnlyMode} className="space-y-2.5">
                 <div className="grid grid-cols-3 gap-2">
-                  <div className="col-span-2">
+                  <div className={isBasicMode ? 'col-span-3' : 'col-span-2'}>
                     <label className="text-slate-600 dark:text-slate-400 text-xs font-medium block mb-1">
                       Địa chỉ IP
                     </label>
@@ -489,31 +589,35 @@ export const DeviceNodeInspector: React.FC<DeviceNodeInspectorProps> = ({
                       className="w-full px-2 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 font-mono text-xs tabular-nums disabled:opacity-70"
                     />
                   </div>
+                  {!isBasicMode && (
+                    <div>
+                      <label className="text-slate-600 dark:text-slate-400 text-xs font-medium block mb-1">
+                        VLAN
+                      </label>
+                      <input
+                        type="text"
+                        value={selectedAsset.vlan}
+                        onChange={e => onUpdateAsset(selectedAsset.id, { vlan: e.target.value })}
+                        className="w-full px-2 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 font-mono text-xs disabled:opacity-70"
+                        placeholder="10, 20"
+                      />
+                    </div>
+                  )}
+                </div>
+
+                {!isBasicMode && (
                   <div>
                     <label className="text-slate-600 dark:text-slate-400 text-xs font-medium block mb-1">
-                      VLAN
+                      Subnet Mask
                     </label>
                     <input
                       type="text"
-                      value={selectedAsset.vlan}
-                      onChange={e => onUpdateAsset(selectedAsset.id, { vlan: e.target.value })}
+                      value={selectedAsset.subnetMask}
+                      onChange={e => onUpdateAsset(selectedAsset.id, { subnetMask: e.target.value })}
                       className="w-full px-2 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 font-mono text-xs disabled:opacity-70"
-                      placeholder="10, 20"
                     />
                   </div>
-                </div>
-
-                <div>
-                  <label className="text-slate-600 dark:text-slate-400 text-xs font-medium block mb-1">
-                    Subnet Mask
-                  </label>
-                  <input
-                    type="text"
-                    value={selectedAsset.subnetMask}
-                    onChange={e => onUpdateAsset(selectedAsset.id, { subnetMask: e.target.value })}
-                    className="w-full px-2 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 font-mono text-xs disabled:opacity-70"
-                  />
-                </div>
+                )}
               </fieldset>
             )}
 
@@ -664,16 +768,6 @@ export const DeviceNodeInspector: React.FC<DeviceNodeInspectorProps> = ({
                             </span>
                           </div>
                         </button>
-                        {onSelectNode && peerNode && (
-                          <button
-                            type="button"
-                            onClick={() => onSelectNode(peerNode.id)}
-                            title={`Chọn thiết bị đích: ${peerAsset?.name || peerNode.label}`}
-                            className="px-1.5 py-0.5 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 hover:border-[#155EEF] text-[10px] font-semibold text-[#155EEF] dark:text-blue-400 shrink-0"
-                          >
-                            TB →
-                          </button>
-                        )}
                         {!isReadOnlyMode && (
                           <button
                             type="button"
@@ -695,7 +789,7 @@ export const DeviceNodeInspector: React.FC<DeviceNodeInspectorProps> = ({
         )}
 
         {/* TAB 3: VẬT LÝ (Lớp Layer, Tầng, Phòng, Tủ Rack, Công suất PoE, Camera/Wi-Fi) */}
-        {deviceTab === 'physical' && (
+        {effectiveTab === 'physical' && !isBasicMode && (
           <fieldset disabled={isReadOnlyMode} className="space-y-3">
             <div>
               <div className="flex items-center justify-between mb-1">
@@ -788,20 +882,9 @@ export const DeviceNodeInspector: React.FC<DeviceNodeInspectorProps> = ({
 
                 <div className="grid grid-cols-2 gap-2">
                   <div>
-                    <div className="flex items-center justify-between gap-1 mb-1">
-                      <label className="text-slate-600 dark:text-slate-400 text-xs font-medium">
-                        Tủ Rack gá
-                      </label>
-                      {onSelectNode && selectedAsset.rackId && (
-                        <button
-                          type="button"
-                          onClick={() => onSelectNode(selectedAsset.rackId!)}
-                          className="text-[11px] font-semibold text-[#155EEF] dark:text-blue-400 hover:underline"
-                        >
-                          Chọn tủ →
-                        </button>
-                      )}
-                    </div>
+                    <label className="text-slate-600 dark:text-slate-400 text-xs font-medium block mb-1">
+                      Tủ Rack gá
+                    </label>
                     <select
                       value={selectedAsset.rackId || ''}
                       onChange={e => {
@@ -1327,7 +1410,7 @@ export const DeviceNodeInspector: React.FC<DeviceNodeInspectorProps> = ({
         )}
 
         {/* TAB 4: GHI CHÚ + NÂNG CAO ACCORDION */}
-        {deviceTab === 'notes' && (
+        {effectiveTab === 'notes' && (
           <fieldset disabled={isReadOnlyMode} className="space-y-3">
             <div>
               <label className="text-slate-600 dark:text-slate-400 text-xs font-medium block mb-1">

@@ -5,7 +5,10 @@ import {
   createContactShadowTexture,
   createLockBadgeTexture,
   createWorldAxesHelper,
-  setupStudioEnvironment
+  setupStudioEnvironment,
+  applyGlobalShadowMapping,
+  applySceneWireframeMode,
+  getPixelRatioForQuality
 } from './studioEnvironment';
 import {
   populateInfrastructure3DWorld,
@@ -24,6 +27,9 @@ const HachihiViewer3D = {
   createLockBadgeTexture,
   createWorldAxesHelper,
   setupStudioEnvironment,
+  applyGlobalShadowMapping,
+  applySceneWireframeMode,
+  getPixelRatioForQuality,
   populateInfrastructure3DWorld,
   disposeObjectTree,
   extractCameraRotationMatrix,

@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, Suspense, lazy } from 'react';
 import {
   ProjectState,
   DeviceAsset,
@@ -39,8 +39,11 @@ import {
   RackDoorAirflowType
 } from '../../utils/rackAirflow';
 import { DEVICE_CATALOG } from '../../data/deviceCatalog';
-import { Rack3DVisualizer } from '../rack/Rack3DVisualizer';
 import { useFocusTrap } from '../../hooks/useFocusTrap';
+
+const Rack3DVisualizer = lazy(() =>
+  import('../rack/Rack3DVisualizer').then(m => ({ default: m.Rack3DVisualizer }))
+);
 
 const MODAL_SLOT_HEIGHT = 28; // exact pixel height per 1U slot row
 
@@ -462,34 +465,42 @@ export const DeepInspectModal: React.FC<DeepInspectModalProps> = ({
             {/* Left Main Pane: Interactive 3D Rack Visualizer OR 2D Elevation Frame */}
             {rackViewMode === '3d' ? (
               <div className="flex-1 min-h-[480px] h-[62vh] md:h-[68vh] flex flex-col">
-                <Rack3DVisualizer
-                  rack={activeRack}
-                  assets={project.assets}
-                  analysis={airflowAnalysis}
-                  doorType={doorType}
-                  fanCount={fanCount}
-                  onChangeDoorType={setDoorType}
-                  onChangeFanCount={setFanCount}
-                  activeSide={activeSide}
-                  onChangeSide={setActiveSide}
-                  selectedAssetId={selected3DAssetId}
-                  onSelectAsset={setSelected3DAssetId}
-                  draggedExternalAsset={dragInfo}
-                  highlightedGap={highlightedGap}
-                  onAssignDeviceToRackSlot={(_rackId, assetId, preferredU, side) =>
-                    assignToU(preferredU, assetId, side)
+                <Suspense
+                  fallback={
+                    <div className="flex-1 flex items-center justify-center rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-950/90 text-slate-300 text-xs font-medium">
+                      Đang tải trình mô phỏng Tủ Rack 3D...
+                    </div>
                   }
-                  onRemoveDeviceFromRackSlot={(_rackId, assetIdOrU, side) => {
-                    if (typeof assetIdOrU === 'number') {
-                      unmountSlot(assetIdOrU, side);
-                    } else if (onRemoveDeviceFromRackSlot) {
-                      onRemoveDeviceFromRackSlot(activeRack.id, assetIdOrU, side);
+                >
+                  <Rack3DVisualizer
+                    rack={activeRack}
+                    assets={project.assets}
+                    analysis={airflowAnalysis}
+                    doorType={doorType}
+                    fanCount={fanCount}
+                    onChangeDoorType={setDoorType}
+                    onChangeFanCount={setFanCount}
+                    activeSide={activeSide}
+                    onChangeSide={setActiveSide}
+                    selectedAssetId={selected3DAssetId}
+                    onSelectAsset={setSelected3DAssetId}
+                    draggedExternalAsset={dragInfo}
+                    highlightedGap={highlightedGap}
+                    onAssignDeviceToRackSlot={(_rackId, assetId, preferredU, side) =>
+                      assignToU(preferredU, assetId, side)
                     }
-                  }}
-                  onDropPresetIntoRack={onDropPresetIntoRack}
-                  onNotify={showAlert}
-                  isDark={resolvedDark}
-                />
+                    onRemoveDeviceFromRackSlot={(_rackId, assetIdOrU, side) => {
+                      if (typeof assetIdOrU === 'number') {
+                        unmountSlot(assetIdOrU, side);
+                      } else if (onRemoveDeviceFromRackSlot) {
+                        onRemoveDeviceFromRackSlot(activeRack.id, assetIdOrU, side);
+                      }
+                    }}
+                    onDropPresetIntoRack={onDropPresetIntoRack}
+                    onNotify={showAlert}
+                    isDark={resolvedDark}
+                  />
+                </Suspense>
               </div>
             ) : (
             <div className="flex-1 flex flex-col items-center">

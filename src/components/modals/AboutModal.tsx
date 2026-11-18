@@ -287,11 +287,11 @@ export const AboutModal: React.FC<AboutModalProps> = ({
               <button
                 type="button"
                 disabled
-                title="Liên kết Google Form góp ý đang được hoàn thiện (Sắp có)"
+                title="Chưa cấu hình liên kết biểu mẫu góp ý"
                 className="h-9 px-3.5 rounded-md border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap cursor-not-allowed"
               >
                 <MessageSquarePlus className="w-3.5 h-3.5" />
-                <span>Góp ý (Sắp có)</span>
+                <span>Góp ý</span>
               </button>
             )}
           </div>

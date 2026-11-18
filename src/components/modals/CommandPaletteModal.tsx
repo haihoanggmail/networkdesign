@@ -168,6 +168,8 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
     }
   }, [isOpen]);
 
+  const activeKeymap = useMemo(() => keymap || getDefaultShortcutKeymap(), [keymap]);
+
   const actions: CommandPaletteAction[] = useMemo(() => {
     const base: CommandPaletteAction[] = [
       {
@@ -175,6 +177,7 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
         title: 'Tự định tuyến toàn bộ tuyến cáp (Tránh vật cản)',
         subtitle: 'Tự động đi dây vuông góc vòng qua thiết bị và tủ Rack trên trang vẽ',
         category: 'Thao tác nhanh',
+        shortcut: formatShortcutDisplay(activeKeymap.auto_route),
         keywords: ['auto route', 'tu dinh tuyen', 'di day', 'tranh vat can', 'cap'],
         icon: <Route className="w-4 h-4 text-blue-600" />,
         run: onAutoRouteAllCables
@@ -186,6 +189,7 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
               title: 'Tự động gán địa chỉ IP theo sơ đồ',
               subtitle: 'Đánh số IP, Subnet Mask & Gateway từ Router/Core xuống thiết bị theo sơ đồ kết nối',
               category: 'Thao tác nhanh' as const,
+              shortcut: formatShortcutDisplay(activeKeymap.auto_assign_ip),
               keywords: ['tu gan ip', 'cap phat ip', 'subnet', 'gateway', 'ipam'],
               icon: <Wand2 className="w-4 h-4 text-blue-600" />,
               run: onAutoAssignIps
@@ -310,7 +314,7 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
               title: 'Sao chép / Nhân bản đối tượng đang chọn',
               subtitle: 'Tạo bản sao thiết bị giữ nguyên thông số kỹ thuật',
               category: 'Thao tác nhanh' as const,
-              shortcut: 'Ctrl+D',
+              shortcut: formatShortcutDisplay(activeKeymap.duplicate),
               keywords: ['sao chep', 'nhan ban', 'duplicate', 'copy'],
               icon: <Copy className="w-4 h-4 text-slate-600" />,
               run: onDuplicateSelected
@@ -324,7 +328,7 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
               title: 'Chọn tất cả đối tượng trên trang',
               subtitle: 'Chọn toàn bộ thiết bị trên chế độ/tầng đang mở',
               category: 'Thao tác nhanh' as const,
-              shortcut: 'Ctrl+A',
+              shortcut: formatShortcutDisplay(activeKeymap.select_all),
               keywords: ['chon tat ca', 'select all'],
               icon: <CheckSquare className="w-4 h-4 text-slate-600" />,
               run: onSelectAll
@@ -336,6 +340,7 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
         title: 'Xuất bản vẽ (Excel / PDF / SVG / DXF)',
         subtitle: 'Mở hộp thoại xuất hồ sơ thi công và sao lưu JSON',
         category: 'Thao tác nhanh',
+        shortcut: formatShortcutDisplay(activeKeymap.export_project),
         keywords: ['xuat ho so', 'dxf', 'svg', 'png', 'html', 'excel', 'csv', 'goi du an'],
         icon: <Download className="w-4 h-4 text-blue-600" />,
         run: onOpenExport
@@ -345,7 +350,7 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
         title: 'Lưu ngay dự án vào IndexedDB',
         subtitle: 'Ghi bản lưu an toàn trong trình duyệt',
         category: 'Thao tác nhanh',
-        shortcut: 'Ctrl+S',
+        shortcut: formatShortcutDisplay(activeKeymap.save),
         icon: <Save className="w-4 h-4 text-emerald-600" />,
         run: onSaveNow
       },
@@ -542,10 +547,9 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
     onDuplicateSelected,
     onSelectAll,
     onOpenAbout,
-    onOpenGuide
+    onOpenGuide,
+    activeKeymap
   ]);
-
-  const activeKeymap = useMemo(() => keymap || getDefaultShortcutKeymap(), [keymap]);
 
   const recentItems: CommandPaletteAction[] = useMemo(() => {
     if (!onReplayRecentAction || recentActions.length === 0) return [];

@@ -35,11 +35,16 @@ import { CableBundleInfo } from '../../utils/cableRouting';
 import { CanvasCableGeometry, OpenInlineCableLabelFn } from './canvasTypes';
 import { useFloatingPanel } from '../../hooks/useFloatingPanel';
 
-interface TouchContextMenuState {
-  kind: 'node' | 'edge';
+import { SmartCopyPasteOptions } from '../../store/useProjectStore';
+
+export interface TouchContextMenuState {
+  kind: 'node' | 'edge' | 'canvas';
   id: string;
   x: number;
   y: number;
+  targetNodeIds?: string[];
+  canvasX?: number;
+  canvasY?: number;
 }
 
 interface CanvasHudControlsProps {
@@ -85,6 +90,9 @@ interface CanvasHudControlsProps {
   onAddQuickDevice?: () => void;
   onOpenCommandPalette?: () => void;
   onDuplicateNodes?: (nodeIds: string[]) => void;
+  smartClipboardNodeIds?: string[];
+  onSmartCopyPasteNodes?: (nodeIds?: string[], options?: SmartCopyPasteOptions) => void;
+  onCopyNodesToClipboard?: (nodeIds: string[]) => void;
   onToggleNodeLock?: (nodeIds: string[]) => void;
   onOpenDeepInspect: (id: string) => void;
   onDeleteSelected: () => void;
@@ -137,6 +145,9 @@ export const CanvasHudControls: React.FC<CanvasHudControlsProps> = ({
   onOpenTemplates,
   onAddQuickDevice,
   onDuplicateNodes,
+  smartClipboardNodeIds = [],
+  onSmartCopyPasteNodes,
+  onCopyNodesToClipboard,
   onToggleNodeLock,
   onOpenDeepInspect,
   onDeleteSelected,
@@ -503,22 +514,95 @@ export const CanvasHudControls: React.FC<CanvasHudControlsProps> = ({
         </div>
       )}
 
-      {/* Touch Long-Press Contextual Menu */}
+      {/* Contextual Menu (Right-click & Touch Long-Press) */}
       {touchContextMenu && (
         <div
           onPointerDown={e => e.stopPropagation()}
+          onContextMenu={e => e.preventDefault()}
           style={{ left: touchContextMenu.x, top: touchContextMenu.y }}
           role="menu"
           aria-label="Menu thao tác nhanh"
-          className="absolute z-40 w-56 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-2xl p-1.5 space-y-1 text-xs no-print"
+          className="absolute z-40 w-64 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-2xl p-1.5 space-y-1 text-xs no-print"
         >
-          {touchContextMenu.kind === 'node' ? (() => {
+          {touchContextMenu.kind === 'canvas' ? (() => {
+            const pasteTargets =
+              smartClipboardNodeIds.length > 0
+                ? smartClipboardNodeIds
+                : Array.from(selectedNodeIdSet);
+            return (
+              <>
+                <div className="px-2 py-1 text-xs font-bold text-slate-500 truncate border-b border-slate-100 dark:border-slate-800">
+                  Thao tác Canvas
+                </div>
+                {!isReadOnlyMode && onSmartCopyPasteNodes && (
+                  <button
+                    type="button"
+                    disabled={pasteTargets.length === 0}
+                    onClick={() => {
+                      if (pasteTargets.length > 0) {
+                        onSmartCopyPasteNodes(pasteTargets, {
+                          targetCanvasPos:
+                            touchContextMenu.canvasX !== undefined && touchContextMenu.canvasY !== undefined
+                              ? { x: touchContextMenu.canvasX, y: touchContextMenu.canvasY }
+                              : undefined
+                        });
+                      }
+                      onSetTouchContextMenu(null);
+                    }}
+                    className="touch-target w-full px-2.5 py-2 rounded-lg text-left hover:bg-blue-50 dark:hover:bg-slate-800 disabled:opacity-45 disabled:cursor-not-allowed flex items-center justify-between gap-2 font-medium"
+                  >
+                    <span className="flex items-center gap-2">
+                      <Copy className="w-4 h-4 text-[#155EEF]" />
+                      <span>Dán thông minh tại đây</span>
+                    </span>
+                    {pasteTargets.length > 0 && (
+                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-blue-100 dark:bg-blue-900/50 text-[#155EEF] dark:text-blue-300">
+                        {pasteTargets.length}
+                      </span>
+                    )}
+                  </button>
+                )}
+                {onSelectMultipleNodes && visibleNodes.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onSelectMultipleNodes(visibleNodes.map(n => n.id));
+                      onSetTouchContextMenu(null);
+                    }}
+                    className="touch-target w-full px-2.5 py-2 rounded-lg text-left hover:bg-blue-50 dark:hover:bg-slate-800 flex items-center gap-2 font-medium"
+                  >
+                    <Check className="w-4 h-4 text-slate-600 dark:text-slate-300" />
+                    <span>Chọn tất cả ({visibleNodes.length})</span>
+                  </button>
+                )}
+                {!isReadOnlyMode && onAddQuickDevice && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onAddQuickDevice();
+                      onSetTouchContextMenu(null);
+                    }}
+                    className="touch-target w-full px-2.5 py-2 rounded-lg text-left hover:bg-blue-50 dark:hover:bg-slate-800 flex items-center gap-2 font-medium"
+                  >
+                    <Plus className="w-4 h-4 text-emerald-600" />
+                    <span>Thêm thiết bị mới</span>
+                  </button>
+                )}
+              </>
+            );
+          })() : touchContextMenu.kind === 'node' ? (() => {
             const targetNode = nodeMap.get(touchContextMenu.id);
             if (!targetNode) return null;
+            const contextNodeIds =
+              touchContextMenu.targetNodeIds && touchContextMenu.targetNodeIds.length > 0
+                ? touchContextMenu.targetNodeIds
+                : [targetNode.id];
+            const isMultiContext = contextNodeIds.length > 1;
             return (
               <>
                 <div className="px-2 py-1 text-xs font-bold text-slate-500 truncate border-b border-slate-100 dark:border-slate-800">
                   {targetNode.label}
+                  {isMultiContext ? ` (+${contextNodeIds.length - 1} nút)` : ''}
                 </div>
                 {!isReadOnlyMode && (
                   <button
@@ -533,11 +617,46 @@ export const CanvasHudControls: React.FC<CanvasHudControlsProps> = ({
                     <span>Đổi biểu tượng / Logo</span>
                   </button>
                 )}
-                {!isReadOnlyMode && onDuplicateNodes && (
+                {!isReadOnlyMode && onSmartCopyPasteNodes && (
+                  <button
+                    type="button"
+                    data-testid="ctx-smart-copy-paste"
+                    onClick={() => {
+                      onSmartCopyPasteNodes(contextNodeIds);
+                      onSetTouchContextMenu(null);
+                    }}
+                    className="touch-target w-full px-2.5 py-2 rounded-lg text-left hover:bg-blue-50 dark:hover:bg-blue-950/40 flex items-center justify-between gap-2 font-semibold text-[#155EEF] dark:text-blue-400"
+                    title="Nhân bản thông minh, giữ nguyên liên kết cáp tương đối, cổng kết nối và customData"
+                  >
+                    <span className="flex items-center gap-2">
+                      <GitBranch className="w-4 h-4 shrink-0" />
+                      <span>Sao chép &amp; Dán thông minh</span>
+                    </span>
+                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-blue-100 dark:bg-blue-900/60">
+                      +Cáp
+                    </span>
+                  </button>
+                )}
+                {!isReadOnlyMode && onCopyNodesToClipboard && (
+                  <button
+                    type="button"
+                    data-testid="ctx-smart-copy"
+                    onClick={() => {
+                      onCopyNodesToClipboard(contextNodeIds);
+                      onSetTouchContextMenu(null);
+                    }}
+                    className="touch-target w-full px-2.5 py-2 rounded-lg text-left hover:bg-blue-50 dark:hover:bg-slate-800 flex items-center gap-2 font-medium"
+                    title="Sao chép vào bộ nhớ tạm để dán tại vị trí bất kỳ trên Canvas"
+                  >
+                    <Copy className="w-4 h-4 text-slate-600 dark:text-slate-300" />
+                    <span>Sao chép thông minh ({contextNodeIds.length})</span>
+                  </button>
+                )}
+                {!isReadOnlyMode && onDuplicateNodes && !onSmartCopyPasteNodes && (
                   <button
                     type="button"
                     onClick={() => {
-                      onDuplicateNodes([targetNode.id]);
+                      onDuplicateNodes(contextNodeIds);
                       onSetTouchContextMenu(null);
                     }}
                     className="touch-target w-full px-2.5 py-2 rounded-lg text-left hover:bg-blue-50 dark:hover:bg-slate-800 flex items-center gap-2 font-medium"
@@ -550,7 +669,7 @@ export const CanvasHudControls: React.FC<CanvasHudControlsProps> = ({
                   <button
                     type="button"
                     onClick={() => {
-                      onToggleNodeLock([targetNode.id]);
+                      onToggleNodeLock(contextNodeIds);
                       onSetTouchContextMenu(null);
                     }}
                     className="touch-target w-full px-2.5 py-2 rounded-lg text-left hover:bg-blue-50 dark:hover:bg-slate-800 flex items-center gap-2 font-medium"

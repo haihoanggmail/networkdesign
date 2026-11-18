@@ -7,7 +7,6 @@ import {
   Floor,
   ProjectState,
   Room,
-  SelectionState,
   ServerRack
 } from '../../../types/infrastructure';
 import {
@@ -20,7 +19,24 @@ import {
   isNodeEffectivelyLocked,
   resolveNodeLayer
 } from '../../../utils/layerPolicy';
-import { resolve3DHighlightedIds } from '../../../utils/selectionSync';
+import {
+  applySceneWireframeMode,
+  StudioRenderQuality
+} from './studioEnvironment';
+import {
+  disposeThreeObjectTree,
+  ThreeResourceRegistry
+} from './resourceRegistry';
+import {
+  classifyTempRisk,
+  computeRackThermalOverlayData,
+  getSubDeviceThermalReading,
+  RackThermalOverlayData,
+  ThermalRiskLevel,
+  thermalHeatToColor
+} from '../../../utils/rackAirflow';
+
+export type DetailLodLevel = 'high' | 'medium' | 'low' | 'collapsed';
 
 export const WORLD_SCALE = 1 / 48;
 
@@ -71,35 +87,6 @@ export function canvasToWorldXZ(
   };
 }
 
-export function worldXZToCanvas(
-  wx: number,
-  wz: number,
-  origin: WorldCoordinateOrigin
-): { x: number; y: number } {
-  return {
-    x: origin.centerX + wx / WORLD_SCALE,
-    y: origin.centerY + wz / WORLD_SCALE
-  };
-}
-
-export function getFloorElevationY(
-  project: Pick<ProjectState, 'activeMode' | 'floors' | 'activeFloorId'>,
-  floorId: string | undefined,
-  explodeSpread: number,
-  viewAllFloors: boolean
-): number {
-  const isFloorBasedMode = ['floorplan', 'cctv', 'wifi', 'fiber'].includes(project.activeMode);
-  const isMultiFloorCutaway = Boolean(
-    viewAllFloors && isFloorBasedMode && project.floors.length > 1
-  );
-  if (!isMultiFloorCutaway || !floorId) return 0;
-  const sortedFloors = [...project.floors].sort((a, b) => a.level - b.level);
-  const idx = sortedFloors.findIndex(f => f.id === floorId);
-  if (idx < 0) return 0;
-  const floorStepY = 3.25 + explodeSpread * 1.15;
-  return idx * floorStepY;
-}
-
 function tagSelectableSubtree(
   group: THREE.Object3D,
   selectType: 'node' | 'rack',
@@ -108,11 +95,12 @@ function tagSelectableSubtree(
   label: string,
   castShadow: boolean
 ) {
-  group.userData = { selectType, selectId, nodeId, label };
+  group.userData = { ...group.userData, selectType, selectId, nodeId, label };
   group.traverse(child => {
-    child.userData = { selectType, selectId, nodeId, label };
+    child.userData = { ...child.userData, selectType, selectId, nodeId, label };
     if (child instanceof THREE.Mesh) {
       if (
+        !child.userData.noShadow &&
         child.name !== 'contact_shadow' &&
         child.name !== 'selection_ring' &&
         child.name !== 'locked_indicator_ring'
@@ -122,6 +110,115 @@ function tagSelectableSubtree(
       }
     }
   });
+}
+
+function createRackThermalCurtainTexture(
+  thermalData: RackThermalOverlayData,
+  units: number
+): THREE.CanvasTexture | null {
+  if (typeof document === 'undefined') return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = 48;
+  canvas.height = 256;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const grad = ctx.createLinearGradient(0, canvas.height, 0, 0);
+  const maxU = Math.max(1, units);
+
+  for (let i = 0; i <= 8; i++) {
+    const t = i / 8;
+    const u = Math.max(1, Math.min(maxU, Math.round(1 + t * (maxU - 1))));
+    const reading = thermalData.unitReadings.find(r => r.u === u);
+    const heatNorm = reading ? reading.heatNorm : 0.25;
+    const zone = reading ? reading.zone : 'nominal';
+    grad.addColorStop(t, thermalHeatToColor(heatNorm, zone));
+  }
+
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Horizontal U-band micro striations for technical clarity
+  ctx.fillStyle = 'rgba(255,255,255,0.16)';
+  for (let u = 1; u <= maxU; u += 2) {
+    const y = canvas.height * (1 - u / maxU);
+    ctx.fillRect(0, y, canvas.width, 1.5);
+  }
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+function createRackTempBadgeSprite(
+  label: string,
+  tempC: number,
+  zone: ThermalRiskLevel
+): THREE.Sprite | null {
+  if (typeof document === 'undefined') return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = 256;
+  canvas.height = 68;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+
+  const badgeBg =
+    zone === 'hot'
+      ? 'rgba(153, 27, 27, 0.94)'
+      : zone === 'warm'
+      ? 'rgba(146, 64, 14, 0.94)'
+      : zone === 'cool'
+      ? 'rgba(12, 74, 110, 0.94)'
+      : 'rgba(6, 78, 59, 0.94)';
+  const accent =
+    zone === 'hot'
+      ? '#f87171'
+      : zone === 'warm'
+      ? '#fbbf24'
+      : zone === 'cool'
+      ? '#38bdf8'
+      : '#34d399';
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = badgeBg;
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.roundRect(4, 4, canvas.width - 8, canvas.height - 8, 14);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.fillStyle = accent;
+  ctx.beginPath();
+  ctx.arc(24, 34, 7, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = '600 18px Inter, system-ui, sans-serif';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label.slice(0, 12), 40, 24);
+
+  ctx.fillStyle = '#ffffff';
+  ctx.font = '700 24px monospace';
+  ctx.fillText(`${tempC.toFixed(1)}°C`, 40, 48);
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.needsUpdate = true;
+
+  const spriteMat = new THREE.SpriteMaterial({
+    map: tex,
+    transparent: true,
+    depthTest: false
+  });
+  const sprite = new THREE.Sprite(spriteMat);
+  sprite.scale.set(0.86, 0.23, 1);
+  sprite.renderOrder = 22;
+  sprite.userData.excludeWireframe = true;
+  sprite.userData.noShadow = true;
+  return sprite;
 }
 
 function addContactShadow(
@@ -222,9 +319,21 @@ function buildRackGroup(
   castShadow: boolean,
   shadowTex: THREE.Texture,
   lockBadgeTex?: THREE.Texture,
-  isFloorplanWallMount = false
+  isFloorplanWallMount = false,
+  detailLevel: DetailLodLevel = 'high',
+  showThermalHeatmap = true
 ): THREE.Group {
   const group = new THREE.Group();
+  const isCollapsed = detailLevel === 'collapsed' || Boolean(node.customData?.collapsed);
+  const isReducedDetail = isCollapsed || detailLevel === 'low';
+  const effectiveLod: DetailLodLevel = isCollapsed ? 'collapsed' : detailLevel;
+  group.userData.rackCollapsed = isCollapsed;
+  group.userData.lodLevel = effectiveLod;
+  const thermalData = computeRackThermalOverlayData(rack, assets, node);
+  const peakZone = classifyTempRisk(thermalData.peakTempC);
+  group.userData.thermalPeakTempC = thermalData.peakTempC;
+  group.userData.thermalHasHardwareSensors = thermalData.hasHardwareSensors;
+
   const units = rack?.totalUnits || node.customData?.totalUnits || 42;
   const isSmallWallRack = isFloorplanWallMount && units <= 18;
   const rackH = isSmallWallRack
@@ -268,52 +377,56 @@ function buildRackGroup(
     wallBracket.position.set(0, rackH / 2 + 0.04, -rackD / 2 - 0.02);
     cabinetBody.add(wallBracket);
 
-    // Side blue cable bundle cuff exiting right toward vertical Riser shaft
-    const cableCuff = new THREE.Mesh(
-      new THREE.BoxGeometry(0.14, 0.24, 0.22),
-      blueHarnessMat
-    );
-    cableCuff.position.set(rackW / 2 + 0.05, rackH * 0.28, -0.05);
-    cabinetBody.add(cableCuff);
+    if (!isCollapsed) {
+      // Side blue cable bundle cuff exiting right toward vertical Riser shaft
+      const cableCuff = new THREE.Mesh(
+        new THREE.BoxGeometry(0.14, 0.24, 0.22),
+        blueHarnessMat
+      );
+      cableCuff.position.set(rackW / 2 + 0.05, rackH * 0.28, -0.05);
+      cabinetBody.add(cableCuff);
+    }
   } else {
-    // 1. Base plinth + leveling feet for floor-standing racks (42U Main Rack)
+    // 1. Base plinth for floor-standing racks (42U Main Rack)
     const plinth = new THREE.Mesh(new THREE.BoxGeometry(rackW, 0.08, rackD), darkMetalMat);
     plinth.position.y = 0.06;
     cabinetBody.add(plinth);
 
-    const footGeo = new THREE.CylinderGeometry(0.05, 0.06, 0.05, 12);
-    const fx = rackW * 0.42;
-    const fz = rackD * 0.42;
-    for (const [sx, sz] of [
-      [-fx, -fz],
-      [fx, -fz],
-      [-fx, fz],
-      [fx, fz]
-    ]) {
-      const foot = new THREE.Mesh(footGeo, railMat);
-      foot.position.set(sx, 0.025, sz);
-      cabinetBody.add(foot);
-    }
+    if (!isReducedDetail) {
+      const footGeo = new THREE.CylinderGeometry(0.05, 0.06, 0.05, 12);
+      const fx = rackW * 0.42;
+      const fz = rackD * 0.42;
+      for (const [sx, sz] of [
+        [-fx, -fz],
+        [fx, -fz],
+        [-fx, fz],
+        [fx, fz]
+      ]) {
+        const foot = new THREE.Mesh(footGeo, railMat);
+        foot.position.set(sx, 0.025, sz);
+        cabinetBody.add(foot);
+      }
 
-    // Dual top cooling fan circles on canopy
-    const fanMat = new THREE.MeshStandardMaterial({
-      color: 0x334155,
-      roughness: 0.35,
-      metalness: 0.78
-    });
-    for (const fanX of [-rackW * 0.22, rackW * 0.22]) {
-      const fanRing = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.18, 0.03, 18), fanMat);
-      fanRing.position.set(fanX, rackH + 0.115, 0);
-      cabinetBody.add(fanRing);
-    }
+      // Dual top cooling fan circles on canopy
+      const fanMat = new THREE.MeshStandardMaterial({
+        color: 0x334155,
+        roughness: 0.35,
+        metalness: 0.78
+      });
+      for (const fanX of [-rackW * 0.22, rackW * 0.22]) {
+        const fanRing = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.18, 0.03, 18), fanMat);
+        fanRing.position.set(fanX, rackH + 0.115, 0);
+        cabinetBody.add(fanRing);
+      }
 
-    // Vertical blue cable trunk harness on right side of Main Rack
-    const verticalHarness = new THREE.Mesh(
-      new THREE.BoxGeometry(0.11, rackH * 0.86, 0.18),
-      blueHarnessMat
-    );
-    verticalHarness.position.set(rackW / 2 + 0.04, rackH * 0.48, -0.14);
-    cabinetBody.add(verticalHarness);
+      // Vertical blue cable trunk harness on right side of Main Rack
+      const verticalHarness = new THREE.Mesh(
+        new THREE.BoxGeometry(0.11, rackH * 0.86, 0.18),
+        blueHarnessMat
+      );
+      verticalHarness.position.set(rackW / 2 + 0.04, rackH * 0.48, -0.14);
+      cabinetBody.add(verticalHarness);
+    }
   }
 
   // Bottom floor plate (especially visible for wall-mounted rack)
@@ -343,76 +456,208 @@ function buildRackGroup(
   backPanel.position.set(0, rackH / 2 + 0.05, -rackD / 2 + 0.03);
   cabinetBody.add(backPanel);
 
-  // Subtle smoked glass side/front trim frame
-  const glassTrimMat = new THREE.MeshStandardMaterial({
-    color: 0x38bdf8,
-    roughness: 0.18,
-    metalness: 0.25,
-    transparent: true,
-    opacity: 0.16
-  });
-  const frontGlass = new THREE.Mesh(
-    new THREE.BoxGeometry(rackW - 0.18, rackH - 0.14, 0.02),
-    glassTrimMat
-  );
-  frontGlass.position.set(0, rackH / 2 + 0.05, rackD / 2 - 0.03);
-  cabinetBody.add(frontGlass);
-
-  // Front vertical mounting rails
-  const railGeo = new THREE.BoxGeometry(0.035, rackH - 0.12, 0.035);
-  for (const rx of [-rackW / 2 + 0.11, rackW / 2 - 0.11]) {
-    const rail = new THREE.Mesh(railGeo, railMat);
-    rail.position.set(rx, rackH / 2 + 0.05, rackD / 2 - 0.11);
-    cabinetBody.add(rail);
+  if (!isReducedDetail) {
+    // Subtle smoked glass side/front trim frame
+    const glassTrimMat = new THREE.MeshStandardMaterial({
+      color: 0x38bdf8,
+      roughness: 0.18,
+      metalness: 0.25,
+      transparent: true,
+      opacity: 0.16
+    });
+    const frontGlass = new THREE.Mesh(
+      new THREE.BoxGeometry(rackW - 0.18, rackH - 0.14, 0.02),
+      glassTrimMat
+    );
+    frontGlass.position.set(0, rackH / 2 + 0.05, rackD / 2 - 0.03);
+    cabinetBody.add(frontGlass);
   }
 
-  // Mounted U blades populated from rack.slots
+  if (!isCollapsed) {
+    // Front vertical mounting rails
+    const railGeo = new THREE.BoxGeometry(0.035, rackH - 0.12, 0.035);
+    for (const rx of [-rackW / 2 + 0.11, rackW / 2 - 0.11]) {
+      const rail = new THREE.Mesh(railGeo, railMat);
+      rail.position.set(rx, rackH / 2 + 0.05, rackD / 2 - 0.11);
+      cabinetBody.add(rail);
+    }
+  }
+
+  // Mounted U blades populated from rack.slots (front) & rack.rearSlots (rear)
   const usableH = rackH - 0.16;
   const uStep = usableH / units;
-  const slots = rack?.slots || {};
-  for (const [uStr, assetId] of Object.entries(slots)) {
-    const startU = parseInt(uStr, 10);
-    const asset = assets[assetId];
-    if (!asset || Number.isNaN(startU)) continue;
-    const uH = getAssetUHeight(asset);
-    const bladeH = Math.max(0.038, uH * uStep * 0.88);
-    const bladeY = 0.1 + (startU - 1 + uH / 2) * uStep;
+  const frontSlots = rack?.slots || {};
+  const rearSlots = rack?.rearSlots || {};
+  const hasRearSlots = Object.keys(rearSlots).length > 0;
+  const sharedCollapsedLedMat = isCollapsed
+    ? null
+    : new THREE.MeshStandardMaterial({
+        color: 0x22c55e,
+        emissive: 0x22c55e,
+        emissiveIntensity: 0.9,
+        roughness: 0.3
+      });
 
-    const bladeColor =
-      asset.category === 'ups'
-        ? 0xd97706
-        : asset.category === 'switch' || asset.category === 'core_switch'
-        ? 0x0284c7
-        : asset.category === 'router' || asset.category === 'firewall'
-        ? 0x0ea5e9
-        : asset.category === 'patch_panel' || asset.category === 'odf'
-        ? 0x64748b
-        : 0x334155;
+  const addSideBlades = (sideMap: Record<string, string>, side: 'front' | 'rear') => {
+    for (const [uStr, assetId] of Object.entries(sideMap)) {
+      const startU = parseInt(uStr, 10);
+      const asset = assets[assetId];
+      if (!asset || Number.isNaN(startU)) continue;
+      const uH = getAssetUHeight(asset);
+      const bladeH = Math.max(0.038, uH * uStep * 0.88);
+      const bladeY = 0.1 + (startU - 1 + uH / 2) * uStep;
 
-    const bladeMat = new THREE.MeshStandardMaterial({
-      color: bladeColor,
-      roughness: 0.36,
-      metalness: 0.58
+      const bladeColor =
+        asset.category === 'ups'
+          ? 0xd97706
+          : asset.category === 'switch' || asset.category === 'core_switch'
+          ? 0x0284c7
+          : asset.category === 'router' || asset.category === 'firewall'
+          ? 0x0ea5e9
+          : asset.category === 'patch_panel' || asset.category === 'odf'
+          ? 0x64748b
+          : 0x334155;
+
+      const bladeDepth = hasRearSlots
+        ? rackD * (isCollapsed ? 0.34 : 0.38)
+        : rackD * (isCollapsed ? 0.58 : 0.68);
+      const bladeZ =
+        side === 'rear'
+          ? -rackD * 0.2
+          : hasRearSlots
+          ? rackD * 0.16
+          : 0.02;
+
+      const bladeMat = new THREE.MeshStandardMaterial({
+        color: bladeColor,
+        roughness: isCollapsed ? 0.52 : 0.36,
+        metalness: isCollapsed ? 0.3 : 0.58
+      });
+      const blade = new THREE.Mesh(
+        new THREE.BoxGeometry(rackW - 0.22, bladeH, bladeDepth),
+        bladeMat
+      );
+      const bladeThermal = getSubDeviceThermalReading(thermalData, startU, uH);
+      blade.position.set(0, bladeY, bladeZ);
+      blade.name = isCollapsed ? 'subdevice_proxy_lod' : 'subdevice_blade';
+      blade.userData.subDeviceLod = effectiveLod;
+      blade.userData.subDeviceAssetId = asset.id;
+      blade.userData.subDeviceRackId = rack?.id || node.id;
+      blade.userData.subDeviceStartU = startU;
+      blade.userData.subDeviceUHeight = uH;
+      blade.userData.subDeviceSide = side;
+      blade.userData.subDeviceTempC = bladeThermal.tempC;
+      blade.userData.subDeviceZone = bladeThermal.zone;
+      blade.userData.subDeviceHeatBtu = Math.round((asset.powerWatts || 0) * 3.41214);
+      cabinetBody.add(blade);
+
+      // Omit per-device LED indicator sub-meshes when rack is collapsed or quality is low
+      if (!isReducedDetail && sharedCollapsedLedMat && side === 'front') {
+        const led = new THREE.Mesh(
+          new THREE.BoxGeometry(0.08, Math.min(0.022, bladeH * 0.42), 0.02),
+          sharedCollapsedLedMat
+        );
+        led.position.set(-rackW * 0.28, bladeY, rackD * 0.36);
+        led.name = 'subdevice_led';
+        cabinetBody.add(led);
+      }
+    }
+  };
+
+  addSideBlades(frontSlots, 'front');
+  if (hasRearSlots) {
+    addSideBlades(rearSlots, 'rear');
+  }
+
+  // 3D Thermal Heatmap Overlay (translucent U-thermal gradient curtains + sensor temperature sprites)
+  const shouldRenderNodeThermal =
+    showThermalHeatmap && node.customData?.showThermalOverlay !== false;
+  if (shouldRenderNodeThermal) {
+    const thermalGroup = new THREE.Group();
+    thermalGroup.name = 'thermal_heatmap_overlay';
+    thermalGroup.userData.excludeWireframe = true;
+    thermalGroup.userData.noShadow = true;
+    thermalGroup.userData.sensorCount = thermalData.sensors.length;
+    thermalGroup.userData.peakTempC = thermalData.peakTempC;
+
+    const curtainTex = createRackThermalCurtainTexture(thermalData, units);
+    const curtainMat = new THREE.MeshBasicMaterial({
+      ...(curtainTex ? { map: curtainTex } : {}),
+      color: curtainTex ? 0xffffff : peakZone === 'hot' ? 0xef4444 : 0x0ea5e9,
+      transparent: true,
+      opacity: isCollapsed ? 0.26 : 0.32,
+      depthWrite: false,
+      side: THREE.DoubleSide
     });
-    const blade = new THREE.Mesh(
-      new THREE.BoxGeometry(rackW - 0.22, bladeH, rackD * 0.68),
-      bladeMat
-    );
-    blade.position.set(0, bladeY, 0.02);
-    cabinetBody.add(blade);
 
-    const ledMat = new THREE.MeshStandardMaterial({
-      color: 0x22c55e,
-      emissive: 0x22c55e,
-      emissiveIntensity: 0.9,
-      roughness: 0.3
-    });
-    const led = new THREE.Mesh(
-      new THREE.BoxGeometry(0.08, Math.min(0.022, bladeH * 0.42), 0.02),
-      ledMat
+    // Side right thermal heatmap fin/curtain + front thin wash
+    const rightCurtain = new THREE.Mesh(
+      new THREE.PlaneGeometry(rackD * 0.88, usableH),
+      curtainMat
     );
-    led.position.set(-rackW * 0.28, bladeY, rackD * 0.36);
-    cabinetBody.add(led);
+    rightCurtain.rotation.y = Math.PI / 2;
+    rightCurtain.position.set(rackW / 2 + 0.045, 0.1 + usableH / 2, 0);
+    rightCurtain.name = 'thermal_curtain_right';
+    rightCurtain.userData.excludeWireframe = true;
+    rightCurtain.userData.noShadow = true;
+    thermalGroup.add(rightCurtain);
+
+    if (!isCollapsed) {
+      const frontCurtain = new THREE.Mesh(
+        new THREE.PlaneGeometry(rackW - 0.16, usableH),
+        curtainMat
+      );
+      frontCurtain.position.set(0, 0.1 + usableH / 2, rackD / 2 + 0.032);
+      frontCurtain.name = 'thermal_curtain_front';
+      frontCurtain.userData.excludeWireframe = true;
+      frontCurtain.userData.noShadow = true;
+      thermalGroup.add(frontCurtain);
+
+      // Individual rack sensor probe spheres + floating temperature sprites
+      thermalData.sensors.forEach((sensor, idx) => {
+        const uVal = sensor.u ?? Math.round((idx + 0.5) * (units / Math.max(1, thermalData.sensors.length)));
+        const clampedU = Math.max(1, Math.min(units, uVal));
+        const probeY = 0.1 + (clampedU - 0.5) * uStep;
+        const probeColor =
+          sensor.status === 'hot'
+            ? 0xef4444
+            : sensor.status === 'warm'
+            ? 0xf59e0b
+            : sensor.status === 'cool'
+            ? 0x0ea5e9
+            : 0x10b981;
+
+        const probeMat = new THREE.MeshStandardMaterial({
+          color: probeColor,
+          emissive: probeColor,
+          emissiveIntensity: 0.75,
+          roughness: 0.25
+        });
+        const probeSphere = new THREE.Mesh(new THREE.SphereGeometry(0.046, 12, 10), probeMat);
+        probeSphere.position.set(rackW / 2 + 0.075, probeY, idx % 2 === 0 ? 0.16 : -0.16);
+        probeSphere.name = 'thermal_sensor_probe';
+        probeSphere.userData.excludeWireframe = true;
+        probeSphere.userData.noShadow = true;
+        thermalGroup.add(probeSphere);
+
+        const badge = createRackTempBadgeSprite(sensor.label, sensor.temperatureC, sensor.status);
+        if (badge) {
+          badge.position.set(rackW / 2 + 0.56, probeY, idx % 2 === 0 ? 0.16 : -0.16);
+          badge.name = 'thermal_sensor_sprite';
+          thermalGroup.add(badge);
+        }
+      });
+    } else {
+      // Collapsed LOD: single peak sensor temperature sprite above canopy
+      const peakSprite = createRackTempBadgeSprite('Đỉnh nhiệt', thermalData.peakTempC, peakZone);
+      if (peakSprite) {
+        peakSprite.position.set(0, rackH + 0.34, 0);
+        peakSprite.name = 'thermal_collapsed_peak_sprite';
+        thermalGroup.add(peakSprite);
+      }
+    }
+
+    cabinetBody.add(thermalGroup);
   }
 
   if (!isSmallWallRack) {
@@ -426,14 +671,7 @@ function buildRackGroup(
     addSelectionRing(group, 0.92, isLocked);
   }
 
-  tagSelectableSubtree(
-    group,
-    rack ? 'rack' : 'node',
-    rack ? rack.id : node.id,
-    node.id,
-    rack?.name || node.label,
-    castShadow
-  );
+  tagSelectableSubtree(group, 'rack', rack?.id || node.id, node.id, rack?.name || node.label, castShadow);
   return group;
 }
 
@@ -489,6 +727,37 @@ function createTerminalUiTexture(kind: 'workstation' | 'attendance'): THREE.Canv
   return tex;
 }
 
+interface WorldDeviceResourcePool {
+  darkSlateMat: THREE.MeshStandardMaterial;
+  brushedSteelMat: THREE.MeshStandardMaterial;
+  ledGreenMat: THREE.MeshStandardMaterial;
+  chassisMats: Map<string, THREE.MeshStandardMaterial>;
+  terminalUiTextures: Partial<Record<'workstation' | 'attendance', THREE.CanvasTexture | null>>;
+}
+
+function createWorldDeviceResourcePool(): WorldDeviceResourcePool {
+  return {
+    darkSlateMat: new THREE.MeshStandardMaterial({
+      color: 0x1e293b,
+      roughness: 0.5,
+      metalness: 0.62
+    }),
+    brushedSteelMat: new THREE.MeshStandardMaterial({
+      color: 0xcbd5e1,
+      roughness: 0.28,
+      metalness: 0.82
+    }),
+    ledGreenMat: new THREE.MeshStandardMaterial({
+      color: 0x22c55e,
+      emissive: 0x22c55e,
+      emissiveIntensity: 0.95,
+      roughness: 0.25
+    }),
+    chassisMats: new Map(),
+    terminalUiTextures: {}
+  };
+}
+
 /**
  * Builds composite 3–10 part procedural 3D models for every network/electrical node category.
  */
@@ -499,7 +768,8 @@ function buildDeviceGroup(
   isLocked: boolean,
   castShadow: boolean,
   shadowTex: THREE.Texture,
-  lockBadgeTex?: THREE.Texture
+  lockBadgeTex?: THREE.Texture,
+  pool?: WorldDeviceResourcePool
 ): THREE.Group {
   const group = new THREE.Group();
   const category = String(asset?.category || node.type);
@@ -510,29 +780,37 @@ function buildDeviceGroup(
     category === 'riser' || category === 'telecom_tower' || node.type === 'riser';
 
   const accentHex = node.style?.backgroundColor || '#1d4ed8';
-  const accentColor = new THREE.Color(accentHex);
-
-  const chassisMat = new THREE.MeshStandardMaterial({
-    color: accentColor,
-    roughness: 0.38,
-    metalness: 0.52
-  });
-  const darkSlateMat = new THREE.MeshStandardMaterial({
-    color: 0x1e293b,
-    roughness: 0.5,
-    metalness: 0.62
-  });
-  const brushedSteelMat = new THREE.MeshStandardMaterial({
-    color: 0xcbd5e1,
-    roughness: 0.28,
-    metalness: 0.82
-  });
-  const ledGreenMat = new THREE.MeshStandardMaterial({
-    color: 0x22c55e,
-    emissive: 0x22c55e,
-    emissiveIntensity: 0.95,
-    roughness: 0.25
-  });
+  let chassisMat = pool?.chassisMats.get(accentHex);
+  if (!chassisMat) {
+    chassisMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(accentHex),
+      roughness: 0.38,
+      metalness: 0.52
+    });
+    pool?.chassisMats.set(accentHex, chassisMat);
+  }
+  const darkSlateMat =
+    pool?.darkSlateMat ||
+    new THREE.MeshStandardMaterial({
+      color: 0x1e293b,
+      roughness: 0.5,
+      metalness: 0.62
+    });
+  const brushedSteelMat =
+    pool?.brushedSteelMat ||
+    new THREE.MeshStandardMaterial({
+      color: 0xcbd5e1,
+      roughness: 0.28,
+      metalness: 0.82
+    });
+  const ledGreenMat =
+    pool?.ledGreenMat ||
+    new THREE.MeshStandardMaterial({
+      color: 0x22c55e,
+      emissive: 0x22c55e,
+      emissiveIntensity: 0.95,
+      roughness: 0.25
+    });
 
   if (category === 'workstation') {
     // Composite Office Workstation: desk + 4 legs + dual monitor + PC tower + office chair
@@ -572,11 +850,16 @@ function buildDeviceGroup(
     monFrame.position.set(-0.08, 0.94, -0.14);
     group.add(monFrame);
 
-    const monScreenTex = createTerminalUiTexture('workstation');
+    let monScreenTex: THREE.CanvasTexture | null;
+    if (pool && 'workstation' in pool.terminalUiTextures) {
+      monScreenTex = pool.terminalUiTextures.workstation ?? null;
+    } else {
+      monScreenTex = createTerminalUiTexture('workstation');
+      if (pool) pool.terminalUiTextures.workstation = monScreenTex;
+    }
     const monScreenMat = new THREE.MeshStandardMaterial({
       color: monScreenTex ? 0xffffff : 0x0ea5e9,
-      map: monScreenTex || undefined,
-      emissiveMap: monScreenTex || undefined,
+      ...(monScreenTex ? { map: monScreenTex, emissiveMap: monScreenTex } : {}),
       emissive: new THREE.Color(monScreenTex ? 0xffffff : 0x0284c7),
       emissiveIntensity: 0.42,
       roughness: 0.22
@@ -626,11 +909,16 @@ function buildDeviceGroup(
     trimBezel.position.set(0, 1.15, -0.02);
     group.add(trimBezel);
 
-    const uiTex = createTerminalUiTexture('attendance');
+    let uiTex: THREE.CanvasTexture | null;
+    if (pool && 'attendance' in pool.terminalUiTextures) {
+      uiTex = pool.terminalUiTextures.attendance ?? null;
+    } else {
+      uiTex = createTerminalUiTexture('attendance');
+      if (pool) pool.terminalUiTextures.attendance = uiTex;
+    }
     const uiMat = new THREE.MeshStandardMaterial({
       color: uiTex ? 0xffffff : 0x10b981,
-      map: uiTex || undefined,
-      emissiveMap: uiTex || undefined,
+      ...(uiTex ? { map: uiTex, emissiveMap: uiTex } : {}),
       emissive: new THREE.Color(uiTex ? 0xffffff : 0x059669),
       emissiveIntensity: 0.55,
       roughness: 0.2
@@ -1355,7 +1643,8 @@ export function build3DCableGeometry(
   origin?: WorldCoordinateOrigin,
   isSelected = false,
   srcFloorY = 0,
-  tgtFloorY = 0
+  tgtFloorY = 0,
+  renderQuality: StudioRenderQuality = 'high'
 ): THREE.TubeGeometry {
   const { curve } = build3DCableCurve(
     cable,
@@ -1372,8 +1661,21 @@ export function build3DCableGeometry(
   );
   const baseRadius = Math.min(0.052, Math.max(0.026, (cable.strokeWidth || 2) * 0.012));
   const radius = isSelected ? baseRadius * 1.45 : baseRadius;
-  const tubularSegments = cable.routingType === 'straight' && Math.abs(srcFloorY - tgtFloorY) <= 0.2 ? 12 : 36;
-  return new THREE.TubeGeometry(curve, tubularSegments, radius, 8, false);
+  const isFlatStraight = cable.routingType === 'straight' && Math.abs(srcFloorY - tgtFloorY) <= 0.2;
+  const tubularSegments =
+    renderQuality === 'low'
+      ? isFlatStraight
+        ? 6
+        : 16
+      : renderQuality === 'medium'
+      ? isFlatStraight
+        ? 8
+        : 24
+      : isFlatStraight
+      ? 12
+      : 36;
+  const radialSegments = renderQuality === 'low' ? 5 : 8;
+  return new THREE.TubeGeometry(curve, tubularSegments, radius, radialSegments, false);
 }
 
 export function build3DCableMesh(
@@ -1387,7 +1689,8 @@ export function build3DCableMesh(
   castShadow: boolean,
   isSelected = false,
   srcFloorY = 0,
-  tgtFloorY = 0
+  tgtFloorY = 0,
+  renderQuality: StudioRenderQuality = 'high'
 ): { mesh: THREE.Mesh; midWorld: THREE.Vector3 } {
   const s = canvasToWorldXZ(srcNode.x + srcNode.width / 2, srcNode.y + srcNode.height / 2, origin);
   const t = canvasToWorldXZ(tgtNode.x + tgtNode.width / 2, tgtNode.y + tgtNode.height / 2, origin);
@@ -1416,7 +1719,8 @@ export function build3DCableMesh(
     origin,
     isSelected,
     srcFloorY,
-    tgtFloorY
+    tgtFloorY,
+    renderQuality
   );
   const baseColor = new THREE.Color(cable.color || '#0284c7');
   const mat = new THREE.MeshStandardMaterial({
@@ -1469,14 +1773,13 @@ export interface Populated3DWorldResult {
   isMultiFloorCutaway: boolean;
   nodeGroups: Map<string, { group: THREE.Group; node: DiagramNode; floorY: number }>;
   cableEntries: Populated3DCableEntry[];
-  shadowToRackNodeId: Map<string, string>;
   bounds: World3DBounds;
 }
 
 export function populateInfrastructure3DWorld(
   worldRoot: THREE.Group,
   project: ProjectState,
-  selectionOrId: SelectionState | string | undefined,
+  selectedId: string | undefined,
   options: {
     showRooms: boolean;
     showCables: boolean;
@@ -1485,8 +1788,15 @@ export function populateInfrastructure3DWorld(
     shadowTex: THREE.Texture;
     lockBadgeTex?: THREE.Texture;
     viewAllFloors?: boolean;
+    renderQuality?: StudioRenderQuality;
+    wireframe?: boolean;
+    showThermalHeatmap?: boolean;
+    registry?: ThreeResourceRegistry;
+    registryScope?: string;
   }
 ): Populated3DWorldResult {
+  const quality: StudioRenderQuality = options.renderQuality || 'high';
+  const showThermalHeatmap = options.showThermalHeatmap !== false;
   const isFloorBasedMode = ['floorplan', 'cctv', 'wifi', 'fiber'].includes(project.activeMode);
   const isMultiFloorCutaway = Boolean(
     options.viewAllFloors && isFloorBasedMode && project.floors.length > 1
@@ -1523,7 +1833,6 @@ export function populateInfrastructure3DWorld(
     }
   }
 
-  const highlights = resolve3DHighlightedIds(selectionOrId, project, shadowToRackNodeId);
   const hiddenLayerSet = getHiddenLayerSet(project.settings);
 
   let visibleNodes = project.nodes.filter(n => {
@@ -1617,6 +1926,7 @@ export function populateInfrastructure3DWorld(
 
   const nodeMap = new Map<string, DiagramNode>();
   const nodeFloorYMap = new Map<string, number>();
+  const devicePool = createWorldDeviceResourcePool();
 
   for (const node of visibleNodes) {
     nodeMap.set(node.id, node);
@@ -1632,10 +1942,8 @@ export function populateInfrastructure3DWorld(
       const rack = project.racks.find(
         r => r.id === node.customData?.rackId || r.id === node.id || r.name === node.label
       );
-      const isSelected = Boolean(
-        (rack && highlights.highlightedRackIds.has(rack.id)) ||
-          highlights.highlightedNodeIds.has(node.id)
-      );
+      const isSelected = selectedId === rack?.id || selectedId === node.id;
+      const rackLod: DetailLodLevel = node.customData?.collapsed ? 'collapsed' : quality;
       grp = buildRackGroup(
         node,
         rack,
@@ -1645,10 +1953,12 @@ export function populateInfrastructure3DWorld(
         options.castShadow,
         options.shadowTex,
         options.lockBadgeTex,
-        isFloorBasedMode
+        isFloorBasedMode,
+        rackLod,
+        showThermalHeatmap
       );
     } else {
-      const isSelected = highlights.highlightedNodeIds.has(node.id);
+      const isSelected = selectedId === node.id;
       grp = buildDeviceGroup(
         node,
         asset,
@@ -1656,7 +1966,8 @@ export function populateInfrastructure3DWorld(
         isLocked,
         options.castShadow,
         options.shadowTex,
-        options.lockBadgeTex
+        options.lockBadgeTex,
+        devicePool
       );
     }
 
@@ -1730,9 +2041,10 @@ export function populateInfrastructure3DWorld(
           list.length,
           options.explodeSpread,
           options.castShadow,
-          highlights.highlightedCableIds.has(cable.id),
+          selectedId === cable.id,
           srcFloorY,
-          tgtFloorY
+          tgtFloorY,
+          quality
         );
         worldRoot.add(mesh);
         cableEntries.push({
@@ -1808,32 +2120,21 @@ export function populateInfrastructure3DWorld(
     size
   };
 
-  return { origin, isMultiFloorCutaway, nodeGroups, cableEntries, shadowToRackNodeId, bounds };
+  if (options.wireframe) {
+    applySceneWireframeMode(worldRoot, true);
+  }
+
+  if (options.registry) {
+    const keepTextures = new Set<THREE.Texture>([options.shadowTex]);
+    if (options.lockBadgeTex) {
+      keepTextures.add(options.lockBadgeTex);
+    }
+    options.registry.trackObjectTree(worldRoot, options.registryScope || 'world', keepTextures);
+  }
+
+  return { origin, isMultiFloorCutaway, nodeGroups, cableEntries, bounds };
 }
 
 export function disposeObjectTree(root: THREE.Object3D, keepTextures?: Set<THREE.Texture>) {
-  root.traverse(obj => {
-    if (
-      obj instanceof THREE.Mesh ||
-      obj instanceof THREE.Line ||
-      obj instanceof THREE.LineSegments ||
-      obj instanceof THREE.Points ||
-      obj instanceof THREE.Sprite
-    ) {
-      if ('geometry' in obj && obj.geometry) {
-        obj.geometry.dispose();
-      }
-      const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
-      for (const m of mats) {
-        if (!m) continue;
-        const matAny = m as unknown as Record<string, unknown>;
-        for (const val of Object.values(matAny)) {
-          if (val instanceof THREE.Texture && (!keepTextures || !keepTextures.has(val))) {
-            val.dispose();
-          }
-        }
-        m.dispose();
-      }
-    }
-  });
+  disposeThreeObjectTree(root, keepTextures);
 }

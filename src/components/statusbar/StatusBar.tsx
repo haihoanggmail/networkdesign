@@ -8,7 +8,9 @@ import {
   Compass,
   Clock,
   AlertTriangle,
-  ShieldCheck
+  ShieldCheck,
+  CheckCircle2,
+  Loader2
 } from 'lucide-react';
 import { OfflineIndicator } from '../topbar/PWAInstallButton';
 import { APP_BUILD_HASH, APP_VERSION } from '../../config/appInfo';
@@ -29,7 +31,7 @@ interface StatusBarProps {
   onToggleGrid: () => void;
 }
 
-export const StatusBar: React.FC<StatusBarProps> = ({
+export const StatusBar: React.FC<StatusBarProps> = React.memo(({
   project,
   selection,
   zoom = 1,
@@ -39,6 +41,7 @@ export const StatusBar: React.FC<StatusBarProps> = ({
   isSaving = false,
   storageError = null,
   auditIssueCount = 0,
+  onOpenAudit,
   onOpenAbout,
   onToggleSnap,
   onToggleGrid
@@ -95,26 +98,45 @@ export const StatusBar: React.FC<StatusBarProps> = ({
         <OfflineIndicator />
 
         {storageError ? (
-          <span className="flex items-center gap-1 text-[#DC2626] font-semibold" title={storageError}>
-            <AlertTriangle className="w-3.5 h-3.5" />
-            <span>Lỗi lưu trữ</span>
-          </span>
-        ) : savedClock ? (
           <span
-            className={`hidden lg:flex items-center gap-1 font-mono ${
-              isSaving
-                ? 'text-[#155EEF]'
-                : hasUnsavedChanges
-                ? 'text-[#D97706]'
-                : 'text-slate-500 dark:text-slate-400'
-            }`}
+            role="status"
+            data-testid="statusbar-save-status"
+            className="flex items-center gap-1 text-[#DC2626] font-semibold"
+            title={storageError}
           >
-            <Clock className="w-3.5 h-3.5" />
-            <span>
-              {isSaving ? 'Đang lưu...' : hasUnsavedChanges ? `Chờ lưu · ${savedClock}` : `Đã lưu ${savedClock}`}
-            </span>
+            <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+            <span>Lỗi lưu</span>
           </span>
-        ) : null}
+        ) : isSaving ? (
+          <span
+            role="status"
+            data-testid="statusbar-save-status"
+            className="flex items-center gap-1 font-mono text-[#155EEF] dark:text-blue-400 font-medium"
+          >
+            <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+            <span>Đang lưu...</span>
+          </span>
+        ) : hasUnsavedChanges ? (
+          <span
+            role="status"
+            data-testid="statusbar-save-status"
+            className="flex items-center gap-1 font-mono text-[#D97706] dark:text-amber-400 font-medium"
+            title={savedClock ? `Lần lưu gần nhất lúc ${savedClock}` : 'Có thay đổi chưa lưu'}
+          >
+            <Clock className="w-3.5 h-3.5 shrink-0" />
+            <span>Chưa lưu</span>
+          </span>
+        ) : (
+          <span
+            role="status"
+            data-testid="statusbar-save-status"
+            className="flex items-center gap-1 font-mono text-[#16A34A] dark:text-emerald-400 font-medium"
+            title={savedClock ? `Đã tự động lưu lúc ${savedClock}` : 'Mọi thay đổi đã được lưu'}
+          >
+            <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+            <span>{savedClock ? `Đã lưu ${savedClock}` : 'Đã lưu'}</span>
+          </span>
+        )}
 
         <div className="hidden md:flex items-center gap-3 border-l border-slate-200 dark:border-slate-800 pl-3 font-mono">
           <span className="flex items-center gap-1">
@@ -127,19 +149,21 @@ export const StatusBar: React.FC<StatusBarProps> = ({
           </span>
         </div>
 
-        <span
-          role="status"
-          aria-label={auditIssueCount > 0 ? `${auditIssueCount} cảnh báo kỹ thuật` : '0 cảnh báo kỹ thuật'}
-          className={`flex items-center gap-1 border-l border-slate-200 dark:border-slate-800 pl-3 font-medium whitespace-nowrap ${
+        <button
+          type="button"
+          onClick={() => onOpenAudit?.()}
+          data-testid="statusbar-audit-btn"
+          aria-label={auditIssueCount > 0 ? `Xem ${auditIssueCount} cảnh báo kỹ thuật` : 'Kiểm tra kỹ thuật: 0 cảnh báo'}
+          className={`flex items-center gap-1 border-l border-slate-200 dark:border-slate-800 pl-3 font-medium whitespace-nowrap hover:underline underline-offset-2 cursor-pointer transition-colors ${
             auditIssueCount > 0
               ? 'text-amber-700 dark:text-amber-400'
               : 'text-emerald-700 dark:text-emerald-400'
           }`}
-          title="Trạng thái kiểm tra kỹ thuật (bấm Kiểm tra trên thanh menu để xem chi tiết)"
+          title="Nhấn để mở danh sách kiểm tra lỗi & nhảy đến đúng đối tượng"
         >
           <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
           <span>{auditIssueCount > 0 ? `${auditIssueCount} cảnh báo` : '0 cảnh báo'}</span>
-        </span>
+        </button>
 
         <div className="flex items-center gap-2 border-l border-slate-200 dark:border-slate-800 pl-3 font-mono">
           <span
@@ -194,4 +218,4 @@ export const StatusBar: React.FC<StatusBarProps> = ({
       </div>
     </footer>
   );
-};
+});

@@ -1,6 +1,7 @@
 import React, { useMemo, useRef, useState } from 'react';
 import { ProjectState } from '../../types/infrastructure';
-import { runEngineeringAudit, buildIpVlanMatrix, AuditIssue } from '../../utils/engineeringValidator';
+import { buildIpVlanMatrix, AuditIssue } from '../../utils/engineeringValidator';
+import { useAsyncEngineeringAudit } from '../../utils/computeWorkerClient';
 import { useFocusTrap } from '../../hooks/useFocusTrap';
 import { X, AlertCircle, AlertTriangle, CheckCircle2, ArrowRight, Network, Zap } from 'lucide-react';
 
@@ -22,7 +23,7 @@ export const EngineeringAuditModal: React.FC<EngineeringAuditModalProps> = ({
   const dialogRef = useRef<HTMLDivElement>(null);
   useFocusTrap(dialogRef, isOpen, onClose);
 
-  const report = useMemo(() => runEngineeringAudit(project), [project]);
+  const report = useAsyncEngineeringAudit(project, 60);
   const ipMatrix = useMemo(() => buildIpVlanMatrix(project), [project]);
 
   const filteredIpRows = useMemo(() => {
