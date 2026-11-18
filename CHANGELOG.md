@@ -2,6 +2,17 @@
 
 Tài liệu này ghi nhận các thay đổi quan trọng của **HACHIHI Network & Electrical Designer** theo chuẩn [Keep a Changelog](https://keepachangelog.com/vi/1.0.0/) và đánh số phiên bản theo [SemVer](https://semver.org/).
 
+## [Chưa phát hành - Nhóm CA] - 2026-11-18
+
+### Sửa lỗi & Độ tin cậy
+- **Vệ sinh phát hành & PWA (CA-01, CA-03)**: Gỡ bỏ toàn bộ thư mục dư `public/assets/aistudio/`, cập nhật `.gitignore` bỏ qua `dev-dist/`, `playwright-report/`, `test-results/`, bổ sung bước kiểm tra kích thước `public/` (< 1 MB), danh sách precache `dist/sw.js` và lưu artifact báo cáo Playwright trong CI (`.github/workflows/ci.yml`).
+- **Logo Vector SVG Sáng/Tối (CA-02)**: Thay thế hoàn toàn ảnh raster JPG 488 KB bằng vector SVG sắc nét hỗ trợ chế độ Sáng/Tối trong `HachihiLogo`, khung tên PDF (`pdfExporter.ts`) và đầu trang trình xem HTML (`htmlViewerExporter.ts`).
+- **Tài liệu & cấu hình môi trường (CA-04)**: Bổ sung `CHAT_DAILY_TOKEN_LIMIT`, `CHAT_RATE_LIMIT_FAIL_CLOSED` và hướng dẫn khởi tạo Node 22+ / `.env` / Playwright vào `README.md` và `.env.example`; loại bỏ chuỗi định danh nội bộ khỏi header gọi API Gemini trong `chatService.ts`.
+- **SaveCoordinator (CA-05)**: Khắc phục cơ chế `shouldDeferAutoSave` lặp lại nhiều chu kỳ khi người dùng đang kéo thả đối tượng; bổ sung 8 kịch bản test đơn vị bao phủ debounce, giữ trạng thái lỗi, hoãn lưu khi kéo, `flush()` khi đóng tab, `reset()`, `dispose()` và bất biến `committedVersion <= dirtyVersion`.
+- **Bảo mật & Trợ lý AI (CA-06, CA-07, CA-08)**: Bổ sung kiểm tra vi phạm CSP & lỗi runtime vào E2E; tăng cường unit test cho `/api/health`, chế độ fallback ngoại tuyến/rate-limit và kiểm tra giới hạn kích thước/số đối tượng + chặn XSS `<image>`/`<use>` trong SVG base64.
+- **Chốt mốc BOM & Tối ưu nạp mẫu (CA-13, CA-18)**: Bổ sung nút **Chốt mốc BOM hiện tại** ngay trong tab *So sánh BOM* của `BomStatisticsModal` để lưu snapshot đối chiếu tức thì; tách mẫu mặc định (`defaultStarterTemplate.ts`) và tải lười `data/templates.ts` khỏi bundle khởi đầu.
+- **Mở rộng Playwright E2E (CA-14)**: Mở rộng từ 1 ca lên **10 ca kiểm thử E2E** trên cả 3 khung kích thước (`desktop-wide`, `tablet-medium`, `mobile-narrow`).
+
 ## [3.1.1] - 2026-11-16
 
 ### Thêm mới

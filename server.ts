@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { buildHealthPayload, handleChatRequest } from './src/server/chatService';
+import { handleTrackRequest } from './src/server/trackService';
 
 function loadLocalEnvFiles() {
   for (const filename of ['.env', '.env.local']) {
@@ -110,6 +111,24 @@ async function startServer() {
         res.setHeader(k, v);
       }
     }
+    res.status(result.statusCode).json(result.body);
+  });
+
+  app.all('/api/track', async (req, res) => {
+    const contentLengthHeader = req.headers['content-length'];
+    const rawByteLength =
+      typeof contentLengthHeader === 'string' && /^\d+$/.test(contentLengthHeader)
+        ? Number(contentLengthHeader)
+        : undefined;
+
+    const result = await handleTrackRequest({
+      method: req.method,
+      headers: req.headers,
+      body: req.body,
+      rawByteLength,
+      remoteIp: req.ip || req.socket.remoteAddress
+    });
+
     res.status(result.statusCode).json(result.body);
   });
 

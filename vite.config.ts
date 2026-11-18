@@ -88,6 +88,8 @@ export default defineConfig(() => {
           globIgnores: [
             '**/iso_*',
             '**/three-vendor*',
+            '**/viewer3dRuntimeBundle*',
+            '**/viewer-3d-runtime.js',
             '**/exceljs-vendor*',
             '**/pdf-vendor*',
             '**/recharts-vendor*',
