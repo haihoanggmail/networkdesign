@@ -6,6 +6,7 @@ declare const __BUILD_DATE__: string | undefined;
 
 export const APP_PRODUCT_NAME = 'HACHIHI Network & Electrical Designer';
 export const APP_SHORT_NAME = 'HACHIHI';
+export const QUICK_TOUR_STORAGE_KEY = 'hachihi_quick_tour_done_v1';
 
 export const APP_VERSION: string =
   typeof __APP_VERSION__ !== 'undefined' && __APP_VERSION__ ? __APP_VERSION__ : '3.1.1';
@@ -46,7 +47,11 @@ export const CHANGELOG_HIGHLIGHTS_310: string[] = [
 
 const viteEnv = (import.meta as unknown as { env?: Record<string, string | undefined> }).env || {};
 
-export const FEEDBACK_FORM_URL: string = (viteEnv.VITE_FEEDBACK_FORM_URL || '').trim();
+export const DEFAULT_FEEDBACK_FORM_URL = 'https://forms.gle/qEkFLC1sCtZmRRcU8';
+
+export const FEEDBACK_FORM_URL: string = (
+  viteEnv.VITE_FEEDBACK_FORM_URL || DEFAULT_FEEDBACK_FORM_URL
+).trim();
 
 export interface FeedbackPrefillEntries {
   version: string;
@@ -87,7 +92,16 @@ export function formatFeedbackPrefillUrl(
   const trimmedBase = (baseUrl || '').trim();
   if (!isFeedbackFormConfigured(trimmedBase)) return null;
   try {
+    const hasAnyEntry = Boolean(
+      entries.version?.trim() ||
+      entries.build?.trim() ||
+      (entries.mode?.trim() && context?.activeMode) ||
+      entries.device?.trim()
+    );
     const url = new URL(trimmedBase);
+    if (!hasAnyEntry && url.hostname === 'forms.gle') {
+      return trimmedBase;
+    }
     url.searchParams.set('usp', 'pp_url');
     if (entries.version?.trim()) {
       url.searchParams.set(entries.version.trim(), context?.version || APP_VERSION);

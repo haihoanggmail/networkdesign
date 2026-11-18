@@ -11,6 +11,7 @@ import React, {
 export type ViewportMode = '2d' | '3d';
 export type CameraPresetId = 'iso' | 'top' | 'front' | 'side';
 export type Capture3DBackground = 'light' | 'dark';
+export type RenderQualityLevel = 'low' | 'medium' | 'high';
 
 export interface Capture3DRequestOptions {
   width?: number;
@@ -33,6 +34,10 @@ export interface View3DDisplayOptions {
   explodeSpread: number;
   viewAllFloors: boolean;
   activePreset: CameraPresetId;
+  wireframeMode: boolean;
+  renderQuality: RenderQualityLevel;
+  shadowsEnabled: boolean;
+  showThermalHeatmap: boolean;
 }
 
 export interface Network3DSceneHandle {
@@ -43,14 +48,6 @@ export interface Network3DSceneHandle {
   zoomOut: () => void;
   resetZoom: () => void;
   isContextLost: () => boolean;
-  getCenterCanvasCoords?: () => { x: number; y: number } | null;
-  previewLibraryDrop?: (
-    clientX: number,
-    clientY: number,
-    footprint?: { width: number; height: number; isRack?: boolean }
-  ) => { x: number; y: number; floorName: string } | null;
-  clearLibraryDropPreview?: () => void;
-  focusSelection?: (targetType: 'node' | 'rack' | 'edge', targetId: string) => boolean;
 }
 
 interface Viewport2DHandlers {
@@ -88,14 +85,6 @@ interface ViewportContextValue {
   setIs3DContextLost: (lost: boolean) => void;
   clear3DCaptureError: () => void;
   capture3DImage: (options?: Capture3DRequestOptions) => Promise<Capture3DResult>;
-  get3DInsertionPoint: () => { x: number; y: number } | null;
-  preview3DLibraryDrop: (
-    clientX: number,
-    clientY: number,
-    footprint?: { width: number; height: number; isRack?: boolean }
-  ) => { x: number; y: number; floorName: string } | null;
-  clear3DLibraryDropPreview: () => void;
-  focus3DSelection: (targetType: 'node' | 'rack' | 'edge', targetId: string) => boolean;
   update2DHandlers: (handlers: Viewport2DHandlers) => void;
 }
 
@@ -126,7 +115,11 @@ export const ViewportProvider: React.FC<ViewportProviderProps> = ({
     showAxes: true,
     explodeSpread: 0,
     viewAllFloors: defaultViewAllFloors,
-    activePreset: 'iso'
+    activePreset: 'iso',
+    wireframeMode: false,
+    renderQuality: 'high',
+    shadowsEnabled: true,
+    showThermalHeatmap: true
   });
 
   const handle3DRef = useRef<Network3DSceneHandle | null>(null);
@@ -277,32 +270,6 @@ export const ViewportProvider: React.FC<ViewportProviderProps> = ({
     [is3DContextLost]
   );
 
-  const get3DInsertionPoint = useCallback(() => {
-    return handle3DRef.current?.getCenterCanvasCoords?.() ?? null;
-  }, []);
-
-  const preview3DLibraryDrop = useCallback(
-    (
-      clientX: number,
-      clientY: number,
-      footprint?: { width: number; height: number; isRack?: boolean }
-    ) => {
-      return handle3DRef.current?.previewLibraryDrop?.(clientX, clientY, footprint) ?? null;
-    },
-    []
-  );
-
-  const clear3DLibraryDropPreview = useCallback(() => {
-    handle3DRef.current?.clearLibraryDropPreview?.();
-  }, []);
-
-  const focus3DSelection = useCallback(
-    (targetType: 'node' | 'rack' | 'edge', targetId: string) => {
-      return handle3DRef.current?.focusSelection?.(targetType, targetId) ?? false;
-    },
-    []
-  );
-
   const value = useMemo<ViewportContextValue>(
     () => ({
       mode,
@@ -327,10 +294,6 @@ export const ViewportProvider: React.FC<ViewportProviderProps> = ({
       setIs3DContextLost,
       clear3DCaptureError,
       capture3DImage,
-      get3DInsertionPoint,
-      preview3DLibraryDrop,
-      clear3DLibraryDropPreview,
-      focus3DSelection,
       update2DHandlers
     }),
     [
@@ -352,10 +315,6 @@ export const ViewportProvider: React.FC<ViewportProviderProps> = ({
       register3DHandle,
       clear3DCaptureError,
       capture3DImage,
-      get3DInsertionPoint,
-      preview3DLibraryDrop,
-      clear3DLibraryDropPreview,
-      focus3DSelection,
       update2DHandlers
     ]
   );

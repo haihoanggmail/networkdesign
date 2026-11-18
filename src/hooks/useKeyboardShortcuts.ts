@@ -8,7 +8,9 @@ export type ShortcutActionId =
   | 'tool_room'
   | 'tool_measure'
   | 'action_legend'
-  | 'action_add_rack'
+  | 'auto_route'
+  | 'auto_assign_ip'
+  | 'export_project'
   | 'undo'
   | 'redo'
   | 'duplicate'
@@ -22,21 +24,40 @@ export type ShortcutActionId =
   | 'zoom_reset'
   | 'command_palette';
 
+export type ShortcutCategory = 'Tác vụ nhanh' | 'Công cụ' | 'Chỉnh sửa' | 'Khung nhìn';
+
 export interface ShortcutDefinition {
   id: ShortcutActionId;
   label: string;
-  category: 'Công cụ' | 'Chỉnh sửa' | 'Khung nhìn';
+  category: ShortcutCategory;
   defaultCombo: string;
 }
 
 export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
+  {
+    id: 'auto_route',
+    label: 'Auto-Route (Định tuyến cáp thông minh)',
+    category: 'Tác vụ nhanh',
+    defaultCombo: 'ctrl+shift+r'
+  },
+  {
+    id: 'auto_assign_ip',
+    label: 'Auto-Assign IP (Gán IP tự động theo topology)',
+    category: 'Tác vụ nhanh',
+    defaultCombo: 'ctrl+shift+i'
+  },
+  {
+    id: 'export_project',
+    label: 'Export (Mở hộp thoại Xuất hồ sơ bản vẽ)',
+    category: 'Tác vụ nhanh',
+    defaultCombo: 'ctrl+e'
+  },
   { id: 'tool_select', label: 'Công cụ Chọn / Di chuyển', category: 'Công cụ', defaultCombo: 'v' },
   { id: 'tool_pan', label: 'Công cụ Kéo khung nhìn (Pan)', category: 'Công cụ', defaultCombo: 'h' },
   { id: 'tool_connect', label: 'Công cụ Nối dây cáp', category: 'Công cụ', defaultCombo: 'c' },
   { id: 'tool_text', label: 'Thêm ghi chú chữ', category: 'Công cụ', defaultCombo: 't' },
   { id: 'tool_room', label: 'Vẽ phòng / khu vực', category: 'Công cụ', defaultCombo: 'r' },
   { id: 'action_legend', label: 'Tạo / cập nhật bảng chú giải', category: 'Công cụ', defaultCombo: 'l' },
-  { id: 'action_add_rack', label: 'Thêm tủ Server Rack 42U tại con trỏ', category: 'Công cụ', defaultCombo: 'shift+r' },
   { id: 'tool_measure', label: 'Thước đo khoảng cách', category: 'Công cụ', defaultCombo: 'm' },
   { id: 'undo', label: 'Hoàn tác (Undo)', category: 'Chỉnh sửa', defaultCombo: 'ctrl+z' },
   { id: 'redo', label: 'Làm lại (Redo)', category: 'Chỉnh sửa', defaultCombo: 'ctrl+y' },
@@ -148,13 +169,23 @@ export function useShortcutKeymap() {
     });
   }, []);
 
+  const resetSingleShortcut = useCallback((actionId: ShortcutActionId) => {
+    const def = SHORTCUT_DEFINITIONS.find(d => d.id === actionId);
+    if (!def) return;
+    setKeymap(prev => {
+      const next = { ...prev, [actionId]: def.defaultCombo };
+      saveShortcutKeymap(next);
+      return next;
+    });
+  }, []);
+
   const resetShortcuts = useCallback(() => {
     const defaults = getDefaultShortcutKeymap();
     saveShortcutKeymap(defaults);
     setKeymap(defaults);
   }, []);
 
-  return { keymap, updateShortcut, resetShortcuts };
+  return { keymap, updateShortcut, resetSingleShortcut, resetShortcuts };
 }
 
 export function useKeyboardShortcuts(

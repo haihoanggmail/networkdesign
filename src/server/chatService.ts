@@ -122,7 +122,7 @@ export async function handleChatRequest(input: UnifiedChatInput): Promise<ChatHt
       apiKey: cfg.apiKey,
       httpOptions: {
         headers: {
-          'User-Agent': 'aistudio-build'
+          'User-Agent': 'hachihi-designer-api'
         }
       }
     });

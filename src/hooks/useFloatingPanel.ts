@@ -183,6 +183,15 @@ export function useFloatingPanel(options: {
     setPosition(null);
   }, []);
 
+  const dragCleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    return () => {
+      dragCleanupRef.current?.();
+      dragCleanupRef.current = null;
+    };
+  }, []);
+
   const handleDragStart = useCallback(
     (e: React.PointerEvent) => {
       if (e.button !== 0) return;
@@ -192,6 +201,8 @@ export function useFloatingPanel(options: {
       const containerEl = containerRef.current;
       const panelEl = panelRef.current;
       if (!containerEl || !panelEl) return;
+
+      dragCleanupRef.current?.();
 
       const cRect = containerEl.getBoundingClientRect();
       const pRect = panelEl.getBoundingClientRect();
@@ -222,15 +233,23 @@ export function useFloatingPanel(options: {
         setPosition(clamped);
       };
 
-      const onUp = () => {
+      const cleanupListeners = () => {
         window.removeEventListener('pointermove', onMove);
         window.removeEventListener('pointerup', onUp);
         window.removeEventListener('pointercancel', onUp);
+        if (dragCleanupRef.current === cleanupListeners) {
+          dragCleanupRef.current = null;
+        }
+      };
+
+      const onUp = () => {
+        cleanupListeners();
         if (started) {
           setIsDragging(false);
         }
       };
 
+      dragCleanupRef.current = cleanupListeners;
       window.addEventListener('pointermove', onMove);
       window.addEventListener('pointerup', onUp);
       window.addEventListener('pointercancel', onUp);

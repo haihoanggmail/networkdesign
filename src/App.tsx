@@ -1,12 +1,12 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo, Suspense, lazy } from 'react';
 import { useProjectStore } from './store/useProjectStore';
 import { TopBar } from './components/topbar/TopBar';
-import { LeftLibrary, LibraryDragPayload } from './components/sidebar/LeftLibrary';
-import { DesignCanvas, Canvas2DDropApi } from './components/canvas/DesignCanvas';
+import { LeftLibrary } from './components/sidebar/LeftLibrary';
+import { DesignCanvas } from './components/canvas/DesignCanvas';
 import { PropertiesPanel } from './components/properties/PropertiesPanel';
 import { StatusBar } from './components/statusbar/StatusBar';
 import { QuickAccessBar } from './components/toolbar/QuickAccessBar';
-import { QUICK_TOUR_STORAGE_KEY } from './components/modals/QuickTourOverlay';
+import { QUICK_TOUR_STORAGE_KEY } from './config/appInfo';
 import { DESIGN_MODES, DESIGN_MODE_GROUPS } from './utils/designModes';
 import {
   WorkspacePresetId,
@@ -16,28 +16,20 @@ import {
   saveWorkspacePresetId
 } from './utils/workspacePresets';
 import { ErrorBoundary } from './components/modals/ErrorBoundary';
-import { runEngineeringAudit, AuditIssue } from './utils/engineeringValidator';
+import type { AuditIssue } from './utils/engineeringValidator';
+import { runBatchAutoRouteOffThread, useAsyncEngineeringAudit } from './utils/computeWorkerClient';
 import { importNetworkScannerData, diffMergeNetworkScannerData } from './utils/scannerImport';
-import { ProjectState, DesignMode, CanvasLayerId, SelectionState } from './types/infrastructure';
-import {
-  resolveCanonicalSelection,
-  resolveSelectionFloorId,
-  resolveTargetSelectionForAssetOrNode
-} from './utils/selectionSync';
+import { ProjectState, DesignMode, CanvasLayerId } from './types/infrastructure';
 import { useWorkspaceLayout, BottomSheetSnap } from './hooks/useWorkspaceLayout';
 import { useShortcutKeymap, useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import {
   LAYER_CATALOG,
-  canAddDevicesInScene,
   resolveSelectableTargetForLayer
 } from './utils/layerPolicy';
-import { DEVICE_CATALOG, loadCustomDevicePresets } from './data/deviceCatalog';
-import { renderDeviceVisualIcon } from './utils/deviceIcons';
 import { layoutRackNodesForElevationMode } from './utils/rackGeometry';
 import { ViewportProvider, useViewport } from './contexts/ViewportContext';
 import { ViewportController } from './components/viewport/ViewportController';
 import { LayerPanel } from './components/layers/LayerPanel';
-import { ExportService } from './services/export/exportService';
 import {
   RecentActionEntry,
   ReplayableActionId,
@@ -89,6 +81,7 @@ import {
   isFeedbackFormConfigured
 } from './config/appInfo';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
+import { trackVisit } from './services/tracker';
 
 interface LaunchQueueFileHandleLike {
   name?: string;
@@ -196,7 +189,7 @@ function AppContent({ store }: { store: ProjectStore }) {
   const [narrowSubDrawer, setNarrowSubDrawer] = useState<'none' | 'draw' | 'more'>('none');
   const isOnline = useOnlineStatus();
 
-  const { keymap, updateShortcut, resetShortcuts } = useShortcutKeymap();
+  const { keymap, updateShortcut, resetSingleShortcut, resetShortcuts } = useShortcutKeymap();
 
   // Viewport & Layout modes (shared 2D/3D viewport state lives in ViewportContext)
   const [isLeftCollapsed, setIsLeftCollapsed] = useState(false);
@@ -212,14 +205,6 @@ function AppContent({ store }: { store: ProjectStore }) {
   const [isAiChatOpen, setIsAiChatOpen] = useState(false);
   const [isQuickExporting, setIsQuickExporting] = useState(false);
   const [draggedPresetName, setDraggedPresetName] = useState<string | null>(null);
-  const [activeLibraryDrag, setActiveLibraryDrag] = useState<{
-    payload: LibraryDragPayload;
-    clientX: number;
-    clientY: number;
-    isOverTarget: boolean;
-    canDrop: boolean;
-    hint: string;
-  } | null>(null);
   const [toast, setToast] = useState<{ text: string; type: 'success' | 'error' | 'info' } | null>(null);
   const [packagePreview, setPackagePreview] = useState<PackagePreviewInspection | null>(null);
   const [isFileDragOver, setIsFileDragOver] = useState(false);
@@ -228,23 +213,30 @@ function AppContent({ store }: { store: ProjectStore }) {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const packageFileInputRef = useRef<HTMLInputElement>(null);
-  const canvas2DDropApiRef = useRef<Canvas2DDropApi | null>(null);
-  const addRackActionRef = useRef<(() => void) | null>(null);
-  const activeLibraryDragRef = useRef<{
-    payload: LibraryDragPayload;
-    clientX: number;
-    clientY: number;
-    isOverTarget: boolean;
-    canDrop: boolean;
-    hint: string;
-  } | null>(null);
   const fileDragDepthRef = useRef(0);
   const toastTimerRef = useRef<number | null>(null);
+  const focusLibraryTimerRef = useRef<number | null>(null);
+  const splitterCleanupRef = useRef<(() => void) | null>(null);
   const prevTierRef = useRef(layout.layoutTier);
   const prevOrientationRef = useRef<'landscape' | 'portrait'>(
     layout.containerSize.width >= layout.containerSize.height ? 'landscape' : 'portrait'
   );
   const sheetDragStartRef = useRef<{ y: number; snap: BottomSheetSnap } | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current !== null) {
+        window.clearTimeout(toastTimerRef.current);
+        toastTimerRef.current = null;
+      }
+      if (focusLibraryTimerRef.current !== null) {
+        window.clearTimeout(focusLibraryTimerRef.current);
+        focusLibraryTimerRef.current = null;
+      }
+      splitterCleanupRef.current?.();
+      splitterCleanupRef.current = null;
+    };
+  }, []);
 
   const showToast = useCallback((text: string, type: 'success' | 'error' | 'info' = 'info', durationMs = 3500) => {
     if (toastTimerRef.current) {
@@ -295,6 +287,10 @@ function AppContent({ store }: { store: ProjectStore }) {
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  useEffect(() => {
+    trackVisit();
   }, []);
 
   const isAiAvailable = aiConfigured && isOnline;
@@ -500,6 +496,20 @@ function AppContent({ store }: { store: ProjectStore }) {
 
   const handleAutoRouteAllCables = useCallback(() => {
     recordAction('auto_route_all');
+    const activeCables = store.project.cables.filter(c => c.diagramMode === store.project.activeMode);
+    if (activeCables.length > 15) {
+      showToast(`Đang định tuyến ${activeCables.length} tuyến cáp trên luồng nền...`, 'info', 2000);
+      void runBatchAutoRouteOffThread(store.project).then(updates => {
+        if (updates.length > 0) {
+          store.applyBatchCableRoutes(updates);
+          showToast(`Đã Auto-Route thông minh ${updates.length} tuyến cáp tránh vật cản!`, 'success', 2600);
+        } else {
+          showToast('Không có tuyến cáp khả dụng trên chế độ/tầng hiện tại.', 'info', 2200);
+        }
+      });
+      return;
+    }
+
     const { routedCount } = store.autoRouteAllCables();
     if (routedCount > 0) {
       showToast(`Đã Auto-Route thông minh ${routedCount} tuyến cáp tránh vật cản!`, 'success', 2600);
@@ -542,6 +552,7 @@ function AppContent({ store }: { store: ProjectStore }) {
       3000
     );
     try {
+      const { ExportService } = await import('./services/export/exportService');
       const res = await ExportService.exportPdf(store.project, {
         contentScope: viewport.is3DView ? '3d' : '2d',
         paperSize: 'A4',
@@ -588,6 +599,7 @@ function AppContent({ store }: { store: ProjectStore }) {
     if (isQuickExporting || viewport.isCapturing3D) return;
     setIsQuickExporting(true);
     try {
+      const { ExportService } = await import('./services/export/exportService');
       const res = await ExportService.exportPng(store.project, {
         contentScope: viewport.is3DView ? '3d' : '2d',
         quickView: true,
@@ -626,6 +638,7 @@ function AppContent({ store }: { store: ProjectStore }) {
   const startSplitterDrag = useCallback(
     (side: 'left' | 'right', e: React.PointerEvent) => {
       e.preventDefault();
+      splitterCleanupRef.current?.();
       const startX = e.clientX;
       const startW = side === 'left' ? layout.leftWidth : layout.rightWidth;
       const onMove = (ev: PointerEvent) => {
@@ -636,12 +649,18 @@ function AppContent({ store }: { store: ProjectStore }) {
           layout.setRightWidth(startW - dx);
         }
       };
-      const onUp = () => {
+      const cleanup = () => {
         window.removeEventListener('pointermove', onMove);
-        window.removeEventListener('pointerup', onUp);
+        window.removeEventListener('pointerup', cleanup);
+        window.removeEventListener('pointercancel', cleanup);
+        if (splitterCleanupRef.current === cleanup) {
+          splitterCleanupRef.current = null;
+        }
       };
+      splitterCleanupRef.current = cleanup;
       window.addEventListener('pointermove', onMove);
-      window.addEventListener('pointerup', onUp);
+      window.addEventListener('pointerup', cleanup);
+      window.addEventListener('pointercancel', cleanup);
     },
     [layout]
   );
@@ -681,8 +700,23 @@ function AppContent({ store }: { store: ProjectStore }) {
         recordAction('generate_legend');
         showToast('Đã tạo / đồng bộ Bảng chú giải lên trang vẽ!', 'success', 2200);
       },
-      action_add_rack: () => {
-        addRackActionRef.current?.();
+      auto_route: () => {
+        if (isReadOnlyMode) {
+          showToast('Đang ở chế độ Chỉ xem — hãy tắt Chỉ xem để tự định tuyến cáp.', 'info', 2200);
+          return;
+        }
+        handleAutoRouteAllCables();
+      },
+      auto_assign_ip: () => {
+        if (isReadOnlyMode) {
+          showToast('Đang ở chế độ Chỉ xem — hãy tắt Chỉ xem để gán IP tự động.', 'info', 2200);
+          return;
+        }
+        handleAutoAssignIps({ preserveExistingValid: true });
+      },
+      export_project: () => {
+        recordAction('open_export');
+        setIsExportModalOpen(true);
       },
       undo: () => {
         if (store.historyIndex > 0) {
@@ -773,6 +807,9 @@ function AppContent({ store }: { store: ProjectStore }) {
       store,
       viewport,
       handleDeleteSelected,
+      handleAutoRouteAllCables,
+      handleAutoAssignIps,
+      isReadOnlyMode,
       showToast,
       recordAction,
       isCommandPaletteOpen,
@@ -783,183 +820,109 @@ function AppContent({ store }: { store: ProjectStore }) {
 
   useKeyboardShortcuts(keymap, shortcutHandlers, isShortcutModalOpen);
 
-  const focus3DTargetDeferred = useCallback(
-    (focusType: 'node' | 'rack' | 'edge', focusId: string) => {
-      if (!viewport.is3DView) return;
-      if (viewport.focus3DSelection(focusType, focusId)) return;
-      window.requestAnimationFrame(() => {
-        window.requestAnimationFrame(() => {
-          viewport.focus3DSelection(focusType, focusId);
-        });
-      });
-    },
-    [viewport]
+  // Jump to node from TopBar search or Command Palette
+  const handleJumpToNode = useCallback((nodeId: string) => {
+    const target = store.project.nodes.find(n => n.id === nodeId);
+    if (!target) return;
+
+    if (viewport.is3DView) {
+      viewport.setMode('2d');
+    }
+    if (target.floorId && target.floorId !== store.project.activeFloorId) {
+      store.setActiveFloor(target.floorId);
+    }
+    if (target.diagramMode && target.diagramMode !== store.project.activeMode) {
+      store.setDesignMode(target.diagramMode);
+    }
+
+    const hostRect = canvasHostRef.current?.getBoundingClientRect();
+    const viewportW = hostRect?.width || Math.max(300, layout.containerSize.width - (layout.layoutTier === 'wide' ? layout.leftWidth + layout.rightWidth : 0));
+    const viewportH = hostRect?.height || Math.max(240, layout.containerSize.height - 100);
+    const targetPanX = Math.round(viewportW / 2 - (target.x + target.width / 2) * store.zoom);
+    const targetPanY = Math.round(viewportH / 2 - (target.y + target.height / 2) * store.zoom);
+    store.setPan({ x: targetPanX, y: targetPanY });
+
+    if (target.type === 'rack' && target.customData?.rackId) {
+      store.selectItem('rack', target.customData.rackId);
+    } else {
+      store.selectItem('node', target.id);
+    }
+  }, [store, viewport, layout.containerSize.height, layout.containerSize.width, layout.layoutTier, layout.leftWidth, layout.rightWidth]);
+
+  // Center of viewport in canvas coordinates for quick addition
+  const canvasCenter = useMemo(
+    () => ({
+      x: Math.round((-store.pan.x + (canvasHostRef.current?.clientWidth || 720) * 0.45) / store.zoom),
+      y: Math.round((-store.pan.y + (canvasHostRef.current?.clientHeight || 480) * 0.45) / store.zoom)
+    }),
+    [store.pan.x, store.pan.y, store.zoom]
   );
 
-  // Jump to node/asset/rack from TopBar search, Command Palette, Inspector, Audit, or BOM
-  const handleJumpToNode = useCallback(
-    (nodeOrAssetId: string) => {
-      const resolved = resolveTargetSelectionForAssetOrNode(nodeOrAssetId, store.project);
-      if (!resolved) return;
+  const auditReport = useAsyncEngineeringAudit(store.project, 140);
 
-      const targetFloorId = resolved.floorId;
-      if (targetFloorId && targetFloorId !== store.project.activeFloorId) {
-        store.setActiveFloor(targetFloorId, { preserveSelection: true });
-      }
+  const handleNavigateToAuditTarget = useCallback((targetType: AuditIssue['targetType'], targetId: string) => {
+    if (targetType === 'node') {
+      handleJumpToNode(targetId);
+      return;
+    }
 
-      const targetMode = resolved.node?.diagramMode;
-      if (targetMode && targetMode !== store.project.activeMode) {
-        store.setDesignMode(targetMode, { preserveSelection: true });
-      }
+    if (viewport.is3DView) {
+      viewport.setMode('2d');
+    }
 
-      if (resolved.node && !viewport.is3DView) {
-        const hostRect = canvasHostRef.current?.getBoundingClientRect();
-        const viewportW =
-          hostRect?.width ||
-          Math.max(
-            300,
-            layout.containerSize.width -
-              (layout.layoutTier === 'wide' ? layout.leftWidth + layout.rightWidth : 0)
-          );
-        const viewportH =
-          hostRect?.height || Math.max(240, layout.containerSize.height - 100);
-        const targetPanX = Math.round(
-          viewportW / 2 - (resolved.node.x + resolved.node.width / 2) * store.zoom
-        );
-        const targetPanY = Math.round(
-          viewportH / 2 - (resolved.node.y + resolved.node.height / 2) * store.zoom
-        );
-        store.setPan({ x: targetPanX, y: targetPanY });
-      }
+    const hostRect = canvasHostRef.current?.getBoundingClientRect();
+    const viewportW = hostRect?.width || Math.max(300, layout.containerSize.width - (layout.layoutTier === 'wide' ? layout.leftWidth + layout.rightWidth : 0));
+    const viewportH = hostRect?.height || Math.max(240, layout.containerSize.height - 100);
 
-      store.selectItem(resolved.selection.type, resolved.selection.id);
-
-      if (layout.layoutTier === 'wide') {
-        setIsPropertiesCollapsed(false);
-      }
-
-      if (viewport.is3DView && resolved.selection.id) {
-        const focusType: 'node' | 'rack' =
-          resolved.selection.type === 'rack' ? 'rack' : 'node';
-        const focusId =
-          focusType === 'rack'
-            ? resolved.selection.id
-            : resolved.node?.id || resolved.selection.id;
-        focus3DTargetDeferred(focusType, focusId);
-      }
-    },
-    [
-      store,
-      viewport.is3DView,
-      focus3DTargetDeferred,
-      layout.containerSize.height,
-      layout.containerSize.width,
-      layout.layoutTier,
-      layout.leftWidth,
-      layout.rightWidth
-    ]
-  );
-
-  const handleJumpToCable = useCallback(
-    (cableId: string) => {
-      const cable = store.project.cables.find(c => c.id === cableId);
-      if (!cable) return;
-
-      const floorId = resolveSelectionFloorId({ type: 'edge', id: cableId }, store.project);
-      if (floorId && floorId !== store.project.activeFloorId) {
-        store.setActiveFloor(floorId, { preserveSelection: true });
-      }
-
-      if (!viewport.is3DView) {
-        const src = store.project.nodes.find(n => n.id === cable.sourceNodeId);
-        const tgt = store.project.nodes.find(n => n.id === cable.targetNodeId);
-        if (src && tgt) {
-          const midX = (src.x + src.width / 2 + tgt.x + tgt.width / 2) / 2;
-          const midY = (src.y + src.height / 2 + tgt.y + tgt.height / 2) / 2;
-          const hostRect = canvasHostRef.current?.getBoundingClientRect();
-          const viewportW =
-            hostRect?.width ||
-            Math.max(
-              300,
-              layout.containerSize.width -
-                (layout.layoutTier === 'wide' ? layout.leftWidth + layout.rightWidth : 0)
-            );
-          const viewportH =
-            hostRect?.height || Math.max(240, layout.containerSize.height - 100);
+    if (targetType === 'edge') {
+      const edge = store.project.cables.find(c => c.id === targetId);
+      if (edge) {
+        const srcNode = store.project.nodes.find(n => n.id === edge.sourceNodeId);
+        const dstNode = store.project.nodes.find(n => n.id === edge.targetNodeId);
+        const anchorNode = srcNode || dstNode;
+        if (anchorNode?.floorId && anchorNode.floorId !== store.project.activeFloorId) {
+          store.setActiveFloor(anchorNode.floorId);
+        }
+        if (anchorNode?.diagramMode && anchorNode.diagramMode !== store.project.activeMode) {
+          store.setDesignMode(anchorNode.diagramMode);
+        }
+        if (srcNode && dstNode) {
+          const midX = (srcNode.x + srcNode.width / 2 + dstNode.x + dstNode.width / 2) / 2;
+          const midY = (srcNode.y + srcNode.height / 2 + dstNode.y + dstNode.height / 2) / 2;
           store.setPan({
             x: Math.round(viewportW / 2 - midX * store.zoom),
             y: Math.round(viewportH / 2 - midY * store.zoom)
           });
+        } else if (anchorNode) {
+          store.setPan({
+            x: Math.round(viewportW / 2 - (anchorNode.x + anchorNode.width / 2) * store.zoom),
+            y: Math.round(viewportH / 2 - (anchorNode.y + anchorNode.height / 2) * store.zoom)
+          });
         }
       }
+      store.selectItem('edge', targetId);
+      return;
+    }
 
-      store.selectItem('edge', cableId);
-
-      if (layout.layoutTier === 'wide') {
-        setIsPropertiesCollapsed(false);
-      }
-
-      if (viewport.is3DView) {
-        focus3DTargetDeferred('edge', cableId);
-      }
-    },
-    [
-      store,
-      viewport.is3DView,
-      focus3DTargetDeferred,
-      layout.containerSize.height,
-      layout.containerSize.width,
-      layout.layoutTier,
-      layout.leftWidth,
-      layout.rightWidth
-    ]
-  );
-
-  const handleSelectFrom3D = useCallback(
-    (type: SelectionState['type'], id?: string) => {
-      store.selectItem(type, id);
-      if (type !== 'none' && type !== 'canvas' && id) {
-        const canonical = resolveCanonicalSelection(type, id, store.project);
-        const floorId = resolveSelectionFloorId(canonical, store.project);
-        if (floorId && floorId !== store.project.activeFloorId) {
-          store.setActiveFloor(floorId, { preserveSelection: true });
+    if (targetType === 'rack') {
+      const rackNode = store.project.nodes.find(
+        n => n.customData?.rackId === targetId || n.id === targetId
+      );
+      if (rackNode) {
+        if (rackNode.floorId && rackNode.floorId !== store.project.activeFloorId) {
+          store.setActiveFloor(rackNode.floorId);
         }
-        if (layout.layoutTier === 'wide') {
-          setIsPropertiesCollapsed(false);
+        if (rackNode.diagramMode && rackNode.diagramMode !== store.project.activeMode) {
+          store.setDesignMode(rackNode.diagramMode);
         }
+        store.setPan({
+          x: Math.round(viewportW / 2 - (rackNode.x + rackNode.width / 2) * store.zoom),
+          y: Math.round(viewportH / 2 - (rackNode.y + rackNode.height / 2) * store.zoom)
+        });
       }
-    },
-    [store, layout.layoutTier]
-  );
-
-  const handleToggleNodeSelectionFrom3D = useCallback(
-    (nodeId: string) => {
-      store.toggleNodeSelection(nodeId);
-      if (layout.layoutTier === 'wide') {
-        setIsPropertiesCollapsed(false);
-      }
-    },
-    [store, layout.layoutTier]
-  );
-
-  // Center of viewport in canvas coordinates for quick addition
-  const canvasCenter = {
-    x: Math.round((-store.pan.x + (canvasHostRef.current?.clientWidth || 720) * 0.45) / store.zoom),
-    y: Math.round((-store.pan.y + (canvasHostRef.current?.clientHeight || 480) * 0.45) / store.zoom)
-  };
-
-  const auditReport = useMemo(() => runEngineeringAudit(store.project), [store.project]);
-
-  const handleNavigateToAuditTarget = useCallback(
-    (targetType: AuditIssue['targetType'], targetId: string) => {
-      if (targetType === 'node' || targetType === 'rack') {
-        handleJumpToNode(targetId);
-      } else if (targetType === 'edge') {
-        handleJumpToCable(targetId);
-      }
-    },
-    [handleJumpToNode, handleJumpToCable]
-  );
+      store.selectItem('rack', targetId);
+    }
+  }, [handleJumpToNode, store, viewport, layout.containerSize.height, layout.containerSize.width, layout.layoutTier, layout.leftWidth, layout.rightWidth]);
 
   // Handle direct Excel upload from toolbar using lazy import for ExcelJS splitting
   const handleExcelQuickUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1270,7 +1233,11 @@ function AppContent({ store }: { store: ProjectStore }) {
     } else {
       layout.setActiveDrawer('library');
     }
-    window.setTimeout(() => {
+    if (focusLibraryTimerRef.current !== null) {
+      window.clearTimeout(focusLibraryTimerRef.current);
+    }
+    focusLibraryTimerRef.current = window.setTimeout(() => {
+      focusLibraryTimerRef.current = null;
       window.dispatchEvent(new CustomEvent('hachihi:focus-library'));
     }, 60);
   }, [layout]);
@@ -1320,236 +1287,13 @@ function AppContent({ store }: { store: ProjectStore }) {
     [store, viewport, showToast]
   );
 
-  const resolveLibraryInsertionPoint = useCallback(
-    (fallbackX?: number, fallbackY?: number) => {
-      if (viewport.is3DView) {
-        const pt3d = viewport.get3DInsertionPoint();
-        if (pt3d) return pt3d;
-      }
-      return {
-        x: typeof fallbackX === 'number' ? fallbackX : canvasCenter.x,
-        y: typeof fallbackY === 'number' ? fallbackY : canvasCenter.y
-      };
-    },
-    [viewport, canvasCenter.x, canvasCenter.y]
-  );
-
   const handleAddRack = useCallback(
-    (rackName = 'Tủ Server Rack 42U', x?: number, y?: number) => {
-      if (isReadOnlyMode) return;
-      let targetX = x;
-      let targetY = y;
-      if (typeof targetX !== 'number' || typeof targetY !== 'number') {
-        const cursorPos = viewport.is3DView
-          ? viewport.get3DInsertionPoint()
-          : canvas2DDropApiRef.current?.getCursorCanvasPos();
-        if (cursorPos) {
-          targetX = cursorPos.x;
-          targetY = cursorPos.y;
-        } else {
-          targetX = canvasCenter.x;
-          targetY = canvasCenter.y;
-        }
-      }
+    (rackName = 'Tủ Server Rack 42U') => {
       recordAction('add_rack');
-      store.addRack(rackName, 42, targetX, targetY);
+      store.addRack(rackName);
     },
-    [isReadOnlyMode, viewport, canvasCenter.x, canvasCenter.y, recordAction, store]
+    [recordAction, store]
   );
-
-  useEffect(() => {
-    addRackActionRef.current = () => {
-      handleAddRack('Tủ Server Rack 42U');
-    };
-  }, [handleAddRack]);
-
-  const handleDropCatalogOrCustomDevice = useCallback(
-    (presetName: string, x: number, y: number, customPresetId?: string) => {
-      if (customPresetId) {
-        const customPreset = loadCustomDevicePresets().find(p => p.id === customPresetId);
-        if (customPreset) {
-          store.addCustomDevicePresetToCanvas(customPreset, x, y);
-          return;
-        }
-      }
-      if (
-        presetName === 'Tủ Rack Phân Phối IDF' ||
-        (presetName.toLowerCase().includes('rack') && !DEVICE_CATALOG.some(d => d.name === presetName))
-      ) {
-        handleAddRack(presetName, x, y);
-        return;
-      }
-      store.addDeviceFromCatalog(presetName, x, y);
-    },
-    [store, handleAddRack]
-  );
-
-  const updateLibraryDragPreview = useCallback(
-    (payload: LibraryDragPayload, clientX: number, clientY: number) => {
-      if (viewport.is3DView) {
-        const canInsert = canAddDevicesInScene({
-          isReadOnlyMode,
-          is3DView: true,
-          is3DDragLocked: viewport.is3DDragLocked
-        });
-        if (!canInsert) {
-          viewport.clear3DLibraryDropPreview();
-          return {
-            isOverTarget: false,
-            canDrop: false,
-            hint: 'Đang khóa 3D — Nhấn Mở khóa để thêm thiết bị'
-          };
-        }
-        const hit = viewport.preview3DLibraryDrop(clientX, clientY, {
-          width: payload.width,
-          height: payload.height,
-          isRack: payload.action === 'rack'
-        });
-        if (hit) {
-          return {
-            isOverTarget: true,
-            canDrop: true,
-            hint: `Thả để đặt vào ${hit.floorName}`
-          };
-        }
-        return {
-          isOverTarget: false,
-          canDrop: false,
-          hint: 'Kéo vào khung nhìn 3D để đặt'
-        };
-      }
-
-      const preview = canvas2DDropApiRef.current?.previewLibraryDrop(clientX, clientY, payload.presetName, {
-        width: payload.width,
-        height: payload.height,
-        isRack: payload.action === 'rack',
-        customPresetId: payload.customPresetId
-      });
-      if (preview?.rackHitU) {
-        return {
-          isOverTarget: true,
-          canDrop: true,
-          hint: preview.rackHitValid
-            ? `Đặt vào ${preview.rackHitName || 'Tủ Rack'} · ${preview.rackHitU}U`
-            : `Vị trí ${preview.rackHitU}U đã kín (sẽ tự chọn ô trống)`
-        };
-      }
-      if (preview) {
-        return {
-          isOverTarget: true,
-          canDrop: true,
-          hint: 'Thả để đặt lên bản vẽ 2D'
-        };
-      }
-      return {
-        isOverTarget: false,
-        canDrop: false,
-        hint: 'Kéo ra vùng bản vẽ để đặt'
-      };
-    },
-    [viewport, isReadOnlyMode]
-  );
-
-  const clearAllLibraryDropState = useCallback(() => {
-    viewport.clear3DLibraryDropPreview();
-    canvas2DDropApiRef.current?.clearLibraryDropPreview();
-    activeLibraryDragRef.current = null;
-    setActiveLibraryDrag(null);
-  }, [viewport]);
-
-  useEffect(() => {
-    if (activeLibraryDragRef.current) {
-      clearAllLibraryDropState();
-    }
-  }, [viewport.is3DView, isReadOnlyMode, clearAllLibraryDropState]);
-
-  const handleStartPointerDrag = useCallback(
-    (payload: LibraryDragPayload, clientX: number, clientY: number) => {
-      const status = updateLibraryDragPreview(payload, clientX, clientY);
-      const next = { payload, clientX, clientY, ...status };
-      activeLibraryDragRef.current = next;
-      setActiveLibraryDrag(next);
-    },
-    [updateLibraryDragPreview]
-  );
-
-  const handleMovePointerDrag = useCallback(
-    (clientX: number, clientY: number) => {
-      const current = activeLibraryDragRef.current;
-      if (!current) return;
-      const status = updateLibraryDragPreview(current.payload, clientX, clientY);
-      const next = { payload: current.payload, clientX, clientY, ...status };
-      activeLibraryDragRef.current = next;
-      setActiveLibraryDrag(next);
-    },
-    [updateLibraryDragPreview]
-  );
-
-  const handleEndPointerDrag = useCallback(
-    (clientX: number, clientY: number) => {
-      const current = activeLibraryDragRef.current;
-      if (!current) return;
-      const { payload } = current;
-      let committed = false;
-
-      if (viewport.is3DView) {
-        const canInsert = canAddDevicesInScene({
-          isReadOnlyMode,
-          is3DView: true,
-          is3DDragLocked: viewport.is3DDragLocked
-        });
-        if (canInsert) {
-          const hit = viewport.preview3DLibraryDrop(clientX, clientY, {
-            width: payload.width,
-            height: payload.height,
-            isRack: payload.action === 'rack'
-          });
-          if (hit) {
-            if (payload.action === 'rack') {
-              handleAddRack(payload.presetName, hit.x, hit.y);
-            } else {
-              handleDropCatalogOrCustomDevice(payload.presetName, hit.x, hit.y, payload.customPresetId);
-            }
-            committed = true;
-          }
-        }
-      } else {
-        committed = Boolean(
-          canvas2DDropApiRef.current?.commitLibraryDrop(clientX, clientY, payload.presetName, {
-            width: payload.width,
-            height: payload.height,
-            isRack: payload.action === 'rack',
-            customPresetId: payload.customPresetId
-          })
-        );
-      }
-
-      clearAllLibraryDropState();
-      if (committed && layout.activeDrawer === 'library') {
-        layout.setActiveDrawer('none');
-      }
-    },
-    [
-      viewport,
-      isReadOnlyMode,
-      handleAddRack,
-      handleDropCatalogOrCustomDevice,
-      clearAllLibraryDropState,
-      layout
-    ]
-  );
-
-  const handleCancelPointerDrag = useCallback(() => {
-    clearAllLibraryDropState();
-  }, [clearAllLibraryDropState]);
-
-  const handleBlockedInsertAttempt = useCallback(() => {
-    showToast(
-      'Đang khóa không gian 3D — Nhấn Mở khóa cạnh nút 2D / 3D để thêm hoặc kéo thả thiết bị.',
-      'info',
-      2800
-    );
-  }, [showToast]);
 
   const openAuditModal = useCallback(() => {
     recordAction('open_audit');
@@ -1693,80 +1437,321 @@ function AppContent({ store }: { store: ProjectStore }) {
     ]
   );
 
-  // Properties Panel shared props builder
-  const propertiesPanelProps = {
-    project: store.project,
-    selection: store.selection,
-    auditIssues: auditReport.issues,
-    is3DView: viewport.is3DView,
-    isReadOnlyMode,
-    onUpdateAsset: store.updateDeviceAsset,
-    onUpdateNode: store.updateNode,
-    onSetNodeIconOrLogo: store.setNodeIconOrLogo,
-    onToggleNodeLock: store.toggleNodeLock,
-    onToggleNodeVisibility: store.toggleNodeVisibility,
-    onSelectCable: handleJumpToCable,
-    onSelectNode: handleJumpToNode,
-    onUpdateCable: store.updateCable,
-    onSetCableColor: store.setCableColor,
-    onSetCablesColorByType: store.setCablesColorByType,
-    onReconnectCableEndpoint: store.reconnectCableEndpoint,
-    onUpdateRoom: store.updateRoom,
-    onUpdateRack: store.updateRack,
-    onAssignDeviceToRackSlot: store.assignDeviceToRackSlot,
-    onRemoveDeviceFromRackSlot: store.removeDeviceFromRackSlot,
-    onUpdateFloor: (flId: string, partial: Partial<ProjectState['floors'][number]>) => {
+  const handleSelectCable = useCallback(
+    (cableId: string) => store.selectItem('edge', cableId),
+    [store]
+  );
+
+  const handleUpdateFloor = useCallback(
+    (flId: string, partial: Partial<ProjectState['floors'][number]>) => {
       store.updateProject(prev => ({
         ...prev,
         floors: prev.floors.map(f => (f.id === flId ? { ...f, ...partial } : f))
       }));
     },
-    onUpdateSettings: store.updateSettings,
-    onAutoAssignIps: handleAutoAssignIps,
-    onUpdateProjectMeta: store.updateProjectMeta,
-    onDuplicateProject: () => {
-      void store.duplicateProject().then(() => {
-        showToast('Đã nhân bản thành dự án mới!', 'success');
-      });
-    },
-    onDeleteNode: store.deleteNode,
-    onDeleteNodes: store.deleteNodes,
-    onDuplicateNodes: store.duplicateNodes,
-    onGroupNodes: store.groupNodes,
-    onUngroupNodes: store.ungroupNodes,
-    onAlignNodes: store.alignNodes,
-    onDistributeNodes: store.distributeNodes,
-    onAutoAlignSnapToGrid: store.autoAlignNodesSnapToGrid,
-    onDeleteCable: store.deleteCable,
-    onDeleteRoom: store.deleteRoom,
-    onDeleteRack: store.deleteRack,
-    onOpenDeepInspect: openDeepInspect,
-    onCloneFloor: store.cloneFloor,
-    onResizeLegendToFit: store.resizeLegendToFit,
-    onAutoRouteCable: handleAutoRouteCable,
-    onAutoRouteAllCables: handleAutoRouteAllCables,
-    hasCopiedStyle: store.hasCopiedStyle,
-    onCopyNodeStyle: (id: string) => {
+    [store]
+  );
+
+  const handleDuplicateProject = useCallback(() => {
+    void store.duplicateProject().then(() => {
+      showToast('Đã nhân bản thành dự án mới!', 'success');
+    });
+  }, [store, showToast]);
+
+  const handleCopyNodeStyleById = useCallback(
+    (id: string) => {
       if (store.copyNodeStyle(id)) {
         showToast('Đã sao chép kiểu đối tượng!', 'info', 1800);
       }
     },
-    onPasteNodeStyle: (ids: string[]) => {
+    [store, showToast]
+  );
+
+  const handlePasteNodeStyleByIds = useCallback(
+    (ids: string[]) => {
       if (store.pasteNodeStyle(ids)) {
         showToast('Đã dán kiểu cho đối tượng!', 'success', 1800);
       }
     },
-    layoutTier: layout.layoutTier,
-    density: layout.density,
-    highContrast: layout.highContrast,
-    reducedMotion: layout.reducedMotion,
-    onToggleDensity: layout.toggleDensity,
-    onToggleHighContrast: layout.toggleHighContrast,
-    onToggleReducedMotion: layout.toggleReducedMotion,
-    onOpenBomModal: openBomModal,
-    onAutoLayerDevices: handleAutoLayerDevices,
-    requestedTab: requestedPropertiesTab
-  };
+    [store, showToast]
+  );
+
+  const handleTogglePropertiesCollapse = useCallback(() => {
+    setIsPropertiesCollapsed(prev => !prev);
+  }, []);
+
+  const handleOpenPowerTab = useCallback(() => {
+    setIsPropertiesCollapsed(false);
+    setRequestedPropertiesTab({ tab: 'power', nonce: Date.now() });
+  }, []);
+
+  const handleAutoAssignIpsPreserve = useCallback(
+    () => handleAutoAssignIps({ preserveExistingValid: true }),
+    [handleAutoAssignIps]
+  );
+
+  const handleOpenProjectHub = useCallback(() => setIsProjectHubOpen(true), []);
+  const handleOpenQuickTour = useCallback(() => setIsQuickTourOpen(true), []);
+  const handleOpenAbout = useCallback(() => setIsAboutModalOpen(true), []);
+  const handleOpenCommandPalette = useCallback(() => setIsCommandPaletteOpen(true), []);
+  const handleAddStandardRack = useCallback(() => handleAddRack('Tủ Server Rack 42U'), [handleAddRack]);
+  const handleAddIdfRack = useCallback(() => handleAddRack('Tủ Rack Phân Phối IDF'), [handleAddRack]);
+
+  const handleNewProject = useCallback(() => {
+    void store.resetCanvas().then(() => {
+      showToast('Đã tạo bản vẽ trống mới', 'info');
+    });
+  }, [store, showToast]);
+
+  const handleOpenJsonOrPackageImport = useCallback(() => {
+    packageFileInputRef.current?.click();
+  }, []);
+
+  const handleToggleAiChat = useCallback(() => setIsAiChatOpen(v => !v), []);
+
+  const handleShowToast2800 = useCallback(
+    (msg: string, type?: 'success' | 'error' | 'info') => showToast(msg, type || 'info', 2800),
+    [showToast]
+  );
+
+  const handleExportA4PdfAction = useCallback(() => {
+    void handleQuickExportA4Pdf();
+  }, [handleQuickExportA4Pdf]);
+
+  const handleToggleLeftDrawer = useCallback(() => {
+    setNarrowSubDrawer('none');
+    layout.setActiveDrawer(d => (d === 'library' ? 'none' : 'library'));
+  }, [layout]);
+
+  const handleToggleRightDrawer = useCallback(() => {
+    setNarrowSubDrawer('none');
+    if (layout.layoutTier === 'narrow') {
+      layout.setBottomSheetSnap(s => (s === 'collapsed' ? 'half' : 'collapsed'));
+    } else {
+      layout.setActiveDrawer(d => (d === 'properties' ? 'none' : 'properties'));
+    }
+  }, [layout]);
+
+  const handleToggleCoverageOverlay = useCallback(() => {
+    store.updateSettings({ showCoverageRadius: !store.project.settings.showCoverageRadius });
+  }, [store]);
+
+  const handleToggleReadOnly = useCallback(() => setIsReadOnlyMode(v => !v), []);
+
+  const handleAddDeviceAt = useCallback(
+    (presetName: string, x?: number, y?: number) => {
+      store.addDeviceFromCatalog(presetName, x, y);
+    },
+    [store]
+  );
+
+  const handleAddCustomDeviceAt = useCallback(
+    (preset: Parameters<typeof store.addCustomDevicePresetToCanvas>[0], x?: number, y?: number) => {
+      store.addCustomDevicePresetToCanvas(preset, x, y);
+    },
+    [store]
+  );
+
+  const handleAddTextNodeAt = useCallback(
+    (x?: number, y?: number) => {
+      store.addTextNode(x, y);
+    },
+    [store]
+  );
+
+  const handleAddShapeNodeAt = useCallback(
+    (kind: Parameters<typeof store.addShapeNode>[0], x?: number, y?: number) => {
+      store.addShapeNode(kind, x, y);
+    },
+    [store]
+  );
+
+  const handleDrawerAddDeviceAt = useCallback(
+    (presetName: string, x?: number, y?: number) => {
+      store.addDeviceFromCatalog(presetName, x, y);
+      layout.setActiveDrawer('none');
+    },
+    [store, layout]
+  );
+
+  const handleDrawerAddCustomDeviceAt = useCallback(
+    (preset: Parameters<typeof store.addCustomDevicePresetToCanvas>[0], x?: number, y?: number) => {
+      store.addCustomDevicePresetToCanvas(preset, x, y);
+      layout.setActiveDrawer('none');
+    },
+    [store, layout]
+  );
+
+  const handleDrawerAddTextNodeAt = useCallback(
+    (x?: number, y?: number) => {
+      store.addTextNode(x, y);
+      layout.setActiveDrawer('none');
+    },
+    [store, layout]
+  );
+
+  const handleDrawerAddShapeNodeAt = useCallback(
+    (kind: Parameters<typeof store.addShapeNode>[0], x?: number, y?: number) => {
+      store.addShapeNode(kind, x, y);
+      layout.setActiveDrawer('none');
+    },
+    [store, layout]
+  );
+
+  const handleDrawerGenerateLegend = useCallback(() => {
+    store.generateOrUpdateLegendNode();
+    layout.setActiveDrawer('none');
+    showToast('Đã tạo / đồng bộ Bảng chú giải lên trang vẽ!', 'success', 2400);
+  }, [store, layout, showToast]);
+
+  const handleDrawerAddIdfRack = useCallback(() => {
+    store.addRack('Tủ Rack Phân Phối IDF');
+    layout.setActiveDrawer('none');
+  }, [store, layout]);
+
+  const handleCloseLibraryDrawer = useCallback(() => {
+    layout.setActiveDrawer('none');
+  }, [layout]);
+
+  const handleOpenDeepInspectById = useCallback(
+    (id: string) => store.setDeepInspectId(id),
+    [store]
+  );
+
+  const handleDropDevice = useCallback(
+    (presetName: string, x: number, y: number) => {
+      store.addDeviceFromCatalog(presetName, x, y);
+    },
+    [store]
+  );
+
+  const handleDropDeviceIntoRack = useCallback(
+    (presetName: string, rackId: string, preferredU: number, side?: 'front' | 'rear') => {
+      store.addDeviceFromCatalogToRack(presetName, rackId, preferredU, side);
+    },
+    [store]
+  );
+
+  const handleAddQuickDevice = useCallback(() => {
+    store.addDeviceFromCatalog('Access Switch 24-PoE+', canvasCenter.x, canvasCenter.y);
+  }, [store, canvasCenter.x, canvasCenter.y]);
+
+  // Properties Panel shared props builder
+  const propertiesPanelProps = useMemo(
+    () => ({
+      project: store.project,
+      selection: store.selection,
+      auditIssues: auditReport.issues,
+      is3DView: viewport.is3DView,
+      isReadOnlyMode,
+      onUpdateAsset: store.updateDeviceAsset,
+      onUpdateNode: store.updateNode,
+      onSetNodeIconOrLogo: store.setNodeIconOrLogo,
+      onToggleNodeLock: store.toggleNodeLock,
+      onToggleNodeVisibility: store.toggleNodeVisibility,
+      onSelectCable: handleSelectCable,
+      onSelectNode: handleJumpToNode,
+      onUpdateCable: store.updateCable,
+      onSetCableColor: store.setCableColor,
+      onSetCablesColorByType: store.setCablesColorByType,
+      onReconnectCableEndpoint: store.reconnectCableEndpoint,
+      onUpdateRoom: store.updateRoom,
+      onUpdateRack: store.updateRack,
+      onAssignDeviceToRackSlot: store.assignDeviceToRackSlot,
+      onRemoveDeviceFromRackSlot: store.removeDeviceFromRackSlot,
+      onUpdateFloor: handleUpdateFloor,
+      onUpdateSettings: store.updateSettings,
+      onAutoAssignIps: handleAutoAssignIps,
+      onUpdateProjectMeta: store.updateProjectMeta,
+      onDuplicateProject: handleDuplicateProject,
+      onDeleteNode: store.deleteNode,
+      onDeleteNodes: store.deleteNodes,
+      onDuplicateNodes: store.duplicateNodes,
+      onGroupNodes: store.groupNodes,
+      onUngroupNodes: store.ungroupNodes,
+      onAlignNodes: store.alignNodes,
+      onDistributeNodes: store.distributeNodes,
+      onAutoAlignSnapToGrid: store.autoAlignNodesSnapToGrid,
+      onDeleteCable: store.deleteCable,
+      onDeleteRoom: store.deleteRoom,
+      onDeleteRack: store.deleteRack,
+      onOpenDeepInspect: openDeepInspect,
+      onCloneFloor: store.cloneFloor,
+      onResizeLegendToFit: store.resizeLegendToFit,
+      onAutoRouteCable: handleAutoRouteCable,
+      onAutoRouteAllCables: handleAutoRouteAllCables,
+      hasCopiedStyle: store.hasCopiedStyle,
+      onCopyNodeStyle: handleCopyNodeStyleById,
+      onPasteNodeStyle: handlePasteNodeStyleByIds,
+      layoutTier: layout.layoutTier,
+      density: layout.density,
+      highContrast: layout.highContrast,
+      reducedMotion: layout.reducedMotion,
+      onToggleDensity: layout.toggleDensity,
+      onToggleHighContrast: layout.toggleHighContrast,
+      onToggleReducedMotion: layout.toggleReducedMotion,
+      onOpenBomModal: openBomModal,
+      onAutoLayerDevices: handleAutoLayerDevices,
+      requestedTab: requestedPropertiesTab,
+      experienceMode: store.project.settings.experienceMode ?? ('advanced' as const)
+    }),
+    [
+      store.project,
+      store.selection,
+      auditReport.issues,
+      viewport.is3DView,
+      isReadOnlyMode,
+      store.updateDeviceAsset,
+      store.updateNode,
+      store.setNodeIconOrLogo,
+      store.toggleNodeLock,
+      store.toggleNodeVisibility,
+      handleSelectCable,
+      handleJumpToNode,
+      store.updateCable,
+      store.setCableColor,
+      store.setCablesColorByType,
+      store.reconnectCableEndpoint,
+      store.updateRoom,
+      store.updateRack,
+      store.assignDeviceToRackSlot,
+      store.removeDeviceFromRackSlot,
+      handleUpdateFloor,
+      store.updateSettings,
+      handleAutoAssignIps,
+      store.updateProjectMeta,
+      handleDuplicateProject,
+      store.deleteNode,
+      store.deleteNodes,
+      store.duplicateNodes,
+      store.groupNodes,
+      store.ungroupNodes,
+      store.alignNodes,
+      store.distributeNodes,
+      store.autoAlignNodesSnapToGrid,
+      store.deleteCable,
+      store.deleteRoom,
+      store.deleteRack,
+      openDeepInspect,
+      store.cloneFloor,
+      store.resizeLegendToFit,
+      handleAutoRouteCable,
+      handleAutoRouteAllCables,
+      store.hasCopiedStyle,
+      handleCopyNodeStyleById,
+      handlePasteNodeStyleByIds,
+      layout.layoutTier,
+      layout.density,
+      layout.highContrast,
+      layout.reducedMotion,
+      layout.toggleDensity,
+      layout.toggleHighContrast,
+      layout.toggleReducedMotion,
+      openBomModal,
+      handleAutoLayerDevices,
+      requestedPropertiesTab
+    ]
+  );
 
   const sheetHeightClass =
     layout.bottomSheetSnap === 'full'
@@ -1853,62 +1838,41 @@ function AppContent({ store }: { store: ProjectStore }) {
             onPasteSelectedStyle={handlePasteSelectedStyle}
             onApplyWorkspacePreset={handleApplyWorkspacePreset}
             onSaveNow={handleSaveNow}
-            onDuplicateProject={() => {
-              void store.duplicateProject().then(() => {
-                showToast('Đã nhân bản thành dự án mới!', 'success');
-              });
-            }}
+            onDuplicateProject={handleDuplicateProject}
             onSetMode={store.setDesignMode}
-            onAutoAssignIps={() => handleAutoAssignIps({ preserveExistingValid: true })}
-            onOpenProjectHub={() => setIsProjectHubOpen(true)}
+            onAutoAssignIps={handleAutoAssignIpsPreserve}
+            onOpenProjectHub={handleOpenProjectHub}
             onOpenEngineeringAudit={openAuditModal}
-            onOpenPowerTab={() => {
-              setIsPropertiesCollapsed(false);
-              setRequestedPropertiesTab({ tab: 'power', nonce: Date.now() });
-            }}
+            onOpenPowerTab={handleOpenPowerTab}
             onOpenTemplates={openTemplateModal}
             onOpenBuildingGenerator={openBuildingModal}
             onOpenExport={openExportModal}
             onOpenBomModal={openBomModal}
             onOpenGuide={openGuideModal}
-            onOpenQuickTour={() => setIsQuickTourOpen(true)}
-            onOpenAbout={() => setIsAboutModalOpen(true)}
-            onAddRack={() => handleAddRack('Tủ Server Rack 42U')}
-            onNewProject={() => {
-              void store.resetCanvas().then(() => {
-                showToast('Đã tạo bản vẽ trống mới', 'info');
-              });
-            }}
+            onOpenQuickTour={handleOpenQuickTour}
+            onOpenAbout={handleOpenAbout}
+            onAddRack={handleAddStandardRack}
+            onNewProject={handleNewProject}
             onOpenExcelImport={openExcelTreeModal}
-            onOpenJsonImport={() => packageFileInputRef.current?.click()}
-            onOpenPackageImport={() => packageFileInputRef.current?.click()}
+            onOpenJsonImport={handleOpenJsonOrPackageImport}
+            onOpenPackageImport={handleOpenJsonOrPackageImport}
             isDarkMode={store.project.settings.isDarkMode}
             onToggleTheme={handleToggleTheme}
             is3DView={viewport.is3DView}
             onToggle3DView={handleToggle3D}
             isAiChatOpen={isAiChatOpen}
-            onToggleAiChat={isAiAvailable ? () => setIsAiChatOpen(v => !v) : undefined}
+            onToggleAiChat={isAiAvailable ? handleToggleAiChat : undefined}
             onAutoRouteAllCables={handleAutoRouteAllCables}
             onAutoLayerDevices={handleAutoLayerDevices}
-            onOpenCommandPalette={() => setIsCommandPaletteOpen(true)}
+            onOpenCommandPalette={handleOpenCommandPalette}
             onOpenShortcuts={openShortcutsModal}
-            onExportA4Pdf={() => void handleQuickExportA4Pdf()}
+            onExportA4Pdf={handleExportA4PdfAction}
             onOpenDirectory={openDirectoryModal}
             isReadOnlyMode={isReadOnlyMode}
             layoutTier={layout.layoutTier}
-            onShowToast={(msg, type) => showToast(msg, type || 'info', 2800)}
-            onToggleLeftDrawer={() => {
-              setNarrowSubDrawer('none');
-              layout.setActiveDrawer(d => (d === 'library' ? 'none' : 'library'));
-            }}
-            onToggleRightDrawer={() => {
-              setNarrowSubDrawer('none');
-              if (layout.layoutTier === 'narrow') {
-                layout.setBottomSheetSnap(s => (s === 'collapsed' ? 'half' : 'collapsed'));
-              } else {
-                layout.setActiveDrawer(d => (d === 'properties' ? 'none' : 'properties'));
-              }
-            }}
+            onShowToast={handleShowToast2800}
+            onToggleLeftDrawer={handleToggleLeftDrawer}
+            onToggleRightDrawer={handleToggleRightDrawer}
           />
         )}
 
@@ -1932,19 +1896,25 @@ function AppContent({ store }: { store: ProjectStore }) {
             onAddDeviceFocus={handleFocusDeviceLibrary}
             onOpenExcelTree={openExcelTreeModal}
             onAutoRouteAllCables={handleAutoRouteAllCables}
-            onAutoAssignIps={() => handleAutoAssignIps({ preserveExistingValid: true })}
-            onAddRack={() => handleAddRack('Tủ Server Rack 42U')}
-            onOpenPowerTab={() => {
-              setIsPropertiesCollapsed(false);
-              setRequestedPropertiesTab({ tab: 'power', nonce: Date.now() });
-            }}
-            onToggleCoverageOverlay={() =>
-              store.updateSettings({ showCoverageRadius: !store.project.settings.showCoverageRadius })
-            }
-            onToggleReadOnly={() => setIsReadOnlyMode(v => !v)}
+            onAutoAssignIps={handleAutoAssignIpsPreserve}
+            onAddRack={handleAddStandardRack}
+            onOpenPowerTab={handleOpenPowerTab}
+            onToggleCoverageOverlay={handleToggleCoverageOverlay}
+            onToggleReadOnly={handleToggleReadOnly}
             onAutoLayerDevices={handleAutoLayerDevices}
             onReplayRecentAction={replayRecentAction}
             onClearRecentActions={handleClearRecentActions}
+            experienceMode={store.project.settings.experienceMode ?? 'advanced'}
+            onToggleExperienceMode={mode => {
+              store.updateSettings({ experienceMode: mode });
+              showToast(
+                mode === 'basic'
+                  ? 'Đã bật chế độ Cơ bản: chỉ hiển thị thao tác vẽ & cấu hình thiết yếu.'
+                  : 'Đã bật chế độ Kỹ sư: mở đầy đủ công cụ IP/VLAN, PoE/UPS & Tủ Rack.',
+                'info',
+                2200
+              );
+            }}
           />
         )}
 
@@ -1956,37 +1926,14 @@ function AppContent({ store }: { store: ProjectStore }) {
               <LeftLibrary
                 project={store.project}
                 is3DView={viewport.is3DView}
-                is3DDragLocked={viewport.is3DDragLocked}
                 isReadOnlyMode={isReadOnlyMode}
-                onAddDevice={(presetName, x, y) => {
-                  const pt = resolveLibraryInsertionPoint(x, y);
-                  store.addDeviceFromCatalog(presetName, pt.x, pt.y);
-                }}
-                onAddCustomDevice={(preset, x, y) => {
-                  const pt = resolveLibraryInsertionPoint(x, y);
-                  store.addCustomDevicePresetToCanvas(preset, pt.x, pt.y);
-                }}
-                onAddTextNode={(x, y) => {
-                  store.addTextNode(x, y);
-                }}
-                onAddShapeNode={(kind, x, y) => {
-                  store.addShapeNode(kind, x, y);
-                }}
+                onAddDevice={handleAddDeviceAt}
+                onAddCustomDevice={handleAddCustomDeviceAt}
+                onAddTextNode={handleAddTextNodeAt}
+                onAddShapeNode={handleAddShapeNodeAt}
                 onGenerateLegend={handleGenerateLegend}
-                onAddRack={() => {
-                  if (viewport.is3DView) {
-                    const pt = resolveLibraryInsertionPoint();
-                    handleAddRack('Tủ Rack Phân Phối IDF', pt.x, pt.y);
-                  } else {
-                    handleAddRack('Tủ Rack Phân Phối IDF');
-                  }
-                }}
+                onAddRack={handleAddIdfRack}
                 onDragPresetChange={setDraggedPresetName}
-                onStartPointerDrag={handleStartPointerDrag}
-                onMovePointerDrag={handleMovePointerDrag}
-                onEndPointerDrag={handleEndPointerDrag}
-                onCancelPointerDrag={handleCancelPointerDrag}
-                onBlockedInsertAttempt={handleBlockedInsertAttempt}
                 canvasCenter={canvasCenter}
                 widthPx={layout.leftWidth}
                 isCollapsed={isLeftCollapsed}
@@ -2008,68 +1955,26 @@ function AppContent({ store }: { store: ProjectStore }) {
           {!isZenMode && layout.layoutTier !== 'wide' && layout.activeDrawer === 'library' && (
             <>
               <div
-                onClick={() => layout.setActiveDrawer('none')}
-                className={`fixed inset-0 z-30 bg-black/40 backdrop-blur-[1px] transition-opacity no-print ${
-                  activeLibraryDrag && activeLibraryDrag.clientX > 280
-                    ? 'opacity-10 pointer-events-none'
-                    : 'opacity-100'
-                }`}
+                onClick={handleCloseLibraryDrawer}
+                className="fixed inset-0 z-30 bg-black/40 backdrop-blur-[1px] no-print"
                 aria-hidden="true"
               />
-              <div
-                className={`fixed inset-y-0 left-0 z-40 pt-safe pb-safe shadow-2xl transition-opacity no-print ${
-                  activeLibraryDrag && activeLibraryDrag.clientX > 280
-                    ? 'opacity-15 pointer-events-none'
-                    : 'opacity-100'
-                }`}
-              >
+              <div className="fixed inset-y-0 left-0 z-40 pt-safe pb-safe shadow-2xl no-print">
                 <LeftLibrary
                   project={store.project}
                   is3DView={viewport.is3DView}
-                  is3DDragLocked={viewport.is3DDragLocked}
                   isReadOnlyMode={isReadOnlyMode}
-                  onAddDevice={(presetName, x, y) => {
-                    const pt = resolveLibraryInsertionPoint(x, y);
-                    store.addDeviceFromCatalog(presetName, pt.x, pt.y);
-                    layout.setActiveDrawer('none');
-                  }}
-                  onAddCustomDevice={(preset, x, y) => {
-                    const pt = resolveLibraryInsertionPoint(x, y);
-                    store.addCustomDevicePresetToCanvas(preset, pt.x, pt.y);
-                    layout.setActiveDrawer('none');
-                  }}
-                  onAddTextNode={(x, y) => {
-                    store.addTextNode(x, y);
-                    layout.setActiveDrawer('none');
-                  }}
-                  onAddShapeNode={(kind, x, y) => {
-                    store.addShapeNode(kind, x, y);
-                    layout.setActiveDrawer('none');
-                  }}
-                  onGenerateLegend={() => {
-                    store.generateOrUpdateLegendNode();
-                    layout.setActiveDrawer('none');
-                    showToast('Đã tạo / đồng bộ Bảng chú giải lên trang vẽ!', 'success', 2400);
-                  }}
-                  onAddRack={() => {
-                    if (viewport.is3DView) {
-                      const pt = resolveLibraryInsertionPoint();
-                      handleAddRack('Tủ Rack Phân Phối IDF', pt.x, pt.y);
-                    } else {
-                      handleAddRack('Tủ Rack Phân Phối IDF');
-                    }
-                    layout.setActiveDrawer('none');
-                  }}
+                  onAddDevice={handleDrawerAddDeviceAt}
+                  onAddCustomDevice={handleDrawerAddCustomDeviceAt}
+                  onAddTextNode={handleDrawerAddTextNodeAt}
+                  onAddShapeNode={handleDrawerAddShapeNodeAt}
+                  onGenerateLegend={handleDrawerGenerateLegend}
+                  onAddRack={handleDrawerAddIdfRack}
                   onDragPresetChange={setDraggedPresetName}
-                  onStartPointerDrag={handleStartPointerDrag}
-                  onMovePointerDrag={handleMovePointerDrag}
-                  onEndPointerDrag={handleEndPointerDrag}
-                  onCancelPointerDrag={handleCancelPointerDrag}
-                  onBlockedInsertAttempt={handleBlockedInsertAttempt}
                   canvasCenter={canvasCenter}
                   widthPx={296}
                   isOverlayDrawer
-                  onCloseDrawer={() => layout.setActiveDrawer('none')}
+                  onCloseDrawer={handleCloseLibraryDrawer}
                 />
               </div>
             </>
@@ -2111,8 +2016,7 @@ function AppContent({ store }: { store: ProjectStore }) {
                   view3DOptions={viewport.view3DOptions}
                   onChangeView3DOptions={viewport.setView3DOptions}
                   onContextLostChange={viewport.setIs3DContextLost}
-                  onSelect={handleSelectFrom3D}
-                  onToggleNodeSelection={handleToggleNodeSelectionFrom3D}
+                  onSelect={store.selectItem}
                   onSetTool={store.setActiveTool}
                   onToggleNodeLock={store.toggleNodeLock}
                   onUpdateNode={store.updateNode}
@@ -2124,14 +2028,12 @@ function AppContent({ store }: { store: ProjectStore }) {
                   onBeginDragSnapshot={store.beginDragSnapshot}
                   onMoveNodesTransient={store.moveNodesTransient}
                   onSnapNodesAndCommitDrag={store.snapNodesAndCommitDrag}
-                  onOpenDeepInspect={(id) => store.setDeepInspectId(id)}
+                  onOpenDeepInspect={handleOpenDeepInspectById}
                   onExit3D={() => viewport.setMode('2d')}
-                  draggedPresetName={draggedPresetName}
-                  onDropDevice={handleDropCatalogOrCustomDevice}
                 />
               </Suspense>
             ) : (
-                <DesignCanvas
+              <DesignCanvas
                   project={store.project}
                   selection={store.selection}
                   activeTool={store.activeTool}
@@ -2140,9 +2042,6 @@ function AppContent({ store }: { store: ProjectStore }) {
                   connectingSource={store.connectingSource}
                   draggedPresetName={draggedPresetName}
                   isReadOnlyMode={isReadOnlyMode}
-                  onRegister2DDropApi={api => {
-                    canvas2DDropApiRef.current = api;
-                  }}
                   onSelect={store.selectItem}
                   onToggleNodeSelection={store.toggleNodeSelection}
                   onSelectMultipleNodes={store.selectMultipleNodes}
@@ -2158,10 +2057,12 @@ function AppContent({ store }: { store: ProjectStore }) {
                   onUpdateNode={store.updateNode}
                   onSetNodeIconOrLogo={store.setNodeIconOrLogo}
                   onDuplicateNodes={store.duplicateNodes}
+                  smartClipboardNodeIds={store.smartClipboardNodeIds}
+                  onSmartCopyPasteNodes={store.smartCopyPasteNodes}
+                  onCopyNodesToClipboard={store.copyNodesToClipboard}
                   onToggleNodeLock={store.toggleNodeLock}
                   onToggleNodeVisibility={store.toggleNodeVisibility}
-                  onAddTextNode={(x, y) => store.addTextNode(x, y)}
-                  onAddRackAtCursor={(x, y) => handleAddRack('Tủ Server Rack 42U', x, y)}
+                  onAddTextNode={handleAddTextNodeAt}
                   onSetTool={store.setActiveTool}
                   onAddCable={store.addCable}
                   onUpdateCableControlPoints={store.updateCableControlPointsTransient}
@@ -2171,24 +2072,20 @@ function AppContent({ store }: { store: ProjectStore }) {
                   onSetConnectingSource={store.setConnectingSource}
                   onPanChange={store.setPan}
                   onZoomChange={store.setZoom}
-                  onOpenDeepInspect={(id) => store.setDeepInspectId(id)}
+                  onOpenDeepInspect={handleOpenDeepInspectById}
                   onAddRoom={store.addRoom}
                   onDeleteSelected={handleDeleteSelected}
-                  onDropDevice={handleDropCatalogOrCustomDevice}
-                  onDropDeviceIntoRack={(presetName, rackId, preferredU, side) => {
-                    store.addDeviceFromCatalogToRack(presetName, rackId, preferredU, side);
-                  }}
+                  onDropDevice={handleDropDevice}
+                  onDropDeviceIntoRack={handleDropDeviceIntoRack}
                   onAssignDeviceToRackSlot={store.assignDeviceToRackSlot}
                   onRemoveDeviceFromRackSlot={store.removeDeviceFromRackSlot}
                   onUpdateSettings={store.updateSettings}
                   onUpdateWifiCoverageRadiusTransient={store.updateWifiCoverageRadiusTransient}
                   onResizeLegendToFit={store.resizeLegendToFit}
                   onAutoRouteCable={handleAutoRouteCable}
-                  onOpenCommandPalette={() => setIsCommandPaletteOpen(true)}
+                  onOpenCommandPalette={handleOpenCommandPalette}
                   onOpenTemplates={openTemplateModal}
-                  onAddQuickDevice={() => {
-                    store.addDeviceFromCatalog('Access Switch 24-PoE+', canvasCenter.x, canvasCenter.y);
-                  }}
+                  onAddQuickDevice={handleAddQuickDevice}
                   onOpenBuildingGenerator={openBuildingModal}
                   onSetActiveFloor={store.setActiveFloor}
                   onCloneFloor={store.cloneFloor}
@@ -2250,7 +2147,7 @@ function AppContent({ store }: { store: ProjectStore }) {
                 <PropertiesPanel
                   {...propertiesPanelProps}
                   isCollapsed={isPropertiesCollapsed}
-                  onToggleCollapse={() => setIsPropertiesCollapsed(!isPropertiesCollapsed)}
+                  onToggleCollapse={handleTogglePropertiesCollapse}
                 />
               </div>
             </>
@@ -2558,6 +2455,25 @@ function AppContent({ store }: { store: ProjectStore }) {
                   <button
                     type="button"
                     onClick={() => {
+                      const nextMode =
+                        (store.project.settings.experienceMode ?? 'advanced') === 'basic'
+                          ? 'advanced'
+                          : 'basic';
+                      store.updateSettings({ experienceMode: nextMode });
+                      setNarrowSubDrawer('none');
+                    }}
+                    className="px-3 py-2.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 flex items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-200"
+                  >
+                    <SlidersHorizontal className="w-4 h-4 text-[#155EEF]" />
+                    <span>
+                      {(store.project.settings.experienceMode ?? 'advanced') === 'basic'
+                        ? 'Chế độ: Cơ bản'
+                        : 'Chế độ: Kỹ sư'}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
                       store.updateSettings({ isDarkMode: !store.project.settings.isDarkMode });
                       setNarrowSubDrawer('none');
                     }}
@@ -2616,7 +2532,7 @@ function AppContent({ store }: { store: ProjectStore }) {
                       className="col-span-2 px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-800/50 flex items-center justify-center gap-2 text-xs font-medium text-slate-400 cursor-not-allowed"
                     >
                       <MessageSquarePlus className="w-4 h-4" />
-                      <span>Góp ý (Sắp có)</span>
+                      <span>Góp ý</span>
                     </button>
                   )}
                 </div>
@@ -2704,7 +2620,8 @@ function AppContent({ store }: { store: ProjectStore }) {
             isSaving={store.isSaving}
             storageError={store.storageError}
             auditIssueCount={auditReport.issues.length}
-            onOpenAbout={() => setIsAboutModalOpen(true)}
+            onOpenAudit={openAuditModal}
+            onOpenAbout={handleOpenAbout}
             onToggleSnap={handleToggleSnap}
             onToggleGrid={handleToggleGrid}
           />
@@ -2806,6 +2723,12 @@ function AppContent({ store }: { store: ProjectStore }) {
               currentProjectId={store.project.id}
               projectList={store.projectList}
               lastBackupAt={store.lastBackupAt}
+              snapshots={store.snapshots}
+              lastAutoSnapshotAt={store.lastAutoSnapshotAt}
+              onCreateSnapshot={store.createProjectSnapshot}
+              onRestoreSnapshot={store.restoreProjectSnapshot}
+              onDeleteSnapshot={store.deleteProjectSnapshot}
+              onRefreshSnapshots={store.refreshSnapshots}
               onClose={() => {
                 setIsProjectHubOpen(false);
                 if (store.showWelcomeModal) {
@@ -2818,6 +2741,7 @@ function AppContent({ store }: { store: ProjectStore }) {
                 });
               }}
               onOpenTemplates={() => setIsTemplateModalOpen(true)}
+              onOpenExcelImport={openExcelTreeModal}
               onSwitchProject={(id) => {
                 void store.switchProject(id);
               }}
@@ -2925,7 +2849,11 @@ function AppContent({ store }: { store: ProjectStore }) {
                   return;
                 }
                 if (type === 'edge' && ids.length > 0) {
-                  handleJumpToCable(ids[0]);
+                  const firstCable = store.project.cables.find(c => c.id === ids[0]);
+                  if (firstCable) {
+                    handleJumpToNode(firstCable.sourceNodeId);
+                  }
+                  store.selectItem('edge', ids[0]);
                   showToast(`Đã chọn tuyến cáp thuộc nhóm "${label}" (${ids.length} tuyến).`, 'info', 2800);
                 }
               }}
@@ -3006,7 +2934,7 @@ function AppContent({ store }: { store: ProjectStore }) {
               onOpenDirectory={openDirectoryModal}
               onSaveNow={handleSaveNow}
               onJumpToNode={handleJumpToNode}
-              onSelectCable={handleJumpToCable}
+              onSelectCable={(cableId) => store.selectItem('edge', cableId)}
               onOpenShortcuts={openShortcutsModal}
               onExportA4Pdf={() => void handleQuickExportA4Pdf()}
               onAutoAssignIps={() => handleAutoAssignIps({ preserveExistingValid: true })}
@@ -3027,6 +2955,7 @@ function AppContent({ store }: { store: ProjectStore }) {
               onClose={() => setIsShortcutModalOpen(false)}
               keymap={keymap}
               onUpdateShortcut={updateShortcut}
+              onResetSingleShortcut={resetSingleShortcut}
               onResetShortcuts={resetShortcuts}
             />
           )}
@@ -3054,7 +2983,7 @@ function AppContent({ store }: { store: ProjectStore }) {
               onSelectTarget={(targetType, targetId) => {
                 setIsDirectoryOpen(false);
                 if (targetType === 'node') handleJumpToNode(targetId);
-                else handleJumpToCable(targetId);
+                else store.selectItem('edge', targetId);
               }}
             />
           )}
@@ -3221,56 +3150,6 @@ function AppContent({ store }: { store: ProjectStore }) {
                   Bắt đầu thiết kế
                 </button>
               </div>
-            </div>
-          </div>
-        )}
-        {/* Floating Ghost Card for Unified Pointer Drag-and-Drop (2D & 3D) */}
-        {activeLibraryDrag && (
-          <div
-            aria-hidden="true"
-            style={{
-              left: `${Math.min(
-                typeof window !== 'undefined' ? window.innerWidth - 230 : activeLibraryDrag.clientX + 14,
-                activeLibraryDrag.clientX + 14
-              )}px`,
-              top: `${Math.min(
-                typeof window !== 'undefined' ? window.innerHeight - 90 : activeLibraryDrag.clientY + 14,
-                activeLibraryDrag.clientY + 14
-              )}px`
-            }}
-            className={`fixed z-[100] pointer-events-none w-56 rounded-lg border shadow-2xl px-2.5 py-2 backdrop-blur-md transition-colors no-print ${
-              activeLibraryDrag.canDrop
-                ? 'bg-white/95 dark:bg-slate-900/95 border-[#155EEF] ring-2 ring-[#155EEF]/25'
-                : 'bg-white/90 dark:bg-slate-900/90 border-slate-300 dark:border-slate-700 opacity-90'
-            }`}
-          >
-            <div className="flex items-center gap-2">
-              <div
-                style={{ backgroundColor: activeLibraryDrag.payload.accentColor }}
-                className="w-7 h-7 rounded-md flex items-center justify-center text-white shrink-0 shadow-xs"
-              >
-                {renderDeviceVisualIcon({
-                  category: activeLibraryDrag.payload.category,
-                  className: 'w-4 h-4 text-white'
-                })}
-              </div>
-              <div className="min-w-0 flex-1">
-                <div className="text-[11px] font-semibold text-slate-900 dark:text-white truncate">
-                  {activeLibraryDrag.payload.label}
-                </div>
-                <div className="text-[10px] font-mono text-slate-500 dark:text-slate-400 truncate">
-                  {activeLibraryDrag.payload.specLine}
-                </div>
-              </div>
-            </div>
-            <div
-              className={`mt-1.5 text-[10px] font-semibold px-1.5 py-0.5 rounded-sm truncate ${
-                activeLibraryDrag.canDrop
-                  ? 'bg-[#EEF4FF] text-[#155EEF] dark:bg-blue-950/70 dark:text-blue-300'
-                  : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300'
-              }`}
-            >
-              {activeLibraryDrag.hint}
             </div>
           </div>
         )}
